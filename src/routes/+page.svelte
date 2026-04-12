@@ -29,23 +29,102 @@
   let canvas = $state<HTMLCanvasElement>(null!);
   let drawCanvas = $state<HTMLCanvasElement>(null!);
 
+  // DB row id for the current (textbook, page) pair; null until resolved
+  let currentPageId = $state<number | null>(null);
+
+  async function resolvePageId(bookId: number, pageNum: number) {
+    const pageId = await invoke<number>("get_or_create_page", {
+      textbookId: bookId,
+      pageNumber: pageNum,
+    });
+    currentPageId = pageId;
+    await loadAndDrawStrokes(pageId);
+  }
+
+  interface StrokeOutput {
+    id: number;
+    colour: string;
+    points: { x: number; y: number }[];
+  }
+
+  async function loadAndDrawStrokes(pageId: number) {
+    const loaded = await invoke<StrokeOutput[]>("load_strokes", { pageId });
+    // Each loaded stroke has no pressure data; use a fixed pressure so line
+    // width is consistent with how it was originally drawn.
+    strokes = loaded.map(s =>
+      s.points.map(p => ({ x: p.x, y: p.y, pressure: 0.5 }))
+    );
+    // Wait for syncDrawCanvasSize (queued via rAF in renderPage) to have run
+    // before painting, so the draw canvas has the right dimensions.
+    requestAnimationFrame(redrawAllStrokes);
+  }
+
   // ── Drawing state ──
-  type Point = { x: number; y: number; pressure: number };
+  //
+  // Coordinates are stored in *normalised page space*:
+  //   x, y ∈ [0, 1]  — 0 = page left/top edge, 1 = page right/bottom edge.
+  //   Values outside [0,1] are allowed (drawing in the margin).
+  //
+  // This makes strokes zoom-invariant: to draw them at any zoom level, just
+  // multiply by the current PDF canvas CSS size.
+  //
+  type Point = { x: number; y: number; pressure: number };  // normalised page space
+
   let isDrawing = $state(false);
   let currentStroke = $state<Point[]>([]);
+  // Completed strokes for the current page (cleared on page navigation)
+  let strokes = $state<Point[][]>([]);
   // How many points from currentStroke have already been painted onto the canvas
   let drawnUpTo = 0;
   // Active pointer id for palm rejection (first pen/stylus wins)
   let activePointerId: number | null = null;
 
-  function getCanvasPoint(e: PointerEvent): Point {
-    const rect = drawCanvas.getBoundingClientRect();
-    // Scale from CSS pixels to canvas logical pixels
-    const scaleX = drawCanvas.width / rect.width;
-    const scaleY = drawCanvas.height / rect.height;
+  // ── Coordinate transforms ──
+  //
+  // Normalised page space: (0,0) = PDF page top-left, (1,1) = PDF page bottom-right.
+  // Screen space: the pointer event's (clientX, clientY).
+  // Draw-canvas space: logical pixel coordinate on drawCanvas (set by syncDrawCanvasSize).
+
+  /**
+   * Convert a screen-space pointer position to normalised page space.
+   * The PDF canvas element defines the [0,1] coordinate space.
+   */
+  function screenToPage(screenX: number, screenY: number): { x: number; y: number } {
+    const pageRect = canvas.getBoundingClientRect();
     return {
-      x: (e.clientX - rect.left) * scaleX,
-      y: (e.clientY - rect.top) * scaleY,
+      x: (screenX - pageRect.left) / pageRect.width,
+      y: (screenY - pageRect.top)  / pageRect.height,
+    };
+  }
+
+  /**
+   * Convert a normalised page-space coordinate to draw-canvas logical pixels.
+   * drawCanvas covers the full canvas-wrap area; the page sits somewhere inside it.
+   */
+  function pageToDrawCanvas(normX: number, normY: number): { x: number; y: number } {
+    const wrap = drawCanvas.parentElement!;
+    const pageRect = canvas.getBoundingClientRect();
+    const wrapRect = wrap.getBoundingClientRect();
+
+    // Page origin in scroll-content space (accounts for scroll offset)
+    const originX = pageRect.left - wrapRect.left + wrap.scrollLeft;
+    const originY = pageRect.top  - wrapRect.top  + wrap.scrollTop;
+
+    // draw canvas logical pixels == CSS pixels (we set width/height explicitly)
+    return {
+      x: originX + normX * pageRect.width,
+      y: originY + normY * pageRect.height,
+    };
+  }
+
+  /**
+   * Convert a pointer event to a normalised page-space point.
+   */
+  function getPagePoint(e: PointerEvent): Point {
+    const { x, y } = screenToPage(e.clientX, e.clientY);
+    return {
+      x,
+      y,
       pressure: e.pressure > 0 ? e.pressure : 0.5,
     };
   }
@@ -62,7 +141,7 @@
     activePointerId = e.pointerId;
     drawCanvas.setPointerCapture(e.pointerId);
     isDrawing = true;
-    currentStroke = [getCanvasPoint(e)];
+    currentStroke = [getPagePoint(e)];
     drawnUpTo = 1;
     e.preventDefault();
   }
@@ -74,7 +153,7 @@
     // Use getCoalescedEvents when available for smoother lines on high-freq devices
     const events: PointerEvent[] = e.getCoalescedEvents?.() ?? [e];
     for (const ce of events) {
-      currentStroke = [...currentStroke, getCanvasPoint(ce)];
+      currentStroke = [...currentStroke, getPagePoint(ce)];
     }
 
     redrawStroke();
@@ -82,25 +161,38 @@
 
   function onPointerUp(e: PointerEvent) {
     if (e.pointerId !== activePointerId) return;
-    if (isDrawing) {
-      redrawStroke(); // finalise
+    if (isDrawing && currentStroke.length >= 2) {
+      redrawStroke(); // finalise the last segments
+      const completed = currentStroke;
+      strokes = [...strokes, completed];
+      if (currentPageId !== null) {
+        invoke("save_stroke", {
+          pageId: currentPageId,
+          stroke: {
+            colour: "rgba(30, 80, 220, 0.85)",
+            points: completed.map(({ x, y }) => ({ x, y })),
+          },
+        }).catch(() => { /* fire and forget — persist failure is silent */ });
+      }
     }
-    isDrawing = false;
-    activePointerId = null;
-    currentStroke = [];
-  }
-
-  function onPointerCancel(e: PointerEvent) {
-    if (e.pointerId !== activePointerId) return;
-    // Discard the stroke (e.g. palm was detected mid-stroke)
-    const ctx = drawCanvas.getContext("2d")!;
-    ctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
     isDrawing = false;
     activePointerId = null;
     currentStroke = [];
     drawnUpTo = 0;
   }
 
+  function onPointerCancel(e: PointerEvent) {
+    if (e.pointerId !== activePointerId) return;
+    // Discard the in-progress stroke (e.g. palm was detected mid-stroke),
+    // but keep all previously committed strokes.
+    isDrawing = false;
+    activePointerId = null;
+    currentStroke = [];
+    drawnUpTo = 0;
+    redrawAllStrokes();
+  }
+
+  /** Incrementally paint the new points of the current stroke onto the canvas. */
   function redrawStroke() {
     if (!drawCanvas || currentStroke.length < 2) return;
     const ctx = drawCanvas.getContext("2d")!;
@@ -110,34 +202,75 @@
     ctx.lineJoin = "round";
     ctx.strokeStyle = "rgba(30, 80, 220, 0.85)";
 
-    // Draw all segments that haven't been painted yet (covers coalesced events)
+    const prev = pageToDrawCanvas(pts[drawnUpTo - 1].x, pts[drawnUpTo - 1].y);
     ctx.beginPath();
-    ctx.moveTo(pts[drawnUpTo - 1].x, pts[drawnUpTo - 1].y);
+    ctx.moveTo(prev.x, prev.y);
     for (let i = drawnUpTo; i < pts.length; i++) {
+      const dc = pageToDrawCanvas(pts[i].x, pts[i].y);
       const width = 1 + pts[i].pressure * 5;
-      // Flush the current sub-path before changing lineWidth
       if (ctx.lineWidth !== width) {
         ctx.stroke();
         ctx.beginPath();
-        ctx.moveTo(pts[i - 1].x, pts[i - 1].y);
+        const dcPrev = pageToDrawCanvas(pts[i - 1].x, pts[i - 1].y);
+        ctx.moveTo(dcPrev.x, dcPrev.y);
         ctx.lineWidth = width;
       }
-      ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.lineTo(dc.x, dc.y);
     }
     ctx.stroke();
     drawnUpTo = pts.length;
   }
 
-  // Sync draw canvas logical resolution to its CSS size (the full canvas-wrap area)
-  function syncDrawCanvasSize() {
+  /** Repaint all committed strokes (plus the active stroke) from scratch. */
+  function redrawAllStrokes() {
     if (!drawCanvas) return;
-    const w = drawCanvas.clientWidth;
-    const h = drawCanvas.clientHeight;
-    if (drawCanvas.width !== w || drawCanvas.height !== h) {
-      // Resizing clears the canvas — intentional for now (no persistence yet)
-      drawCanvas.width = w;
-      drawCanvas.height = h;
+    const ctx = drawCanvas.getContext("2d")!;
+    ctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = "rgba(30, 80, 220, 0.85)";
+
+    const allStrokes = isDrawing && currentStroke.length >= 2
+      ? [...strokes, currentStroke]
+      : strokes;
+
+    for (const stroke of allStrokes) {
+      if (stroke.length < 2) continue;
+      let currentWidth = 0;
+      ctx.beginPath();
+      const first = pageToDrawCanvas(stroke[0].x, stroke[0].y);
+      ctx.moveTo(first.x, first.y);
+      for (let i = 1; i < stroke.length; i++) {
+        const dc = pageToDrawCanvas(stroke[i].x, stroke[i].y);
+        const width = 1 + stroke[i].pressure * 5;
+        if (ctx.lineWidth !== width) {
+          ctx.stroke();
+          ctx.beginPath();
+          const dcPrev = pageToDrawCanvas(stroke[i - 1].x, stroke[i - 1].y);
+          ctx.moveTo(dcPrev.x, dcPrev.y);
+          ctx.lineWidth = width;
+          currentWidth = width;
+        }
+        ctx.lineTo(dc.x, dc.y);
+      }
+      ctx.stroke();
     }
+  }
+
+  // Sync draw canvas logical resolution to the full scrollable area, then repaint.
+  function syncDrawCanvasSize() {
+    if (!drawCanvas || !canvas) return;
+    const wrap = drawCanvas.parentElement!;
+    // The scrollable content area is determined by the PDF canvas size + padding.
+    // We need the draw canvas to cover this entire area.
+    const w = wrap.scrollWidth;
+    const h = wrap.scrollHeight;
+    drawCanvas.style.width  = w + "px";
+    drawCanvas.style.height = h + "px";
+    drawCanvas.width  = w;
+    drawCanvas.height = h;
+    redrawAllStrokes();
   }
 
   // Zoom state (1.0 = auto-fit width, multiplier on top of that)
@@ -183,6 +316,7 @@
     error = null;
     selectedBook = book;
     currentPage = loadSavedPage(book.id);
+    currentPageId = null;
     zoomLevel = 1.0;
     pdfDoc = null;
     totalPages = 0;
@@ -198,6 +332,7 @@
       // Clamp saved page in case book changed
       if (currentPage > totalPages) currentPage = 1;
       await renderPage(currentPage);
+      resolvePageId(book.id, currentPage);
     } catch (e) {
       error = String(e);
     }
@@ -219,7 +354,7 @@
       const ctx = canvas.getContext("2d")!;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       await page.render({ canvasContext: ctx, viewport }).promise;
-      syncDrawCanvasSize();
+      requestAnimationFrame(syncDrawCanvasSize);
     } finally {
       rendering = false;
     }
@@ -230,8 +365,11 @@
     const clamped = Math.max(1, Math.min(totalPages, pageNum));
     if (clamped === currentPage) return;
     currentPage = clamped;
+    currentPageId = null;
+    strokes = [];
     if (selectedBook) saveCurrentPage(selectedBook.id, currentPage);
     await renderPage(currentPage);
+    if (selectedBook) resolvePageId(selectedBook.id, currentPage);
   }
 
   async function prevPage() {
@@ -261,8 +399,10 @@
     selectedBook = null;
     pdfDoc = null;
     currentPage = 1;
+    currentPageId = null;
     totalPages = 0;
     zoomLevel = 1.0;
+    strokes = [];
   }
 
   // ── Keyboard navigation ──
@@ -657,12 +797,10 @@
 
   .draw-canvas {
     position: absolute;
-    inset: 0;
-    width: 100% !important;
-    height: 100% !important;
+    top: 0;
+    left: 0;
     cursor: crosshair;
     touch-action: none;
-    /* no box-shadow — transparent overlay */
     box-shadow: none;
   }
 
