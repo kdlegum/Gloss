@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cargo metadata:*)"
+      "Bash(cargo metadata:*)",
+      "Bash(npm run:*)"
     ]
   }
 }

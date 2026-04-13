@@ -20,6 +20,10 @@ struct StrokeOutput {
     id: i64,
     colour: String,
     points: Vec<Point>,
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
 }
 
 #[derive(serde::Serialize)]
@@ -203,11 +207,24 @@ async fn save_stroke(
 }
 
 #[tauri::command]
+async fn delete_stroke(
+    stroke_id: i64,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM strokes WHERE id = ?")
+        .bind(stroke_id)
+        .execute(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn load_strokes(
     page_id: i64,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<Vec<StrokeOutput>, String> {
-    let rows = sqlx::query("SELECT id, colour, data FROM strokes WHERE page_id = ? ORDER BY id")
+    let rows = sqlx::query("SELECT id, colour, data, min_x, min_y, max_x, max_y FROM strokes WHERE page_id = ? ORDER BY id")
         .bind(page_id)
         .fetch_all(pool.inner())
         .await
@@ -223,6 +240,10 @@ async fn load_strokes(
                 id: r.get("id"),
                 colour: r.get("colour"),
                 points,
+                min_x: r.get("min_x"),
+                min_y: r.get("min_y"),
+                max_x: r.get("max_x"),
+                max_y: r.get("max_y"),
             })
         })
         .collect()
@@ -256,7 +277,7 @@ pub fn run() {
             app.manage(pool);
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![import_pdf, list_textbooks, get_pdf_path, get_or_create_page, save_stroke, load_strokes])
+        .invoke_handler(tauri::generate_handler![import_pdf, list_textbooks, get_pdf_path, get_or_create_page, save_stroke, load_strokes, delete_stroke])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

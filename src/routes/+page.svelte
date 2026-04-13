@@ -27,7 +27,8 @@
   let totalPages = $state(0);
   let rendering = $state(false);
   let canvas = $state<HTMLCanvasElement>(null!);
-  let drawCanvas = $state<HTMLCanvasElement>(null!);
+  let dryCanvas = $state<HTMLCanvasElement>(null!);
+  let wetCanvas = $state<HTMLCanvasElement>(null!);
 
   // DB row id for the current (textbook, page) pair; null until resolved
   let currentPageId = $state<number | null>(null);
@@ -45,19 +46,39 @@
     id: number;
     colour: string;
     points: { x: number; y: number }[];
+    min_x: number;
+    min_y: number;
+    max_x: number;
+    max_y: number;
   }
 
   async function loadAndDrawStrokes(pageId: number) {
     const loaded = await invoke<StrokeOutput[]>("load_strokes", { pageId });
     // Each loaded stroke has no pressure data; use a fixed pressure so line
     // width is consistent with how it was originally drawn.
-    strokes = loaded.map(s =>
-      s.points.map(p => ({ x: p.x, y: p.y, pressure: 0.5 }))
-    );
+    strokes = loaded.map(s => ({
+      id: s.id,
+      points: s.points.map(p => ({ x: p.x, y: p.y, pressure: 0.5 })),
+      bbox: { minX: s.min_x, minY: s.min_y, maxX: s.max_x, maxY: s.max_y },
+    }));
+    redoStack = [];
     // Wait for syncDrawCanvasSize (queued via rAF in renderPage) to have run
     // before painting, so the draw canvas has the right dimensions.
     requestAnimationFrame(redrawAllStrokes);
   }
+
+  // ── Tool mode ──
+  type Mode = 'draw' | 'erase' | 'select';
+  let mode = $state<Mode>('draw');
+
+  // ── Select state ──
+  type Rect = { x: number; y: number; w: number; h: number }; // normalised page space
+  let selectOrigin = $state<{ x: number; y: number } | null>(null);
+  let selectRect   = $state<Rect | null>(null);
+  let selectedStrokes = $state<Set<Stroke>>(new Set());
+  // Union bbox of all selected strokes, in normalised page space. Used to
+  // export the area as an image. null when nothing is selected.
+  let selection = $state<{ x: number; y: number; width: number; height: number } | null>(null);
 
   // ── Drawing state ──
   //
@@ -69,13 +90,16 @@
   // multiply by the current PDF canvas CSS size.
   //
   type Point = { x: number; y: number; pressure: number };  // normalised page space
+  type BBox = { minX: number; minY: number; maxX: number; maxY: number };
+  type Stroke = { id: number | null; points: Point[]; bbox: BBox };
 
   let isDrawing = $state(false);
   let currentStroke = $state<Point[]>([]);
   // Completed strokes for the current page (cleared on page navigation)
-  let strokes = $state<Point[][]>([]);
-  // How many points from currentStroke have already been painted onto the canvas
-  let drawnUpTo = 0;
+  let strokes = $state<Stroke[]>([]);
+  // Strokes removed by Ctrl+Z, available for Ctrl+Y (cleared on new stroke).
+  // Each entry is an array of strokes removed together as one action.
+  let redoStack = $state<Stroke[][]>([]);
   // Active pointer id for palm rejection (first pen/stylus wins)
   let activePointerId: number | null = null;
 
@@ -83,7 +107,7 @@
   //
   // Normalised page space: (0,0) = PDF page top-left, (1,1) = PDF page bottom-right.
   // Screen space: the pointer event's (clientX, clientY).
-  // Draw-canvas space: logical pixel coordinate on drawCanvas (set by syncDrawCanvasSize).
+  // Canvas space: logical pixel coordinate on dryCanvas/wetCanvas (set by syncDrawCanvasSize).
 
   /**
    * Convert a screen-space pointer position to normalised page space.
@@ -98,11 +122,11 @@
   }
 
   /**
-   * Convert a normalised page-space coordinate to draw-canvas logical pixels.
-   * drawCanvas covers the full canvas-wrap area; the page sits somewhere inside it.
+   * Convert a normalised page-space coordinate to canvas logical pixels.
+   * dryCanvas/wetCanvas cover the full canvas-wrap area; the page sits somewhere inside.
    */
   function pageToDrawCanvas(normX: number, normY: number): { x: number; y: number } {
-    const wrap = drawCanvas.parentElement!;
+    const wrap = dryCanvas.parentElement!;
     const pageRect = canvas.getBoundingClientRect();
     const wrapRect = wrap.getBoundingClientRect();
 
@@ -133,20 +157,135 @@
     return e.pointerType === "pen" || e.pointerType === "mouse";
   }
 
+  /** Compute a bounding box in normalised page space from a list of points. */
+  function computeBBox(points: Point[]): BBox {
+    let minX = points[0].x, minY = points[0].y;
+    let maxX = minX, maxY = minY;
+    for (const p of points) {
+      if (p.x < minX) minX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y > maxY) maxY = p.y;
+    }
+    return { minX, minY, maxX, maxY };
+  }
+
+  /**
+   * Erase any stroke whose point comes within `radiusPx` CSS pixels of the
+   * eraser tip (given in normalised page space).  Uses the stored bbox as a
+   * cheap pre-filter before checking individual points.
+   */
+  function eraseAt(normX: number, normY: number) {
+    const pageRect = canvas.getBoundingClientRect();
+    // Convert the pixel radius to normalised units (use the smaller dimension
+    // so the circle isn't stretched on non-square pages).
+    const radiusPx = 6;
+    const rNormX = radiusPx / pageRect.width;
+    const rNormY = radiusPx / pageRect.height;
+    const toDelete: Stroke[] = [];
+    const toKeep: Stroke[] = [];
+
+    for (const stroke of strokes) {
+      const { minX, minY, maxX, maxY } = stroke.bbox;
+
+      // Bbox pre-filter (expanded by radius)
+      if (
+        normX < minX - rNormX || normX > maxX + rNormX ||
+        normY < minY - rNormY || normY > maxY + rNormY
+      ) {
+        toKeep.push(stroke);
+        continue;
+      }
+
+      // Per-point distance check (screen-space circle)
+      let hit = false;
+      for (const p of stroke.points) {
+        const dx = (p.x - normX) * pageRect.width;
+        const dy = (p.y - normY) * pageRect.height;
+        if (dx * dx + dy * dy <= radiusPx * radiusPx) {
+          hit = true;
+          break;
+        }
+      }
+
+      if (hit) {
+        toDelete.push(stroke);
+      } else {
+        toKeep.push(stroke);
+      }
+    }
+
+    if (toDelete.length === 0) return;
+
+    strokes = toKeep;
+    redoStack = [...redoStack, toDelete];
+    for (const s of toDelete) {
+      if (s.id !== null) {
+        invoke("delete_stroke", { strokeId: s.id }).catch(() => {});
+      }
+    }
+    redrawAllStrokes();
+  }
+
   function onPointerDown(e: PointerEvent) {
     // Palm rejection: ignore touch; ignore second concurrent pointer
     if (!isPenOrMouse(e)) return;
     if (activePointerId !== null) return;
 
+    if (mode === 'erase') {
+      activePointerId = e.pointerId;
+      wetCanvas.setPointerCapture(e.pointerId);
+      const { x, y } = screenToPage(e.clientX, e.clientY);
+      eraseAt(x, y);
+      e.preventDefault();
+      return;
+    }
+
+    if (mode === 'select') {
+      activePointerId = e.pointerId;
+      wetCanvas.setPointerCapture(e.pointerId);
+      const { x, y } = screenToPage(e.clientX, e.clientY);
+      selectOrigin = { x, y };
+      selectRect = null;
+      selectedStrokes = new Set();
+      selection = null;
+      redrawSelectionHighlight();
+      e.preventDefault();
+      return;
+    }
+
     activePointerId = e.pointerId;
-    drawCanvas.setPointerCapture(e.pointerId);
+    wetCanvas.setPointerCapture(e.pointerId);
     isDrawing = true;
     currentStroke = [getPagePoint(e)];
-    drawnUpTo = 1;
     e.preventDefault();
   }
 
   function onPointerMove(e: PointerEvent) {
+    if (mode === 'erase') {
+      if (e.pointerId !== activePointerId) return;
+      e.preventDefault();
+      const events: PointerEvent[] = e.getCoalescedEvents?.() ?? [e];
+      for (const ce of events) {
+        const { x, y } = screenToPage(ce.clientX, ce.clientY);
+        eraseAt(x, y);
+      }
+      return;
+    }
+
+    if (mode === 'select') {
+      if (e.pointerId !== activePointerId || !selectOrigin) return;
+      e.preventDefault();
+      const { x, y } = screenToPage(e.clientX, e.clientY);
+      selectRect = {
+        x: Math.min(selectOrigin.x, x),
+        y: Math.min(selectOrigin.y, y),
+        w: Math.abs(x - selectOrigin.x),
+        h: Math.abs(y - selectOrigin.y),
+      };
+      drawRubberBand(selectRect);
+      return;
+    }
     if (!isDrawing || e.pointerId !== activePointerId) return;
     e.preventDefault();
 
@@ -156,56 +295,101 @@
       currentStroke = [...currentStroke, getPagePoint(ce)];
     }
 
-    redrawStroke();
+    redrawWetStroke();
   }
 
   function onPointerUp(e: PointerEvent) {
+    if (mode === 'erase') {
+      if (e.pointerId !== activePointerId) return;
+      activePointerId = null;
+      e.preventDefault();
+      return;
+    }
+
+    if (mode === 'select') {
+      if (e.pointerId !== activePointerId) return;
+      activePointerId = null;
+      if (selectRect) {
+        selectedStrokes = hitTestStrokes(selectRect);
+        selection = unionBBox(selectedStrokes);
+      }
+      selectOrigin = null;
+      selectRect = null;
+      redrawSelectionHighlight();
+      e.preventDefault();
+      return;
+    }
     if (e.pointerId !== activePointerId) return;
     if (isDrawing && currentStroke.length >= 2) {
-      redrawStroke(); // finalise the last segments
       const completed = currentStroke;
-      strokes = [...strokes, completed];
+      // Add with a null id; fill in the real id once the save resolves.
+      const stroke: Stroke = { id: null, points: completed, bbox: computeBBox(completed) };
+      strokes = [...strokes, stroke];
+      redoStack = []; // any new stroke wipes the redo history
+      redrawAllStrokes(); // bake the new stroke onto the dry canvas
       if (currentPageId !== null) {
-        invoke("save_stroke", {
+        invoke<number>("save_stroke", {
           pageId: currentPageId,
           stroke: {
             colour: "rgba(30, 80, 220, 0.85)",
             points: completed.map(({ x, y }) => ({ x, y })),
           },
-        }).catch(() => { /* fire and forget — persist failure is silent */ });
+        }).then(id => {
+          stroke.id = id;
+        }).catch(() => { /* persist failure is silent */ });
       }
     }
     isDrawing = false;
     activePointerId = null;
     currentStroke = [];
-    drawnUpTo = 0;
+    // Clear the wet canvas — the committed stroke is now on the dry canvas
+    if (wetCanvas) {
+      wetCanvas.getContext("2d")!.clearRect(0, 0, wetCanvas.width, wetCanvas.height);
+    }
   }
 
   function onPointerCancel(e: PointerEvent) {
+    if (mode === 'erase') {
+      if (e.pointerId !== activePointerId) return;
+      activePointerId = null;
+      return;
+    }
+
+    if (mode === 'select') {
+      if (e.pointerId !== activePointerId) return;
+      activePointerId = null;
+      selectOrigin = null;
+      selectRect = null;
+      redrawSelectionHighlight();
+      return;
+    }
     if (e.pointerId !== activePointerId) return;
     // Discard the in-progress stroke (e.g. palm was detected mid-stroke),
     // but keep all previously committed strokes.
     isDrawing = false;
     activePointerId = null;
     currentStroke = [];
-    drawnUpTo = 0;
-    redrawAllStrokes();
+    if (wetCanvas) {
+      wetCanvas.getContext("2d")!.clearRect(0, 0, wetCanvas.width, wetCanvas.height);
+    }
   }
 
-  /** Incrementally paint the new points of the current stroke onto the canvas. */
-  function redrawStroke() {
-    if (!drawCanvas || currentStroke.length < 2) return;
-    const ctx = drawCanvas.getContext("2d")!;
+  /** Paint the in-progress stroke onto the wet canvas (cleared each call). */
+  function redrawWetStroke() {
+    if (!wetCanvas) return;
+    const ctx = wetCanvas.getContext("2d")!;
+    ctx.clearRect(0, 0, wetCanvas.width, wetCanvas.height);
     const pts = currentStroke;
+    if (pts.length < 2) return;
 
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     ctx.strokeStyle = "rgba(30, 80, 220, 0.85)";
 
-    const prev = pageToDrawCanvas(pts[drawnUpTo - 1].x, pts[drawnUpTo - 1].y);
     ctx.beginPath();
-    ctx.moveTo(prev.x, prev.y);
-    for (let i = drawnUpTo; i < pts.length; i++) {
+    const first = pageToDrawCanvas(pts[0].x, pts[0].y);
+    ctx.moveTo(first.x, first.y);
+    for (let i = 1; i < pts.length; i++) {
       const dc = pageToDrawCanvas(pts[i].x, pts[i].y);
       const width = 1 + pts[i].pressure * 5;
       if (ctx.lineWidth !== width) {
@@ -218,58 +402,150 @@
       ctx.lineTo(dc.x, dc.y);
     }
     ctx.stroke();
-    drawnUpTo = pts.length;
   }
 
-  /** Repaint all committed strokes (plus the active stroke) from scratch. */
+  /** Repaint all committed strokes onto the dry canvas from scratch. */
   function redrawAllStrokes() {
-    if (!drawCanvas) return;
-    const ctx = drawCanvas.getContext("2d")!;
-    ctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+    if (!dryCanvas) return;
+    const ctx = dryCanvas.getContext("2d")!;
+    ctx.clearRect(0, 0, dryCanvas.width, dryCanvas.height);
 
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     ctx.strokeStyle = "rgba(30, 80, 220, 0.85)";
 
-    const allStrokes = isDrawing && currentStroke.length >= 2
-      ? [...strokes, currentStroke]
-      : strokes;
-
-    for (const stroke of allStrokes) {
-      if (stroke.length < 2) continue;
-      let currentWidth = 0;
+    for (const stroke of strokes) {
+      if (stroke.points.length < 2) continue;
       ctx.beginPath();
-      const first = pageToDrawCanvas(stroke[0].x, stroke[0].y);
+      const first = pageToDrawCanvas(stroke.points[0].x, stroke.points[0].y);
       ctx.moveTo(first.x, first.y);
-      for (let i = 1; i < stroke.length; i++) {
-        const dc = pageToDrawCanvas(stroke[i].x, stroke[i].y);
-        const width = 1 + stroke[i].pressure * 5;
+      for (let i = 1; i < stroke.points.length; i++) {
+        const dc = pageToDrawCanvas(stroke.points[i].x, stroke.points[i].y);
+        const width = 1 + stroke.points[i].pressure * 5;
         if (ctx.lineWidth !== width) {
           ctx.stroke();
           ctx.beginPath();
-          const dcPrev = pageToDrawCanvas(stroke[i - 1].x, stroke[i - 1].y);
+          const dcPrev = pageToDrawCanvas(stroke.points[i - 1].x, stroke.points[i - 1].y);
           ctx.moveTo(dcPrev.x, dcPrev.y);
           ctx.lineWidth = width;
-          currentWidth = width;
         }
         ctx.lineTo(dc.x, dc.y);
       }
       ctx.stroke();
     }
+    // Repaint selection highlight on top (wet canvas)
+    redrawSelectionHighlight();
   }
 
-  // Sync draw canvas logical resolution to the full scrollable area, then repaint.
+  /**
+   * Compute the union bounding box of a set of strokes in normalised page
+   * space. Returns null if the set is empty.
+   */
+  function unionBBox(hits: Set<Stroke>): { x: number; y: number; width: number; height: number } | null {
+    if (hits.size === 0) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const s of hits) {
+      if (s.bbox.minX < minX) minX = s.bbox.minX;
+      if (s.bbox.minY < minY) minY = s.bbox.minY;
+      if (s.bbox.maxX > maxX) maxX = s.bbox.maxX;
+      if (s.bbox.maxY > maxY) maxY = s.bbox.maxY;
+    }
+    return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+  }
+
+  /** Draw the rubber-band selection rectangle on the wet canvas. */
+  function drawRubberBand(rect: Rect) {
+    if (!wetCanvas) return;
+    const ctx = wetCanvas.getContext("2d")!;
+    ctx.clearRect(0, 0, wetCanvas.width, wetCanvas.height);
+
+    const tl = pageToDrawCanvas(rect.x,          rect.y);
+    const br = pageToDrawCanvas(rect.x + rect.w,  rect.y + rect.h);
+    const w = br.x - tl.x;
+    const h = br.y - tl.y;
+
+    ctx.save();
+    ctx.strokeStyle = "rgba(57, 108, 216, 0.9)";
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 4]);
+    ctx.strokeRect(tl.x, tl.y, w, h);
+    ctx.fillStyle = "rgba(57, 108, 216, 0.08)";
+    ctx.fillRect(tl.x, tl.y, w, h);
+    ctx.restore();
+  }
+
+  /** Return the set of strokes that have at least one point inside `rect`. */
+  function hitTestStrokes(rect: Rect): Set<Stroke> {
+    const r2 = rect.x + rect.w;
+    const b2 = rect.y + rect.h;
+    const hit = new Set<Stroke>();
+    for (const stroke of strokes) {
+      // Cheap bbox pre-filter: skip if stroke bbox doesn't overlap rect at all
+      if (stroke.bbox.maxX < rect.x || stroke.bbox.minX > r2 ||
+          stroke.bbox.maxY < rect.y || stroke.bbox.minY > b2) continue;
+      // Per-point check
+      for (const p of stroke.points) {
+        if (p.x >= rect.x && p.x <= r2 && p.y >= rect.y && p.y <= b2) {
+          hit.add(stroke);
+          break;
+        }
+      }
+    }
+    return hit;
+  }
+
+  /**
+   * Repaint the wet canvas to show the current selection highlight.
+   * Call after selectedStrokes changes and after redrawAllStrokes.
+   */
+  function redrawSelectionHighlight() {
+    if (!wetCanvas) return;
+    const ctx = wetCanvas.getContext("2d")!;
+    ctx.clearRect(0, 0, wetCanvas.width, wetCanvas.height);
+    if (selectedStrokes.size === 0) return;
+
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = "rgba(255, 140, 0, 0.9)";
+
+    for (const stroke of selectedStrokes) {
+      if (stroke.points.length < 2) continue;
+      ctx.beginPath();
+      const first = pageToDrawCanvas(stroke.points[0].x, stroke.points[0].y);
+      ctx.moveTo(first.x, first.y);
+      for (let i = 1; i < stroke.points.length; i++) {
+        const dc = pageToDrawCanvas(stroke.points[i].x, stroke.points[i].y);
+        const width = 1 + stroke.points[i].pressure * 5;
+        if (ctx.lineWidth !== width) {
+          ctx.stroke();
+          ctx.beginPath();
+          const dcPrev = pageToDrawCanvas(stroke.points[i - 1].x, stroke.points[i - 1].y);
+          ctx.moveTo(dcPrev.x, dcPrev.y);
+          ctx.lineWidth = width;
+        }
+        ctx.lineTo(dc.x, dc.y);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // Sync both overlay canvases to the full scrollable area, then repaint.
   function syncDrawCanvasSize() {
-    if (!drawCanvas || !canvas) return;
-    const wrap = drawCanvas.parentElement!;
-    // The scrollable content area is determined by the PDF canvas size + padding.
-    // We need the draw canvas to cover this entire area.
-    const w = wrap.scrollWidth;
-    const h = wrap.scrollHeight;
-    drawCanvas.style.width  = w + "px";
-    drawCanvas.style.height = h + "px";
-    drawCanvas.width  = w;
-    drawCanvas.height = h;
+    if (!dryCanvas || !wetCanvas || !canvas) return;
+    const wrap = dryCanvas.parentElement!;
+    // offsetWidth/offsetHeight give the full element size including padding,
+    // which is what the overlays need to cover. We also take the max with
+    // scrollWidth/scrollHeight to handle cases where zoomed content overflows.
+    const w = Math.max(wrap.offsetWidth, wrap.scrollWidth);
+    const h = Math.max(wrap.offsetHeight, wrap.scrollHeight);
+    for (const c of [dryCanvas, wetCanvas]) {
+      c.style.width  = w + "px";
+      c.style.height = h + "px";
+      c.width  = w;
+      c.height = h;
+    }
     redrawAllStrokes();
   }
 
@@ -343,8 +619,12 @@
     rendering = true;
     try {
       const page = await pdfDoc.getPage(pageNum);
+      const wrap = canvas.parentElement;
+      const availableWidth = wrap
+        ? wrap.clientWidth - parseFloat(getComputedStyle(wrap).paddingLeft) - parseFloat(getComputedStyle(wrap).paddingRight)
+        : 600;
       const fitScale = Math.min(
-        (canvas.parentElement?.clientWidth ?? 600) / page.getViewport({ scale: 1 }).width,
+        availableWidth / page.getViewport({ scale: 1 }).width,
         1.8
       );
       const scale = fitScale * zoomLevel;
@@ -367,6 +647,9 @@
     currentPage = clamped;
     currentPageId = null;
     strokes = [];
+    redoStack = [];
+    selectedStrokes = new Set();
+    selection = null;
     if (selectedBook) saveCurrentPage(selectedBook.id, currentPage);
     await renderPage(currentPage);
     if (selectedBook) resolvePageId(selectedBook.id, currentPage);
@@ -403,6 +686,58 @@
     totalPages = 0;
     zoomLevel = 1.0;
     strokes = [];
+    redoStack = [];
+    selectedStrokes = new Set();
+    selection = null;
+  }
+
+  // ── Undo / Redo ──
+  async function undoStroke() {
+    if (strokes.length === 0) return;
+    const removed = strokes[strokes.length - 1];
+    strokes = strokes.slice(0, -1);
+    redoStack = [...redoStack, [removed]];
+    if (removed.id !== null) {
+      invoke("delete_stroke", { strokeId: removed.id }).catch(() => {});
+    }
+    redrawAllStrokes();
+  }
+
+  async function redoStroke() {
+    if (redoStack.length === 0) return;
+    const entry = redoStack[redoStack.length - 1];
+    redoStack = redoStack.slice(0, -1);
+    strokes = [...strokes, ...entry];
+    for (const restored of entry) {
+      if (currentPageId !== null) {
+        invoke<number>("save_stroke", {
+          pageId: currentPageId,
+          stroke: {
+            colour: "rgba(30, 80, 220, 0.85)",
+            points: restored.points.map(({ x, y }) => ({ x, y })),
+          },
+        }).then(id => {
+          restored.id = id;
+        }).catch(() => {});
+      }
+    }
+    redrawAllStrokes();
+  }
+
+  // ── Delete selected strokes ──
+  async function deleteSelected() {
+    if (selectedStrokes.size === 0) return;
+    const deleted = [...selectedStrokes];
+    for (const s of deleted) {
+      if (s.id !== null) {
+        invoke("delete_stroke", { strokeId: s.id }).catch(() => {});
+      }
+    }
+    redoStack = [...redoStack, deleted];
+    strokes = strokes.filter(s => !selectedStrokes.has(s));
+    selectedStrokes = new Set();
+    selection = null;
+    redrawAllStrokes();
   }
 
   // ── Keyboard navigation ──
@@ -412,7 +747,16 @@
     // Don't steal focus from inputs
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 
-    if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+    if ((e.ctrlKey || e.metaKey) && e.key === "z") {
+      e.preventDefault();
+      await undoStroke();
+    } else if ((e.ctrlKey || e.metaKey) && (e.key === "y" || (e.shiftKey && e.key === "z"))) {
+      e.preventDefault();
+      await redoStroke();
+    } else if ((e.key === "Delete" || e.key === "Backspace") && mode === 'select' && selectedStrokes.size > 0) {
+      e.preventDefault();
+      await deleteSelected();
+    } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
       e.preventDefault();
       await prevPage();
     } else if (e.key === "ArrowRight" || e.key === "ArrowDown") {
@@ -441,6 +785,14 @@
     }
   }
 
+  let wrapResizeObserver: ResizeObserver | null = null;
+
+  function observeWrapResize(node: HTMLElement) {
+    wrapResizeObserver?.disconnect();
+    wrapResizeObserver = new ResizeObserver(() => syncDrawCanvasSize());
+    wrapResizeObserver.observe(node);
+  }
+
   onMount(() => {
     loadTextbooks();
     window.addEventListener("keydown", handleKeydown);
@@ -450,6 +802,7 @@
   onDestroy(() => {
     window.removeEventListener("keydown", handleKeydown);
     window.removeEventListener("wheel", handleWheel);
+    wrapResizeObserver?.disconnect();
   });
 
   let zoomPercent = $derived(Math.round(zoomLevel * 100));
@@ -472,11 +825,14 @@
         <p class="error">{error}</p>
       {/if}
 
-      <div class="canvas-wrap" onwheel={handleWheel}>
+      <div class="canvas-wrap" onwheel={handleWheel} use:observeWrapResize>
         <canvas bind:this={canvas}></canvas>
+        <canvas bind:this={dryCanvas} class="dry-canvas"></canvas>
         <canvas
-          bind:this={drawCanvas}
-          class="draw-canvas"
+          bind:this={wetCanvas}
+          class="wet-canvas"
+          class:erasing={mode === 'erase'}
+          class:selecting={mode === 'select'}
           onpointerdown={onPointerDown}
           onpointermove={onPointerMove}
           onpointerup={onPointerUp}
@@ -514,6 +870,79 @@
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="9 18 15 12 9 6"/>
+          </svg>
+        </button>
+
+        <div class="divider"></div>
+
+        <!-- Undo -->
+        <button
+          class="ink-btn"
+          onclick={undoStroke}
+          disabled={strokes.length === 0}
+          aria-label="Undo stroke"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 14 4 9l5-5"/>
+            <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>
+          </svg>
+        </button>
+
+        <!-- Redo -->
+        <button
+          class="ink-btn"
+          onclick={redoStroke}
+          disabled={redoStack.length === 0}
+          aria-label="Redo stroke"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M15 14l5-5-5-5"/>
+            <path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/>
+          </svg>
+        </button>
+
+        <div class="divider"></div>
+
+        <!-- Draw -->
+        <button
+          class="tool-btn"
+          class:active={mode === 'draw'}
+          onclick={() => { mode = 'draw'; selectedStrokes = new Set(); selection = null; redrawSelectionHighlight(); }}
+          aria-label="Draw"
+          aria-pressed={mode === 'draw'}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 19l7-7 3 3-7 7-3-3z"/>
+            <path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/>
+            <path d="M2 2l7.586 7.586"/>
+            <circle cx="11" cy="11" r="2"/>
+          </svg>
+        </button>
+
+        <!-- Erase -->
+        <button
+          class="tool-btn"
+          class:active={mode === 'erase'}
+          onclick={() => { mode = 'erase'; selectedStrokes = new Set(); selection = null; redrawSelectionHighlight(); }}
+          aria-label="Erase"
+          aria-pressed={mode === 'erase'}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 20H7L3 16l10-10 7 7-2.5 2.5"/>
+            <path d="M6.5 17.5l5-5"/>
+          </svg>
+        </button>
+
+        <!-- Select -->
+        <button
+          class="tool-btn"
+          class:active={mode === 'select'}
+          onclick={() => { mode = 'select'; selectedStrokes = new Set(); selection = null; redrawSelectionHighlight(); }}
+          aria-label="Select"
+          aria-pressed={mode === 'select'}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5 3l14 9-7 1-4 7-3-17z"/>
           </svg>
         </button>
 
@@ -795,13 +1224,29 @@
     box-shadow: 0 2px 16px rgba(0,0,0,0.18);
   }
 
-  .draw-canvas {
+  .dry-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    box-shadow: none;
+    pointer-events: none;
+  }
+
+  .wet-canvas {
     position: absolute;
     top: 0;
     left: 0;
     cursor: crosshair;
     touch-action: none;
     box-shadow: none;
+  }
+
+  .wet-canvas.erasing {
+    cursor: cell;
+  }
+
+  .wet-canvas.selecting {
+    cursor: default;
   }
 
   /* ── Navigation controls — pinned to bottom ── */
@@ -860,7 +1305,8 @@
     margin: 0 0.25rem;
   }
 
-  .zoom-btn {
+  .zoom-btn,
+  .ink-btn {
     display: flex;
     align-items: center;
     justify-content: center;
@@ -874,19 +1320,60 @@
     transition: background 0.15s, border-color 0.15s, opacity 0.15s;
   }
 
-  .zoom-btn:hover:not(:disabled) {
+  .zoom-btn:hover:not(:disabled),
+  .ink-btn:hover:not(:disabled) {
     background: #eee !important;
     border-color: #aaa;
   }
 
-  .zoom-btn:disabled {
+  .zoom-btn:disabled,
+  .ink-btn:disabled {
     opacity: 0.3;
     cursor: not-allowed;
   }
 
-  .zoom-btn svg {
+  .zoom-btn svg,
+  .ink-btn svg {
     width: 18px;
     height: 18px;
+  }
+
+  .tool-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    transition: background 0.15s, border-color 0.15s;
+  }
+
+  .tool-btn:hover:not(:disabled) {
+    background: #eee !important;
+    border-color: #aaa;
+  }
+
+  .tool-btn.active {
+    background: #dce8ff !important;
+    border-color: #396cd8;
+    color: #396cd8;
+  }
+
+  .tool-btn svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .tool-btn.active {
+      background: #1e3a6e !important;
+      border-color: #6b9aff;
+      color: #6b9aff;
+    }
   }
 
   .zoom-level {
