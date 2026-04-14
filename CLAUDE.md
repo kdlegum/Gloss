@@ -4,9 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is Gloss
 
-A personal maths notes app built with Tauri v2 + SvelteKit (frontend) and Rust (backend). Core workflow: import PDF textbooks → read page-by-page → ask an LLM questions → write self-explanations → build a personal glossary. Target platforms: desktop and Android tablet (via Tauri's Android support). Cross-device sync via Syncthing.
+A maths notes app for desktop and Android tablet. The core idea: **the structure of a PDF becomes the filing system**. Academic documents have natural semantic units — definitions, theorems, proofs, exercises — and Gloss surfaces these as first-class objects called **chunks**. Your work (ink, typed notes, scrap working) attaches to a chunk, not just to a page.
 
-Planned features (not yet built): per-keyword hover showing past self-explanations, learner profile in system prompt, RAG over the glossary, textbook chunking by natural maths structure (definition → theorem → proof → examples), embeddings with LLM-generated semantic tags.
+This is different from GoodNotes (which lets you write *on* a PDF). In Gloss you write *about* a specific chunk, anchored to it.
+
+Key features (many not yet built):
+- **Chunk system** — definitions, theorems, exercises, proofs are containers for your work. AI pre-suggests chunk boundaries, user confirms/adjusts.
+- **In-app AI chat** — chunk-aware: knows which chunk you're in, your attached work, and pulls in related chunks from across all sources via RAG over AI-generated semantic tags. Handles maths synonym/notation variation.
+- **Cross-source linking** — an exercise in a textbook can link to a related worked example in lecture notes.
+- **Progress tracking** — complete/incomplete status across all exercises in a textbook.
+- **Personal glossary** — self-explanations in your own words, one type of work attachable to a chunk. Doubles as a learner model for the AI.
+
+The notes app is the primary product — fast, pleasant, works well without AI. AI features are layered on after core note-taking is solid.
+
+Target platforms: desktop and Android tablet (via Tauri's Android support). Cross-device sync via Syncthing.
+
+LLM stack: Claude Sonnet (primary, via Anthropic API), Mathstral 7B via Ollama (offline fallback), OpenAI text-embedding-3-small (embeddings).
 
 ## Commands
 

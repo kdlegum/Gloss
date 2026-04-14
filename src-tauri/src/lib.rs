@@ -13,6 +13,7 @@ struct Point {
 struct StrokeInput {
     colour: String,
     points: Vec<Point>,
+    chunk_id: Option<i64>,
 }
 
 #[derive(serde::Serialize)]
@@ -24,10 +25,11 @@ struct StrokeOutput {
     min_y: f32,
     max_x: f32,
     max_y: f32,
+    chunk_id: Option<i64>,
 }
 
 #[derive(serde::Serialize)]
-struct Textbook {
+struct SourceDocument {
     id: i64,
     title: String,
     file_path: String,
@@ -37,7 +39,7 @@ struct Textbook {
 async fn import_pdf(
     app: tauri::AppHandle,
     pool: tauri::State<'_, SqlitePool>,
-) -> Result<Textbook, String> {
+) -> Result<SourceDocument, String> {
     // Open file picker
     let picked = app
         .dialog()
@@ -93,7 +95,7 @@ async fn import_pdf(
         .to_string_lossy()
         .to_string();
 
-    let row = sqlx::query("INSERT INTO textbooks (title, file_path) VALUES (?, ?) RETURNING id")
+    let row = sqlx::query("INSERT INTO source_documents (title, file_path) VALUES (?, ?) RETURNING id")
         .bind(&title)
         .bind(&relative_path)
         .fetch_one(pool.inner())
@@ -102,7 +104,7 @@ async fn import_pdf(
 
     let id: i64 = row.get("id");
 
-    Ok(Textbook {
+    Ok(SourceDocument {
         id,
         title,
         file_path: relative_path,
@@ -120,16 +122,16 @@ async fn get_pdf_path(
 }
 
 #[tauri::command]
-async fn list_textbooks(pool: tauri::State<'_, SqlitePool>) -> Result<Vec<Textbook>, String> {
+async fn list_textbooks(pool: tauri::State<'_, SqlitePool>) -> Result<Vec<SourceDocument>, String> {
     let rows =
-        sqlx::query("SELECT id, title, file_path FROM textbooks ORDER BY id DESC")
+        sqlx::query("SELECT id, title, file_path FROM source_documents ORDER BY id DESC")
             .fetch_all(pool.inner())
             .await
             .map_err(|e| e.to_string())?;
 
     Ok(rows
         .into_iter()
-        .map(|r| Textbook {
+        .map(|r| SourceDocument {
             id: r.get("id"),
             title: r.get("title"),
             file_path: r.get("file_path"),
@@ -139,21 +141,21 @@ async fn list_textbooks(pool: tauri::State<'_, SqlitePool>) -> Result<Vec<Textbo
 
 #[tauri::command]
 async fn get_or_create_page(
-    textbook_id: i64,
+    source_document_id: i64,
     page_number: i64,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<i64, String> {
     sqlx::query(
-        "INSERT OR IGNORE INTO pages (textbook_id, page_number) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO pages (source_document_id, page_number) VALUES (?, ?)",
     )
-    .bind(textbook_id)
+    .bind(source_document_id)
     .bind(page_number)
     .execute(pool.inner())
     .await
     .map_err(|e| e.to_string())?;
 
-    let row = sqlx::query("SELECT id FROM pages WHERE textbook_id = ? AND page_number = ?")
-        .bind(textbook_id)
+    let row = sqlx::query("SELECT id FROM pages WHERE source_document_id = ? AND page_number = ?")
+        .bind(source_document_id)
         .bind(page_number)
         .fetch_one(pool.inner())
         .await
@@ -189,8 +191,8 @@ async fn save_stroke(
         .map_err(|e| e.to_string())?;
 
     let row = sqlx::query(
-        "INSERT INTO strokes (page_id, data, colour, min_x, min_y, max_x, max_y) \
-         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO strokes (page_id, data, colour, min_x, min_y, max_x, max_y, chunk_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(page_id)
     .bind(&data)
@@ -199,6 +201,7 @@ async fn save_stroke(
     .bind(min_y)
     .bind(max_x)
     .bind(max_y)
+    .bind(stroke.chunk_id)
     .fetch_one(pool.inner())
     .await
     .map_err(|e| e.to_string())?;
@@ -224,7 +227,7 @@ async fn load_strokes(
     page_id: i64,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<Vec<StrokeOutput>, String> {
-    let rows = sqlx::query("SELECT id, colour, data, min_x, min_y, max_x, max_y FROM strokes WHERE page_id = ? ORDER BY id")
+    let rows = sqlx::query("SELECT id, colour, data, min_x, min_y, max_x, max_y, chunk_id FROM strokes WHERE page_id = ? ORDER BY id")
         .bind(page_id)
         .fetch_all(pool.inner())
         .await
@@ -244,6 +247,7 @@ async fn load_strokes(
                 min_y: r.get("min_y"),
                 max_x: r.get("max_x"),
                 max_y: r.get("max_y"),
+                chunk_id: r.get("chunk_id"),
             })
         })
         .collect()

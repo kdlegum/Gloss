@@ -1,0 +1,1 @@
+-- No-op: 0001_initial.sql was updated to create source_documents directly.

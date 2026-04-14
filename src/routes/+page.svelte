@@ -10,18 +10,18 @@
     import.meta.url
   ).href;
 
-  interface Textbook {
+  interface SourceDocument {
     id: number;
     title: string;
     file_path: string;
   }
 
-  let textbooks = $state<Textbook[]>([]);
+  let sourceDocuments = $state<SourceDocument[]>([]);
   let importing = $state(false);
   let error = $state<string | null>(null);
 
   // PDF viewer state
-  let selectedBook = $state<Textbook | null>(null);
+  let selectedBook = $state<SourceDocument | null>(null);
   let pdfDoc = $state<pdfjsLib.PDFDocumentProxy | null>(null);
   let currentPage = $state(1);
   let totalPages = $state(0);
@@ -30,16 +30,74 @@
   let dryCanvas = $state<HTMLCanvasElement>(null!);
   let wetCanvas = $state<HTMLCanvasElement>(null!);
 
-  // DB row id for the current (textbook, page) pair; null until resolved
+  // DB row id for the current (source_document, page) pair; null until resolved
   let currentPageId = $state<number | null>(null);
 
-  async function resolvePageId(bookId: number, pageNum: number) {
-    const pageId = await invoke<number>("get_or_create_page", {
-      textbookId: bookId,
+  // ── Stroke prefetch cache ──
+  // 5-entry LRU keyed by page DB id. Evicts the oldest entry when full.
+  const STROKE_CACHE_SIZE = 5;
+  const strokeCacheOrder: number[] = [];   // front = most recently used
+  const strokeCacheData = new Map<number, StrokeOutput[]>();
+  // Maps "bookId:pageNum" → pageId so prefetched page IDs can be reused
+  // without a second IPC round-trip when navigating.
+  const pageIdLookup = new Map<string, number>();
+
+  function cacheGet(pageId: number): StrokeOutput[] | undefined {
+    if (!strokeCacheData.has(pageId)) return undefined;
+    // Move to front (most recently used)
+    const idx = strokeCacheOrder.indexOf(pageId);
+    if (idx !== -1) strokeCacheOrder.splice(idx, 1);
+    strokeCacheOrder.unshift(pageId);
+    return strokeCacheData.get(pageId);
+  }
+
+  function cachePut(pageId: number, data: StrokeOutput[]) {
+    if (strokeCacheData.has(pageId)) {
+      const idx = strokeCacheOrder.indexOf(pageId);
+      if (idx !== -1) strokeCacheOrder.splice(idx, 1);
+    } else if (strokeCacheOrder.length >= STROKE_CACHE_SIZE) {
+      const evict = strokeCacheOrder.pop()!;
+      strokeCacheData.delete(evict);
+    }
+    strokeCacheOrder.unshift(pageId);
+    strokeCacheData.set(pageId, data);
+  }
+
+  function cacheEvict(pageId: number) {
+    const idx = strokeCacheOrder.indexOf(pageId);
+    if (idx !== -1) strokeCacheOrder.splice(idx, 1);
+    strokeCacheData.delete(pageId);
+  }
+
+  /** Fire-and-forget: resolve page id and warm the cache for an adjacent page. */
+  function prefetchPage(bookId: number, pageNum: number) {
+    if (pageNum < 1 || (totalPages > 0 && pageNum > totalPages)) return;
+    const key = `${bookId}:${pageNum}`;
+    invoke<number>("get_or_create_page", {
+      sourceDocumentId: bookId,
       pageNumber: pageNum,
-    });
+    }).then(pageId => {
+      pageIdLookup.set(key, pageId);
+      if (strokeCacheData.has(pageId)) return; // already cached
+      return invoke<StrokeOutput[]>("load_strokes", { pageId }).then(data => {
+        cachePut(pageId, data);
+      });
+    }).catch(() => { /* prefetch failures are silent */ });
+  }
+
+  async function resolvePageId(bookId: number, pageNum: number) {
+    const key = `${bookId}:${pageNum}`;
+    const pageId = pageIdLookup.get(key)
+      ?? await invoke<number>("get_or_create_page", {
+           sourceDocumentId: bookId,
+           pageNumber: pageNum,
+         });
+    pageIdLookup.set(key, pageId);
     currentPageId = pageId;
     await loadAndDrawStrokes(pageId);
+    // Warm adjacent pages after the current page is ready
+    prefetchPage(bookId, pageNum - 1);
+    prefetchPage(bookId, pageNum + 1);
   }
 
   interface StrokeOutput {
@@ -50,21 +108,33 @@
     min_y: number;
     max_x: number;
     max_y: number;
+    chunk_id: number | null;
   }
 
   async function loadAndDrawStrokes(pageId: number) {
-    const loaded = await invoke<StrokeOutput[]>("load_strokes", { pageId });
+    const cached = cacheGet(pageId);
+    const loaded = cached ?? await invoke<StrokeOutput[]>("load_strokes", { pageId });
+    if (!cached) cachePut(pageId, loaded);
     // Each loaded stroke has no pressure data; use a fixed pressure so line
     // width is consistent with how it was originally drawn.
     strokes = loaded.map(s => ({
       id: s.id,
       points: s.points.map(p => ({ x: p.x, y: p.y, pressure: 0.5 })),
       bbox: { minX: s.min_x, minY: s.min_y, maxX: s.max_x, maxY: s.max_y },
+      chunkId: s.chunk_id,
     }));
     redoStack = [];
-    // Wait for syncDrawCanvasSize (queued via rAF in renderPage) to have run
-    // before painting, so the draw canvas has the right dimensions.
-    requestAnimationFrame(redrawAllStrokes);
+    if (cached) {
+      // Strokes were already in memory — syncDrawCanvasSize was queued by
+      // renderPage in the same microtask turn, so the canvas is already sized.
+      // Draw immediately rather than deferring another frame.
+      syncDrawCanvasSize();
+      redrawAllStrokes();
+    } else {
+      // Data arrived from IPC after renderPage's rAF may have already fired;
+      // queue a new frame to ensure the canvas is sized before painting.
+      requestAnimationFrame(redrawAllStrokes);
+    }
   }
 
   // ── Tool mode ──
@@ -91,10 +161,14 @@
   //
   type Point = { x: number; y: number; pressure: number };  // normalised page space
   type BBox = { minX: number; minY: number; maxX: number; maxY: number };
-  type Stroke = { id: number | null; points: Point[]; bbox: BBox };
+  type Stroke = { id: number | null; points: Point[]; bbox: BBox; chunkId: number | null };
 
   let isDrawing = $state(false);
   let currentStroke = $state<Point[]>([]);
+  let wetRafPending = false;
+  // Moving-average smoother (window = 3) — disabled for now.
+  // const MA_WINDOW = 3;
+  // let maBuffer: Point[] = [];
   // Completed strokes for the current page (cleared on page navigation)
   let strokes = $state<Stroke[]>([]);
   // Strokes removed by Ctrl+Z, available for Ctrl+Y (cleared on new stroke).
@@ -219,6 +293,7 @@
 
     strokes = toKeep;
     redoStack = [...redoStack, toDelete];
+    if (currentPageId !== null) cacheEvict(currentPageId);
     for (const s of toDelete) {
       if (s.id !== null) {
         invoke("delete_stroke", { strokeId: s.id }).catch(() => {});
@@ -257,6 +332,7 @@
     activePointerId = e.pointerId;
     wetCanvas.setPointerCapture(e.pointerId);
     isDrawing = true;
+    // maBuffer = [];  // reset smoother buffer on stroke start
     currentStroke = [getPagePoint(e)];
     e.preventDefault();
   }
@@ -292,10 +368,27 @@
     // Use getCoalescedEvents when available for smoother lines on high-freq devices
     const events: PointerEvent[] = e.getCoalescedEvents?.() ?? [e];
     for (const ce of events) {
+      // Moving-average smoother (window = MA_WINDOW) — disabled for now.
+      // const raw = getPagePoint(ce);
+      // maBuffer.push(raw);
+      // if (maBuffer.length > MA_WINDOW) maBuffer.shift();
+      // const n = maBuffer.length;
+      // const smoothed: Point = {
+      //   x: maBuffer.reduce((s, p) => s + p.x, 0) / n,
+      //   y: maBuffer.reduce((s, p) => s + p.y, 0) / n,
+      //   pressure: maBuffer.reduce((s, p) => s + p.pressure, 0) / n,
+      // };
+      // currentStroke = [...currentStroke, smoothed];
       currentStroke = [...currentStroke, getPagePoint(ce)];
     }
 
-    redrawWetStroke();
+    if (!wetRafPending) {
+      wetRafPending = true;
+      requestAnimationFrame(() => {
+        wetRafPending = false;
+        redrawWetStroke();
+      });
+    }
   }
 
   function onPointerUp(e: PointerEvent) {
@@ -311,7 +404,7 @@
       activePointerId = null;
       if (selectRect) {
         selectedStrokes = hitTestStrokes(selectRect);
-        selection = unionBBox(selectedStrokes);
+        selection = unionBBox(selectedStrokes) ?? { x: selectRect.x, y: selectRect.y, width: selectRect.w, height: selectRect.h };
       }
       selectOrigin = null;
       selectRect = null;
@@ -323,16 +416,18 @@
     if (isDrawing && currentStroke.length >= 2) {
       const completed = currentStroke;
       // Add with a null id; fill in the real id once the save resolves.
-      const stroke: Stroke = { id: null, points: completed, bbox: computeBBox(completed) };
+      const stroke: Stroke = { id: null, points: completed, bbox: computeBBox(completed), chunkId: null };
       strokes = [...strokes, stroke];
       redoStack = []; // any new stroke wipes the redo history
       redrawAllStrokes(); // bake the new stroke onto the dry canvas
       if (currentPageId !== null) {
+        cacheEvict(currentPageId);
         invoke<number>("save_stroke", {
           pageId: currentPageId,
           stroke: {
             colour: "rgba(30, 80, 220, 0.85)",
             points: completed.map(({ x, y }) => ({ x, y })),
+            chunkId: stroke.chunkId,
           },
         }).then(id => {
           stroke.id = id;
@@ -384,23 +479,30 @@
 
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
-    ctx.strokeStyle = "rgba(30, 80, 220, 0.85)";
+    ctx.strokeStyle = "rgb(30, 80, 220)";
+
+    // Convert all points to draw-canvas space up front.
+    const dc = pts.map(p => pageToDrawCanvas(p.x, p.y));
 
     ctx.beginPath();
-    const first = pageToDrawCanvas(pts[0].x, pts[0].y);
-    ctx.moveTo(first.x, first.y);
-    for (let i = 1; i < pts.length; i++) {
-      const dc = pageToDrawCanvas(pts[i].x, pts[i].y);
+    ctx.moveTo(dc[0].x, dc[0].y);
+    let currentWidth = 1 + pts[1].pressure * 5;
+    ctx.lineWidth = currentWidth;
+
+    for (let i = 1; i < dc.length - 1; i++) {
       const width = 1 + pts[i].pressure * 5;
       if (ctx.lineWidth !== width) {
         ctx.stroke();
         ctx.beginPath();
-        const dcPrev = pageToDrawCanvas(pts[i - 1].x, pts[i - 1].y);
-        ctx.moveTo(dcPrev.x, dcPrev.y);
+        const midPrev = { x: (dc[i - 1].x + dc[i].x) / 2, y: (dc[i - 1].y + dc[i].y) / 2 };
+        ctx.moveTo(midPrev.x, midPrev.y);
         ctx.lineWidth = width;
       }
-      ctx.lineTo(dc.x, dc.y);
+      const mid = { x: (dc[i].x + dc[i + 1].x) / 2, y: (dc[i].y + dc[i + 1].y) / 2 };
+      ctx.quadraticCurveTo(dc[i].x, dc[i].y, mid.x, mid.y);
     }
+    const last = dc.length - 1;
+    ctx.quadraticCurveTo(dc[last - 1].x, dc[last - 1].y, dc[last].x, dc[last].y);
     ctx.stroke();
   }
 
@@ -412,25 +514,30 @@
 
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
-    ctx.strokeStyle = "rgba(30, 80, 220, 0.85)";
+    ctx.strokeStyle = "rgb(30, 80, 220)";
 
     for (const stroke of strokes) {
       if (stroke.points.length < 2) continue;
+      const dc = stroke.points.map(p => pageToDrawCanvas(p.x, p.y));
+
       ctx.beginPath();
-      const first = pageToDrawCanvas(stroke.points[0].x, stroke.points[0].y);
-      ctx.moveTo(first.x, first.y);
-      for (let i = 1; i < stroke.points.length; i++) {
-        const dc = pageToDrawCanvas(stroke.points[i].x, stroke.points[i].y);
+      ctx.moveTo(dc[0].x, dc[0].y);
+      ctx.lineWidth = 1 + stroke.points[1].pressure * 5;
+
+      for (let i = 1; i < dc.length - 1; i++) {
         const width = 1 + stroke.points[i].pressure * 5;
         if (ctx.lineWidth !== width) {
           ctx.stroke();
           ctx.beginPath();
-          const dcPrev = pageToDrawCanvas(stroke.points[i - 1].x, stroke.points[i - 1].y);
-          ctx.moveTo(dcPrev.x, dcPrev.y);
+          const midPrev = { x: (dc[i - 1].x + dc[i].x) / 2, y: (dc[i - 1].y + dc[i].y) / 2 };
+          ctx.moveTo(midPrev.x, midPrev.y);
           ctx.lineWidth = width;
         }
-        ctx.lineTo(dc.x, dc.y);
+        const mid = { x: (dc[i].x + dc[i + 1].x) / 2, y: (dc[i].y + dc[i + 1].y) / 2 };
+        ctx.quadraticCurveTo(dc[i].x, dc[i].y, mid.x, mid.y);
       }
+      const last = dc.length - 1;
+      ctx.quadraticCurveTo(dc[last - 1].x, dc[last - 1].y, dc[last].x, dc[last].y);
       ctx.stroke();
     }
     // Repaint selection highlight on top (wet canvas)
@@ -538,13 +645,15 @@
     // offsetWidth/offsetHeight give the full element size including padding,
     // which is what the overlays need to cover. We also take the max with
     // scrollWidth/scrollHeight to handle cases where zoomed content overflows.
+    const dpr = window.devicePixelRatio || 1;
     const w = Math.max(wrap.offsetWidth, wrap.scrollWidth);
     const h = Math.max(wrap.offsetHeight, wrap.scrollHeight);
     for (const c of [dryCanvas, wetCanvas]) {
       c.style.width  = w + "px";
       c.style.height = h + "px";
-      c.width  = w;
-      c.height = h;
+      c.width  = Math.round(w * dpr);
+      c.height = Math.round(h * dpr);
+      c.getContext("2d")!.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
     redrawAllStrokes();
   }
@@ -569,16 +678,16 @@
     return v ? Math.max(1, parseInt(v, 10)) : 1;
   }
 
-  async function loadTextbooks() {
-    textbooks = await invoke<Textbook[]>("list_textbooks");
+  async function loadSourceDocuments() {
+    sourceDocuments = await invoke<SourceDocument[]>("list_textbooks");
   }
 
   async function importPdf() {
     error = null;
     importing = true;
     try {
-      await invoke<Textbook>("import_pdf");
-      await loadTextbooks();
+      await invoke<SourceDocument>("import_pdf");
+      await loadSourceDocuments();
     } catch (e: unknown) {
       if (e !== "cancelled") {
         error = String(e);
@@ -588,7 +697,7 @@
     }
   }
 
-  async function openBook(book: Textbook) {
+  async function openBook(book: SourceDocument) {
     error = null;
     selectedBook = book;
     currentPage = loadSavedPage(book.id);
@@ -628,11 +737,15 @@
         1.8
       );
       const scale = fitScale * zoomLevel;
+      const dpr = window.devicePixelRatio || 1;
       const viewport = page.getViewport({ scale });
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
+      canvas.width  = Math.round(viewport.width  * dpr);
+      canvas.height = Math.round(viewport.height * dpr);
+      canvas.style.width  = viewport.width  + "px";
+      canvas.style.height = viewport.height + "px";
       const ctx = canvas.getContext("2d")!;
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, viewport.width, viewport.height);
       await page.render({ canvasContext: ctx, viewport }).promise;
       requestAnimationFrame(syncDrawCanvasSize);
     } finally {
@@ -652,7 +765,7 @@
     selection = null;
     if (selectedBook) saveCurrentPage(selectedBook.id, currentPage);
     await renderPage(currentPage);
-    if (selectedBook) resolvePageId(selectedBook.id, currentPage);
+    if (selectedBook) await resolvePageId(selectedBook.id, currentPage);
   }
 
   async function prevPage() {
@@ -697,6 +810,7 @@
     const removed = strokes[strokes.length - 1];
     strokes = strokes.slice(0, -1);
     redoStack = [...redoStack, [removed]];
+    if (currentPageId !== null) cacheEvict(currentPageId);
     if (removed.id !== null) {
       invoke("delete_stroke", { strokeId: removed.id }).catch(() => {});
     }
@@ -708,6 +822,7 @@
     const entry = redoStack[redoStack.length - 1];
     redoStack = redoStack.slice(0, -1);
     strokes = [...strokes, ...entry];
+    if (currentPageId !== null) cacheEvict(currentPageId);
     for (const restored of entry) {
       if (currentPageId !== null) {
         invoke<number>("save_stroke", {
@@ -715,6 +830,7 @@
           stroke: {
             colour: "rgba(30, 80, 220, 0.85)",
             points: restored.points.map(({ x, y }) => ({ x, y })),
+            chunkId: restored.chunkId,
           },
         }).then(id => {
           restored.id = id;
@@ -724,10 +840,69 @@
     redrawAllStrokes();
   }
 
+  // ── AI rasterisation ──
+  let aiWorking = $state(false);
+  let aiDebugImage = $state<string | null>(null);
+
+  /**
+   * Composite the PDF canvas and the ink overlay (dryCanvas) into an offscreen
+   * canvas cropped to the current selection bbox, then export as base64 PNG.
+   *
+   * `selection` is in normalised page space (0–1 relative to the PDF canvas).
+   * The PDF canvas pixel dimensions directly map: x_px = normX * canvas.width.
+   * dryCanvas covers the full scroll area; the page sits at an offset inside it,
+   * so we use pageToDrawCanvas to find where the crop starts on the ink layer.
+   */
+  async function rasteriseSelection(): Promise<string> {
+    if (!selection || !canvas || !dryCanvas) throw new Error("Nothing selected");
+
+    // PDF canvas pixel coords of the selection
+    const sx = selection.x * canvas.width;
+    const sy = selection.y * canvas.height;
+    const sw = selection.width  * canvas.width;
+    const sh = selection.height * canvas.height;
+
+    // dryCanvas pixel coords of the same region
+    const tl = pageToDrawCanvas(selection.x, selection.y);
+    const br = pageToDrawCanvas(selection.x + selection.width, selection.y + selection.height);
+    const dw = br.x - tl.x;
+    const dh = br.y - tl.y;
+
+    const offscreen = new OffscreenCanvas(Math.round(sw), Math.round(sh));
+    const ctx = offscreen.getContext("2d")!;
+
+    // Draw PDF layer
+    ctx.drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+    // Draw ink overlay (dryCanvas spans the full wrap; crop to the page region)
+    ctx.drawImage(dryCanvas, tl.x, tl.y, dw, dh, 0, 0, sw, sh);
+
+    const blob = await offscreen.convertToBlob({ type: "image/png" });
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve((reader.result as string).split(",")[1]);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  async function onAiClick() {
+    if (!selection || aiWorking) return;
+    aiWorking = true;
+    try {
+      const b64 = await rasteriseSelection();
+      aiDebugImage = `data:image/png;base64,${b64}`;
+    } catch (e) {
+      console.error("rasteriseSelection failed:", e);
+    } finally {
+      aiWorking = false;
+    }
+  }
+
   // ── Delete selected strokes ──
   async function deleteSelected() {
     if (selectedStrokes.size === 0) return;
     const deleted = [...selectedStrokes];
+    if (currentPageId !== null) cacheEvict(currentPageId);
     for (const s of deleted) {
       if (s.id !== null) {
         invoke("delete_stroke", { strokeId: s.id }).catch(() => {});
@@ -794,7 +969,7 @@
   }
 
   onMount(() => {
-    loadTextbooks();
+    loadSourceDocuments();
     window.addEventListener("keydown", handleKeydown);
     window.addEventListener("wheel", handleWheel, { passive: false });
   });
@@ -839,6 +1014,13 @@
           onpointercancel={onPointerCancel}
         ></canvas>
       </div>
+
+      {#if aiDebugImage}
+        <div class="ai-debug" role="dialog" aria-label="Debug preview">
+          <button class="ai-debug-close" onclick={() => aiDebugImage = null} aria-label="Close">✕</button>
+          <img src={aiDebugImage} alt="Rasterised selection" />
+        </div>
+      {/if}
 
       <div class="controls">
         <!-- Prev -->
@@ -946,6 +1128,27 @@
           </svg>
         </button>
 
+        <!-- AI -->
+        <button
+          class="tool-btn ai-btn"
+          class:active={!!selection}
+          onclick={onAiClick}
+          disabled={!selection || aiWorking}
+          aria-label="Ask AI about selection"
+          title="Ask AI"
+        >
+          {#if aiWorking}
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="spin">
+              <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+            </svg>
+          {:else}
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2a7 7 0 0 1 7 7c0 2.5-1.3 4.7-3.3 6L15 21H9l-.3-6.1A7 7 0 0 1 5 9a7 7 0 0 1 7-7z"/>
+              <line x1="9" y1="21" x2="15" y2="21"/>
+            </svg>
+          {/if}
+        </button>
+
         <div class="divider"></div>
 
         <!-- Zoom out -->
@@ -1000,11 +1203,11 @@
       <p class="error">{error}</p>
     {/if}
 
-    {#if textbooks.length === 0}
-      <p class="empty">No textbooks yet. Import a PDF to get started.</p>
+    {#if sourceDocuments.length === 0}
+      <p class="empty">No documents yet. Import a PDF to get started.</p>
     {:else}
       <ul>
-        {#each textbooks as book (book.id)}
+        {#each sourceDocuments as book (book.id)}
           <li>
             <button class="book-item" onclick={() => openBook(book)}>
               <span class="title">{book.title}</span>
@@ -1161,6 +1364,7 @@
 
   /* ── Viewer ── */
   .viewer {
+    position: relative;
     display: flex;
     flex-direction: column;
     height: 100vh;
@@ -1393,5 +1597,83 @@
 
   .zoom-level:hover {
     background: #eee !important;
+  }
+
+  .ai-debug {
+    position: absolute;
+    bottom: 1rem;
+    right: 1rem;
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.22);
+    padding: 0.5rem;
+    z-index: 100;
+    max-width: 320px;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+
+  .ai-debug img {
+    max-width: 100%;
+    border-radius: 4px;
+    display: block;
+    box-shadow: none;
+  }
+
+  .ai-debug-close {
+    align-self: flex-end;
+    background: transparent;
+    border: none;
+    color: #666;
+    font-size: 0.9em;
+    padding: 0 0.2em;
+    cursor: pointer;
+    line-height: 1;
+    width: auto;
+    height: auto;
+    border-radius: 4px;
+  }
+
+  .ai-debug-close:hover {
+    background: #eee !important;
+    color: #000;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .ai-debug {
+      background: #222;
+      border-color: #444;
+    }
+    .ai-debug-close {
+      color: #aaa;
+    }
+    .ai-debug-close:hover {
+      background: #333 !important;
+      color: #fff;
+    }
+  }
+
+  .ai-btn:not(:disabled).active {
+    background: #dce8ff !important;
+    border-color: #396cd8;
+    color: #396cd8;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .ai-btn:not(:disabled).active {
+      background: #1e3a6e !important;
+      border-color: #6b9aff;
+      color: #6b9aff;
+    }
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .spin {
+    animation: spin 0.9s linear infinite;
   }
 </style>
