@@ -1,14 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { convertFileSrc } from "@tauri-apps/api/core";
   import { onMount, onDestroy } from "svelte";
-  import * as pdfjsLib from "pdfjs-dist";
-
-  // Point the worker at the bundled worker file
-  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-    "pdfjs-dist/build/pdf.worker.min.mjs",
-    import.meta.url
-  ).href;
 
   interface SourceDocument {
     id: number;
@@ -22,13 +14,9 @@
 
   // PDF viewer state
   let selectedBook = $state<SourceDocument | null>(null);
-  let pdfDoc = $state<pdfjsLib.PDFDocumentProxy | null>(null);
   let currentPage = $state(1);
   let totalPages = $state(0);
   let rendering = $state(false);
-  let canvas = $state<HTMLCanvasElement>(null!);
-  let dryCanvas = $state<HTMLCanvasElement>(null!);
-  let wetCanvas = $state<HTMLCanvasElement>(null!);
 
   // DB row id for the current (source_document, page) pair; null until resolved
   let currentPageId = $state<number | null>(null);
@@ -38,13 +26,10 @@
   const STROKE_CACHE_SIZE = 5;
   const strokeCacheOrder: number[] = [];   // front = most recently used
   const strokeCacheData = new Map<number, StrokeOutput[]>();
-  // Maps "bookId:pageNum" → pageId so prefetched page IDs can be reused
-  // without a second IPC round-trip when navigating.
   const pageIdLookup = new Map<string, number>();
 
   function cacheGet(pageId: number): StrokeOutput[] | undefined {
     if (!strokeCacheData.has(pageId)) return undefined;
-    // Move to front (most recently used)
     const idx = strokeCacheOrder.indexOf(pageId);
     if (idx !== -1) strokeCacheOrder.splice(idx, 1);
     strokeCacheOrder.unshift(pageId);
@@ -69,7 +54,6 @@
     strokeCacheData.delete(pageId);
   }
 
-  /** Fire-and-forget: resolve page id and warm the cache for an adjacent page. */
   function prefetchPage(bookId: number, pageNum: number) {
     if (pageNum < 1 || (totalPages > 0 && pageNum > totalPages)) return;
     const key = `${bookId}:${pageNum}`;
@@ -78,11 +62,11 @@
       pageNumber: pageNum,
     }).then(pageId => {
       pageIdLookup.set(key, pageId);
-      if (strokeCacheData.has(pageId)) return; // already cached
+      if (strokeCacheData.has(pageId)) return;
       return invoke<StrokeOutput[]>("load_strokes", { pageId }).then(data => {
         cachePut(pageId, data);
       });
-    }).catch(() => { /* prefetch failures are silent */ });
+    }).catch(() => {});
   }
 
   async function resolvePageId(bookId: number, pageNum: number) {
@@ -95,7 +79,6 @@
     pageIdLookup.set(key, pageId);
     currentPageId = pageId;
     await loadAndDrawStrokes(pageId);
-    // Warm adjacent pages after the current page is ready
     prefetchPage(bookId, pageNum - 1);
     prefetchPage(bookId, pageNum + 1);
   }
@@ -115,8 +98,6 @@
     const cached = cacheGet(pageId);
     const loaded = cached ?? await invoke<StrokeOutput[]>("load_strokes", { pageId });
     if (!cached) cachePut(pageId, loaded);
-    // Each loaded stroke has no pressure data; use a fixed pressure so line
-    // width is consistent with how it was originally drawn.
     strokes = loaded.map(s => ({
       id: s.id,
       points: s.points.map(p => ({ x: p.x, y: p.y, pressure: 0.5 })),
@@ -124,17 +105,7 @@
       chunkId: s.chunk_id,
     }));
     redoStack = [];
-    if (cached) {
-      // Strokes were already in memory — syncDrawCanvasSize was queued by
-      // renderPage in the same microtask turn, so the canvas is already sized.
-      // Draw immediately rather than deferring another frame.
-      syncDrawCanvasSize();
-      redrawAllStrokes();
-    } else {
-      // Data arrived from IPC after renderPage's rAF may have already fired;
-      // queue a new frame to ensure the canvas is sized before painting.
-      requestAnimationFrame(redrawAllStrokes);
-    }
+    markDirty();
   }
 
   // ── Tool mode ──
@@ -146,92 +117,130 @@
   let selectOrigin = $state<{ x: number; y: number } | null>(null);
   let selectRect   = $state<Rect | null>(null);
   let selectedStrokes = $state<Set<Stroke>>(new Set());
-  // Union bbox of all selected strokes, in normalised page space. Used to
-  // export the area as an image. null when nothing is selected.
   let selection = $state<{ x: number; y: number; width: number; height: number } | null>(null);
 
   // ── Drawing state ──
-  //
-  // Coordinates are stored in *normalised page space*:
-  //   x, y ∈ [0, 1]  — 0 = page left/top edge, 1 = page right/bottom edge.
-  //   Values outside [0,1] are allowed (drawing in the margin).
-  //
-  // This makes strokes zoom-invariant: to draw them at any zoom level, just
-  // multiply by the current PDF canvas CSS size.
-  //
   type Point = { x: number; y: number; pressure: number };  // normalised page space
   type BBox = { minX: number; minY: number; maxX: number; maxY: number };
   type Stroke = { id: number | null; points: Point[]; bbox: BBox; chunkId: number | null };
 
   let isDrawing = $state(false);
-  let currentStroke = $state<Point[]>([]);
-  let wetRafPending = false;
-  // Moving-average smoother (window = 3) — disabled for now.
-  // const MA_WINDOW = 3;
-  // let maBuffer: Point[] = [];
-  // Completed strokes for the current page (cleared on page navigation)
+  let currentStroke: Point[] = [];
+  let lastDrawnStrokeIndex = 0;
   let strokes = $state<Stroke[]>([]);
-  // Strokes removed by Ctrl+Z, available for Ctrl+Y (cleared on new stroke).
-  // Each entry is an array of strokes removed together as one action.
   let redoStack = $state<Stroke[][]>([]);
-  // Active pointer id for palm rejection (first pen/stylus wins)
   let activePointerId: number | null = null;
 
+  const PRESSURE_WIDTH_THRESHOLD = 0.5;
+
+  // ── Infinite canvas state ──
+  // camera is $state so the toolbar zoom% and disabled states stay in sync.
+  // The render loop reads it directly (no reactive overhead on every frame).
+  interface Camera { x: number; y: number; scale: number }
+  let camera = $state<Camera>({ x: 0, y: 0, scale: 1 });
+
+  const ZOOM_MIN = 0.3;
+  const ZOOM_MAX = 8.0;
+  const ZOOM_STEP = 0.15;
+
+  // World-space position and size of the PDF page
+  let pageOrigin = { x: 0, y: 0 };
+  let pageSize = { w: 0, h: 0 };
+
+  // Canvas elements (all viewport-sized, layered via absolute positioning)
+  let canvasContainer = $state<HTMLDivElement>(null!);
+  let gridCanvas = $state<HTMLCanvasElement>(null!);
+  let pdfCanvas  = $state<HTMLCanvasElement>(null!);
+  let dryCanvas  = $state<HTMLCanvasElement>(null!);
+  let wetCanvas  = $state<HTMLCanvasElement>(null!);
+
+  let gridCtx: CanvasRenderingContext2D | null = null;
+  let pdfCtx:  CanvasRenderingContext2D | null = null;
+  let dryCtx:  CanvasRenderingContext2D | null = null;
+  let wetCtx:  CanvasRenderingContext2D | null = null;
+
+  // rAF render loop
+  let dirty = false;
+  let rafId: number | null = null;
+
+  function scheduleRender() {
+    if (rafId !== null) return;
+    rafId = requestAnimationFrame(() => {
+      rafId = null;
+      if (dirty) { renderAll(); dirty = false; }
+    });
+  }
+
+  function markDirty() { dirty = true; scheduleRender(); }
+
+  // ── PDF bitmap cache ──
+  // Keyed by "pageNum:scaleKey". Stores rendered ImageBitmaps.
+  const PDF_BITMAP_CACHE_MAX = 10;
+  const pdfBitmapCacheOrder: string[] = [];
+  const pdfBitmapCache = new Map<string, ImageBitmap>();
+  let currentPdfBitmap: ImageBitmap | null = null;
+
+  function bitmapCacheGet(key: string): ImageBitmap | undefined {
+    const v = pdfBitmapCache.get(key);
+    if (!v) return undefined;
+    const idx = pdfBitmapCacheOrder.indexOf(key);
+    if (idx !== -1) pdfBitmapCacheOrder.splice(idx, 1);
+    pdfBitmapCacheOrder.unshift(key);
+    return v;
+  }
+
+  function bitmapCachePut(key: string, bm: ImageBitmap) {
+    if (pdfBitmapCache.has(key)) {
+      const idx = pdfBitmapCacheOrder.indexOf(key);
+      if (idx !== -1) pdfBitmapCacheOrder.splice(idx, 1);
+    } else if (pdfBitmapCacheOrder.length >= PDF_BITMAP_CACHE_MAX) {
+      const evict = pdfBitmapCacheOrder.pop()!;
+      pdfBitmapCache.get(evict)?.close();
+      pdfBitmapCache.delete(evict);
+    }
+    pdfBitmapCacheOrder.unshift(key);
+    pdfBitmapCache.set(key, bm);
+  }
+
   // ── Coordinate transforms ──
-  //
-  // Normalised page space: (0,0) = PDF page top-left, (1,1) = PDF page bottom-right.
-  // Screen space: the pointer event's (clientX, clientY).
-  // Canvas space: logical pixel coordinate on dryCanvas/wetCanvas (set by syncDrawCanvasSize).
 
-  /**
-   * Convert a screen-space pointer position to normalised page space.
-   * The PDF canvas element defines the [0,1] coordinate space.
-   */
-  function screenToPage(screenX: number, screenY: number): { x: number; y: number } {
-    const pageRect = canvas.getBoundingClientRect();
+  function screenToWorld(sx: number, sy: number): { x: number; y: number } {
     return {
-      x: (screenX - pageRect.left) / pageRect.width,
-      y: (screenY - pageRect.top)  / pageRect.height,
+      x: (sx - camera.x) / camera.scale,
+      y: (sy - camera.y) / camera.scale,
     };
   }
 
-  /**
-   * Convert a normalised page-space coordinate to canvas logical pixels.
-   * dryCanvas/wetCanvas cover the full canvas-wrap area; the page sits somewhere inside.
-   */
-  function pageToDrawCanvas(normX: number, normY: number): { x: number; y: number } {
-    const wrap = dryCanvas.parentElement!;
-    const pageRect = canvas.getBoundingClientRect();
-    const wrapRect = wrap.getBoundingClientRect();
-
-    // Page origin in scroll-content space (accounts for scroll offset)
-    const originX = pageRect.left - wrapRect.left + wrap.scrollLeft;
-    const originY = pageRect.top  - wrapRect.top  + wrap.scrollTop;
-
-    // draw canvas logical pixels == CSS pixels (we set width/height explicitly)
+  /** Convert a screen pointer to normalised page space [0,1]. */
+  function pointerToNorm(clientX: number, clientY: number): { x: number; y: number } {
+    const rect = canvasContainer.getBoundingClientRect();
+    const sx = clientX - rect.left;
+    const sy = clientY - rect.top;
+    const wx = (sx - camera.x) / camera.scale;
+    const wy = (sy - camera.y) / camera.scale;
     return {
-      x: originX + normX * pageRect.width,
-      y: originY + normY * pageRect.height,
+      x: (wx - pageOrigin.x) / pageSize.w,
+      y: (wy - pageOrigin.y) / pageSize.h,
     };
   }
 
-  /**
-   * Convert a pointer event to a normalised page-space point.
-   */
+  /** Normalised page space → world space coordinates. */
+  function normToWorld(nx: number, ny: number): { x: number; y: number } {
+    return {
+      x: pageOrigin.x + nx * pageSize.w,
+      y: pageOrigin.y + ny * pageSize.h,
+    };
+  }
+
   function getPagePoint(e: PointerEvent): Point {
-    const { x, y } = screenToPage(e.clientX, e.clientY);
-    return {
-      x,
-      y,
-      pressure: e.pressure > 0 ? e.pressure : 0.5,
-    };
+    const { x, y } = pointerToNorm(e.clientX, e.clientY);
+    return { x, y, pressure: e.pressure > 0 ? e.pressure : 0.5 };
   }
 
   function isPenOrMouse(e: PointerEvent): boolean {
     return e.pointerType === "pen" || e.pointerType === "mouse";
   }
 
-  /** Compute a bounding box in normalised page space from a list of points. */
   function computeBBox(points: Point[]): BBox {
     let minX = points[0].x, minY = points[0].y;
     let maxX = minX, maxY = minY;
@@ -244,25 +253,18 @@
     return { minX, minY, maxX, maxY };
   }
 
-  /**
-   * Erase any stroke whose point comes within `radiusPx` CSS pixels of the
-   * eraser tip (given in normalised page space).  Uses the stored bbox as a
-   * cheap pre-filter before checking individual points.
-   */
+  // ── Erase eraser hit radius in world units ──
+  const ERASE_RADIUS_WORLD = 6; // ~6px at scale=1
+
   function eraseAt(normX: number, normY: number) {
-    const pageRect = canvas.getBoundingClientRect();
-    // Convert the pixel radius to normalised units (use the smaller dimension
-    // so the circle isn't stretched on non-square pages).
-    const radiusPx = 6;
-    const rNormX = radiusPx / pageRect.width;
-    const rNormY = radiusPx / pageRect.height;
+    // Convert eraser radius from world px to normalised units
+    const rNormX = ERASE_RADIUS_WORLD / (pageSize.w * camera.scale);
+    const rNormY = ERASE_RADIUS_WORLD / (pageSize.h * camera.scale);
     const toDelete: Stroke[] = [];
     const toKeep: Stroke[] = [];
 
     for (const stroke of strokes) {
       const { minX, minY, maxX, maxY } = stroke.bbox;
-
-      // Bbox pre-filter (expanded by radius)
       if (
         normX < minX - rNormX || normX > maxX + rNormX ||
         normY < minY - rNormY || normY > maxY + rNormY
@@ -270,47 +272,68 @@
         toKeep.push(stroke);
         continue;
       }
-
-      // Per-point distance check (screen-space circle)
       let hit = false;
       for (const p of stroke.points) {
-        const dx = (p.x - normX) * pageRect.width;
-        const dy = (p.y - normY) * pageRect.height;
-        if (dx * dx + dy * dy <= radiusPx * radiusPx) {
+        const dx = (p.x - normX) * pageSize.w * camera.scale;
+        const dy = (p.y - normY) * pageSize.h * camera.scale;
+        if (dx * dx + dy * dy <= ERASE_RADIUS_WORLD * ERASE_RADIUS_WORLD) {
           hit = true;
           break;
         }
       }
-
-      if (hit) {
-        toDelete.push(stroke);
-      } else {
-        toKeep.push(stroke);
-      }
+      if (hit) toDelete.push(stroke);
+      else toKeep.push(stroke);
     }
 
     if (toDelete.length === 0) return;
-
     strokes = toKeep;
     redoStack = [...redoStack, toDelete];
     if (currentPageId !== null) cacheEvict(currentPageId);
     for (const s of toDelete) {
-      if (s.id !== null) {
-        invoke("delete_stroke", { strokeId: s.id }).catch(() => {});
-      }
+      if (s.id !== null) invoke("delete_stroke", { strokeId: s.id }).catch(() => {});
     }
-    redrawAllStrokes();
+    markDirty();
   }
 
+  // ── Touch pan/pinch state ──
+  interface TouchPointer { id: number; x: number; y: number }
+  let touchPointers: TouchPointer[] = [];
+
+  function touchDist(a: TouchPointer, b: TouchPointer): number {
+    const dx = a.x - b.x; const dy = a.y - b.y;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+  function touchMid(a: TouchPointer, b: TouchPointer): { x: number; y: number } {
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  }
+
+  let lastPinchDist = 0;
+  let lastPinchMid = { x: 0, y: 0 };
+
+  // ── Pointer events ──
+
   function onPointerDown(e: PointerEvent) {
-    // Palm rejection: ignore touch; ignore second concurrent pointer
+    if (e.pointerType === 'touch') {
+      touchPointers = touchPointers.filter(p => p.id !== e.pointerId);
+      touchPointers = [...touchPointers, { id: e.pointerId, x: e.clientX, y: e.clientY }];
+      if (touchPointers.length === 2) {
+        lastPinchDist = touchDist(touchPointers[0], touchPointers[1]);
+        lastPinchMid  = touchMid(touchPointers[0], touchPointers[1]);
+      } else if (touchPointers.length === 1) {
+        // Initialise pan origin so first move delta is zero
+        lastPinchMid = { x: e.clientX, y: e.clientY };
+      }
+      e.preventDefault();
+      return;
+    }
+
     if (!isPenOrMouse(e)) return;
     if (activePointerId !== null) return;
 
     if (mode === 'erase') {
       activePointerId = e.pointerId;
       wetCanvas.setPointerCapture(e.pointerId);
-      const { x, y } = screenToPage(e.clientX, e.clientY);
+      const { x, y } = pointerToNorm(e.clientX, e.clientY);
       eraseAt(x, y);
       e.preventDefault();
       return;
@@ -319,12 +342,12 @@
     if (mode === 'select') {
       activePointerId = e.pointerId;
       wetCanvas.setPointerCapture(e.pointerId);
-      const { x, y } = screenToPage(e.clientX, e.clientY);
+      const { x, y } = pointerToNorm(e.clientX, e.clientY);
       selectOrigin = { x, y };
       selectRect = null;
       selectedStrokes = new Set();
       selection = null;
-      redrawSelectionHighlight();
+      markDirty();
       e.preventDefault();
       return;
     }
@@ -332,18 +355,53 @@
     activePointerId = e.pointerId;
     wetCanvas.setPointerCapture(e.pointerId);
     isDrawing = true;
-    // maBuffer = [];  // reset smoother buffer on stroke start
-    currentStroke = [getPagePoint(e)];
+    currentStroke = [];
+    currentStroke.push(getPagePoint(e));
+    lastDrawnStrokeIndex = 0;
     e.preventDefault();
   }
 
   function onPointerMove(e: PointerEvent) {
+    if (e.pointerType === 'touch') {
+      touchPointers = touchPointers.map(p => p.id === e.pointerId ? { id: e.pointerId, x: e.clientX, y: e.clientY } : p);
+      if (touchPointers.length === 2) {
+        const [a, b] = touchPointers;
+        const newDist = touchDist(a, b);
+        const newMid  = touchMid(a, b);
+        const zoomFactor = newDist / lastPinchDist;
+        const newScale = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, camera.scale * zoomFactor));
+        // Keep pinch midpoint stationary in world space
+        const wx = (newMid.x - camera.x) / camera.scale;
+        const wy = (newMid.y - camera.y) / camera.scale;
+        camera.x = newMid.x - wx * newScale;
+        camera.y = newMid.y - wy * newScale;
+        // Also pan by midpoint movement
+        camera.x += newMid.x - lastPinchMid.x;
+        camera.y += newMid.y - lastPinchMid.y;
+        camera.scale = newScale;
+        lastPinchDist = newDist;
+        lastPinchMid  = newMid;
+      } else if (touchPointers.length === 1 && activePointerId === null) {
+        // 1-finger pan
+        const cur = touchPointers[0];
+        // delta tracked via lastPinchMid reuse
+        const dx = cur.x - lastPinchMid.x;
+        const dy = cur.y - lastPinchMid.y;
+        camera.x += dx;
+        camera.y += dy;
+        lastPinchMid = { x: cur.x, y: cur.y };
+      }
+      markDirty();
+      e.preventDefault();
+      return;
+    }
+
     if (mode === 'erase') {
       if (e.pointerId !== activePointerId) return;
       e.preventDefault();
       const events: PointerEvent[] = e.getCoalescedEvents?.() ?? [e];
       for (const ce of events) {
-        const { x, y } = screenToPage(ce.clientX, ce.clientY);
+        const { x, y } = pointerToNorm(ce.clientX, ce.clientY);
         eraseAt(x, y);
       }
       return;
@@ -352,46 +410,36 @@
     if (mode === 'select') {
       if (e.pointerId !== activePointerId || !selectOrigin) return;
       e.preventDefault();
-      const { x, y } = screenToPage(e.clientX, e.clientY);
+      const { x, y } = pointerToNorm(e.clientX, e.clientY);
       selectRect = {
         x: Math.min(selectOrigin.x, x),
         y: Math.min(selectOrigin.y, y),
         w: Math.abs(x - selectOrigin.x),
         h: Math.abs(y - selectOrigin.y),
       };
-      drawRubberBand(selectRect);
+      markDirty();
       return;
     }
+
     if (!isDrawing || e.pointerId !== activePointerId) return;
     e.preventDefault();
-
-    // Use getCoalescedEvents when available for smoother lines on high-freq devices
     const events: PointerEvent[] = e.getCoalescedEvents?.() ?? [e];
     for (const ce of events) {
-      // Moving-average smoother (window = MA_WINDOW) — disabled for now.
-      // const raw = getPagePoint(ce);
-      // maBuffer.push(raw);
-      // if (maBuffer.length > MA_WINDOW) maBuffer.shift();
-      // const n = maBuffer.length;
-      // const smoothed: Point = {
-      //   x: maBuffer.reduce((s, p) => s + p.x, 0) / n,
-      //   y: maBuffer.reduce((s, p) => s + p.y, 0) / n,
-      //   pressure: maBuffer.reduce((s, p) => s + p.pressure, 0) / n,
-      // };
-      // currentStroke = [...currentStroke, smoothed];
-      currentStroke = [...currentStroke, getPagePoint(ce)];
+      currentStroke.push(getPagePoint(ce));
     }
-
-    if (!wetRafPending) {
-      wetRafPending = true;
-      requestAnimationFrame(() => {
-        wetRafPending = false;
-        redrawWetStroke();
-      });
-    }
+    markDirty();
   }
 
   function onPointerUp(e: PointerEvent) {
+    if (e.pointerType === 'touch') {
+      touchPointers = touchPointers.filter(p => p.id !== e.pointerId);
+      if (touchPointers.length === 1) {
+        lastPinchMid = { x: touchPointers[0].x, y: touchPointers[0].y };
+      }
+      e.preventDefault();
+      return;
+    }
+
     if (mode === 'erase') {
       if (e.pointerId !== activePointerId) return;
       activePointerId = null;
@@ -408,18 +456,17 @@
       }
       selectOrigin = null;
       selectRect = null;
-      redrawSelectionHighlight();
+      markDirty();
       e.preventDefault();
       return;
     }
+
     if (e.pointerId !== activePointerId) return;
     if (isDrawing && currentStroke.length >= 2) {
       const completed = currentStroke;
-      // Add with a null id; fill in the real id once the save resolves.
       const stroke: Stroke = { id: null, points: completed, bbox: computeBBox(completed), chunkId: null };
       strokes = [...strokes, stroke];
-      redoStack = []; // any new stroke wipes the redo history
-      redrawAllStrokes(); // bake the new stroke onto the dry canvas
+      redoStack = [];
       if (currentPageId !== null) {
         cacheEvict(currentPageId);
         invoke<number>("save_stroke", {
@@ -429,88 +476,111 @@
             points: completed.map(({ x, y }) => ({ x, y })),
             chunkId: stroke.chunkId,
           },
-        }).then(id => {
-          stroke.id = id;
-        }).catch(() => { /* persist failure is silent */ });
+        }).then(id => { stroke.id = id; }).catch(() => {});
       }
     }
     isDrawing = false;
     activePointerId = null;
     currentStroke = [];
-    // Clear the wet canvas — the committed stroke is now on the dry canvas
-    if (wetCanvas) {
-      wetCanvas.getContext("2d")!.clearRect(0, 0, wetCanvas.width, wetCanvas.height);
-    }
+    lastDrawnStrokeIndex = 0;
+    markDirty();
   }
 
   function onPointerCancel(e: PointerEvent) {
-    if (mode === 'erase') {
-      if (e.pointerId !== activePointerId) return;
-      activePointerId = null;
+    if (e.pointerType === 'touch') {
+      touchPointers = touchPointers.filter(p => p.id !== e.pointerId);
+      e.preventDefault();
       return;
     }
 
-    if (mode === 'select') {
+    if (mode === 'erase' || mode === 'select') {
       if (e.pointerId !== activePointerId) return;
       activePointerId = null;
       selectOrigin = null;
       selectRect = null;
-      redrawSelectionHighlight();
+      markDirty();
       return;
     }
+
     if (e.pointerId !== activePointerId) return;
-    // Discard the in-progress stroke (e.g. palm was detected mid-stroke),
-    // but keep all previously committed strokes.
     isDrawing = false;
     activePointerId = null;
     currentStroke = [];
-    if (wetCanvas) {
-      wetCanvas.getContext("2d")!.clearRect(0, 0, wetCanvas.width, wetCanvas.height);
-    }
+    lastDrawnStrokeIndex = 0;
+    markDirty();
   }
 
-  /** Paint the in-progress stroke onto the wet canvas (cleared each call). */
-  function redrawWetStroke() {
-    if (!wetCanvas) return;
-    const ctx = wetCanvas.getContext("2d")!;
-    ctx.clearRect(0, 0, wetCanvas.width, wetCanvas.height);
-    const pts = currentStroke;
-    if (pts.length < 2) return;
+  // ── Render loop ──
 
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    ctx.strokeStyle = "rgb(30, 80, 220)";
+  function renderAll() {
+    renderGrid();
+    renderPdf();
+    renderDryStrokes();
+    renderWetLayer();
+  }
 
-    // Convert all points to draw-canvas space up front.
-    const dc = pts.map(p => pageToDrawCanvas(p.x, p.y));
+  function renderGrid() {
+    if (!gridCtx || !gridCanvas) return;
+    const ctx = gridCtx;
+    const w = gridCanvas.width;
+    const h = gridCanvas.height;
+    const dpr = window.devicePixelRatio || 1;
 
-    ctx.beginPath();
-    ctx.moveTo(dc[0].x, dc[0].y);
-    let currentWidth = 1 + pts[1].pressure * 5;
-    ctx.lineWidth = currentWidth;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, w, h);
 
-    for (let i = 1; i < dc.length - 1; i++) {
-      const width = 1 + pts[i].pressure * 5;
-      if (ctx.lineWidth !== width) {
-        ctx.stroke();
+    const GRID_WORLD = 40;
+    const DOT_R = 1.5;
+    const spacing = GRID_WORLD * camera.scale;
+    if (spacing < 8 || spacing > 300) return;
+
+    const startW = screenToWorld(0, 0);
+    const startX = Math.floor(startW.x / GRID_WORLD) * GRID_WORLD;
+    const startY = Math.floor(startW.y / GRID_WORLD) * GRID_WORLD;
+
+    ctx.fillStyle = 'rgba(0,0,0,0.18)';
+    for (let wx = startX; ; wx += GRID_WORLD) {
+      const sx = (wx * camera.scale + camera.x) * dpr;
+      if (sx > w + DOT_R * dpr) break;
+      if (sx < -DOT_R * dpr) continue;
+      for (let wy = startY; ; wy += GRID_WORLD) {
+        const sy = (wy * camera.scale + camera.y) * dpr;
+        if (sy > h + DOT_R * dpr) break;
+        if (sy < -DOT_R * dpr) continue;
         ctx.beginPath();
-        const midPrev = { x: (dc[i - 1].x + dc[i].x) / 2, y: (dc[i - 1].y + dc[i].y) / 2 };
-        ctx.moveTo(midPrev.x, midPrev.y);
-        ctx.lineWidth = width;
+        ctx.arc(sx, sy, DOT_R, 0, Math.PI * 2);
+        ctx.fill();
       }
-      const mid = { x: (dc[i].x + dc[i + 1].x) / 2, y: (dc[i].y + dc[i + 1].y) / 2 };
-      ctx.quadraticCurveTo(dc[i].x, dc[i].y, mid.x, mid.y);
     }
-    const last = dc.length - 1;
-    ctx.quadraticCurveTo(dc[last - 1].x, dc[last - 1].y, dc[last].x, dc[last].y);
-    ctx.stroke();
   }
 
-  /** Repaint all committed strokes onto the dry canvas from scratch. */
-  function redrawAllStrokes() {
-    if (!dryCanvas) return;
-    const ctx = dryCanvas.getContext("2d")!;
-    ctx.clearRect(0, 0, dryCanvas.width, dryCanvas.height);
+  function renderPdf() {
+    if (!pdfCtx || !pdfCanvas || !currentPdfBitmap) return;
+    const ctx = pdfCtx;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.setTransform(camera.scale * dpr, 0, 0, camera.scale * dpr, camera.x * dpr, camera.y * dpr);
+    ctx.clearRect(
+      -camera.x / camera.scale, -camera.y / camera.scale,
+      pdfCanvas.width / (camera.scale * dpr), pdfCanvas.height / (camera.scale * dpr),
+    );
+    ctx.drawImage(currentPdfBitmap, pageOrigin.x, pageOrigin.y, pageSize.w, pageSize.h);
+  }
+
+  function renderDryStrokes() {
+    if (!dryCtx || !dryCanvas) return;
+    const ctx = dryCtx;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.setTransform(camera.scale * dpr, 0, 0, camera.scale * dpr, camera.x * dpr, camera.y * dpr);
+    ctx.clearRect(
+      -camera.x / camera.scale, -camera.y / camera.scale,
+      dryCanvas.width / (camera.scale * dpr), dryCanvas.height / (camera.scale * dpr),
+    );
+
+    // Viewport culling: compute visible rect in normalised page space
+    const visMinX = (-camera.x / camera.scale - pageOrigin.x) / pageSize.w;
+    const visMinY = (-camera.y / camera.scale - pageOrigin.y) / pageSize.h;
+    const visMaxX = visMinX + (canvasContainer.clientWidth  / camera.scale) / pageSize.w;
+    const visMaxY = visMinY + (canvasContainer.clientHeight / camera.scale) / pageSize.h;
 
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
@@ -518,36 +588,102 @@
 
     for (const stroke of strokes) {
       if (stroke.points.length < 2) continue;
-      const dc = stroke.points.map(p => pageToDrawCanvas(p.x, p.y));
-
-      ctx.beginPath();
-      ctx.moveTo(dc[0].x, dc[0].y);
-      ctx.lineWidth = 1 + stroke.points[1].pressure * 5;
-
-      for (let i = 1; i < dc.length - 1; i++) {
-        const width = 1 + stroke.points[i].pressure * 5;
-        if (ctx.lineWidth !== width) {
-          ctx.stroke();
-          ctx.beginPath();
-          const midPrev = { x: (dc[i - 1].x + dc[i].x) / 2, y: (dc[i - 1].y + dc[i].y) / 2 };
-          ctx.moveTo(midPrev.x, midPrev.y);
-          ctx.lineWidth = width;
-        }
-        const mid = { x: (dc[i].x + dc[i + 1].x) / 2, y: (dc[i].y + dc[i + 1].y) / 2 };
-        ctx.quadraticCurveTo(dc[i].x, dc[i].y, mid.x, mid.y);
-      }
-      const last = dc.length - 1;
-      ctx.quadraticCurveTo(dc[last - 1].x, dc[last - 1].y, dc[last].x, dc[last].y);
-      ctx.stroke();
+      if (
+        stroke.bbox.maxX < visMinX || stroke.bbox.minX > visMaxX ||
+        stroke.bbox.maxY < visMinY || stroke.bbox.minY > visMaxY
+      ) continue;
+      drawStrokePoints(ctx, stroke.points, 0);
     }
-    // Repaint selection highlight on top (wet canvas)
-    redrawSelectionHighlight();
+
+    // Draw selection highlight on dry canvas
+    if (selectedStrokes.size > 0) {
+      ctx.save();
+      ctx.strokeStyle = "rgba(255, 140, 0, 0.9)";
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      for (const stroke of selectedStrokes) {
+        if (stroke.points.length < 2) continue;
+        drawStrokePoints(ctx, stroke.points, 0);
+      }
+      ctx.restore();
+    }
+  }
+
+  function renderWetLayer() {
+    if (!wetCtx || !wetCanvas) return;
+    const ctx = wetCtx;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.setTransform(camera.scale * dpr, 0, 0, camera.scale * dpr, camera.x * dpr, camera.y * dpr);
+
+    // Wet stroke
+    if (isDrawing && currentStroke.length >= 2) {
+      const pts = currentStroke;
+      if (lastDrawnStrokeIndex < 2) {
+        ctx.clearRect(
+          -camera.x / camera.scale, -camera.y / camera.scale,
+          wetCanvas.width / (camera.scale * dpr), wetCanvas.height / (camera.scale * dpr),
+        );
+        drawStrokePoints(ctx, pts, 0);
+      } else {
+        drawStrokePoints(ctx, pts, Math.max(0, lastDrawnStrokeIndex - 1));
+      }
+      lastDrawnStrokeIndex = pts.length;
+    } else if (selectRect) {
+      // Rubber-band selection rectangle
+      ctx.clearRect(
+        -camera.x / camera.scale, -camera.y / camera.scale,
+        wetCanvas.width / (camera.scale * dpr), wetCanvas.height / (camera.scale * dpr),
+      );
+      const tl = normToWorld(selectRect.x, selectRect.y);
+      const br = normToWorld(selectRect.x + selectRect.w, selectRect.y + selectRect.h);
+      ctx.save();
+      ctx.strokeStyle = "rgba(57, 108, 216, 0.9)";
+      ctx.lineWidth = 1.5 / camera.scale;
+      ctx.setLineDash([5 / camera.scale, 4 / camera.scale]);
+      ctx.strokeRect(tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+      ctx.fillStyle = "rgba(57, 108, 216, 0.08)";
+      ctx.fillRect(tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+      ctx.restore();
+    } else {
+      ctx.clearRect(
+        -camera.x / camera.scale, -camera.y / camera.scale,
+        wetCanvas.width / (camera.scale * dpr), wetCanvas.height / (camera.scale * dpr),
+      );
+    }
   }
 
   /**
-   * Compute the union bounding box of a set of strokes in normalised page
-   * space. Returns null if the set is empty.
+   * Draw stroke points in world space. ctx must have camera setTransform applied.
+   * Points are in normalised page space; converted to world here.
    */
+  function drawStrokePoints(ctx: CanvasRenderingContext2D, pts: Point[], startIdx: number) {
+    if (pts.length - startIdx < 2) return;
+    const slice = pts.slice(startIdx);
+    const wc = slice.map(p => normToWorld(p.x, p.y));
+
+    ctx.beginPath();
+    ctx.moveTo(wc[0].x, wc[0].y);
+    ctx.lineWidth = (1 + slice[0].pressure * 5) / camera.scale;
+
+    for (let i = 1; i < wc.length - 1; i++) {
+      const width = (1 + slice[i].pressure * 5) / camera.scale;
+      if (Math.abs(ctx.lineWidth - width) > PRESSURE_WIDTH_THRESHOLD / camera.scale) {
+        ctx.stroke();
+        ctx.beginPath();
+        const midPrev = { x: (wc[i - 1].x + wc[i].x) / 2, y: (wc[i - 1].y + wc[i].y) / 2 };
+        ctx.moveTo(midPrev.x, midPrev.y);
+        ctx.lineWidth = width;
+      }
+      const mid = { x: (wc[i].x + wc[i + 1].x) / 2, y: (wc[i].y + wc[i + 1].y) / 2 };
+      ctx.quadraticCurveTo(wc[i].x, wc[i].y, mid.x, mid.y);
+    }
+    const last = wc.length - 1;
+    ctx.quadraticCurveTo(wc[last - 1].x, wc[last - 1].y, wc[last].x, wc[last].y);
+    ctx.stroke();
+  }
+
+  // ── Hit test / selection helpers ──
+
   function unionBBox(hits: Set<Stroke>): { x: number; y: number; width: number; height: number } | null {
     if (hits.size === 0) return null;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -560,37 +696,12 @@
     return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
   }
 
-  /** Draw the rubber-band selection rectangle on the wet canvas. */
-  function drawRubberBand(rect: Rect) {
-    if (!wetCanvas) return;
-    const ctx = wetCanvas.getContext("2d")!;
-    ctx.clearRect(0, 0, wetCanvas.width, wetCanvas.height);
-
-    const tl = pageToDrawCanvas(rect.x,          rect.y);
-    const br = pageToDrawCanvas(rect.x + rect.w,  rect.y + rect.h);
-    const w = br.x - tl.x;
-    const h = br.y - tl.y;
-
-    ctx.save();
-    ctx.strokeStyle = "rgba(57, 108, 216, 0.9)";
-    ctx.lineWidth = 1.5;
-    ctx.setLineDash([5, 4]);
-    ctx.strokeRect(tl.x, tl.y, w, h);
-    ctx.fillStyle = "rgba(57, 108, 216, 0.08)";
-    ctx.fillRect(tl.x, tl.y, w, h);
-    ctx.restore();
-  }
-
-  /** Return the set of strokes that have at least one point inside `rect`. */
   function hitTestStrokes(rect: Rect): Set<Stroke> {
-    const r2 = rect.x + rect.w;
-    const b2 = rect.y + rect.h;
+    const r2 = rect.x + rect.w, b2 = rect.y + rect.h;
     const hit = new Set<Stroke>();
     for (const stroke of strokes) {
-      // Cheap bbox pre-filter: skip if stroke bbox doesn't overlap rect at all
       if (stroke.bbox.maxX < rect.x || stroke.bbox.minX > r2 ||
           stroke.bbox.maxY < rect.y || stroke.bbox.minY > b2) continue;
-      // Per-point check
       for (const p of stroke.points) {
         if (p.x >= rect.x && p.x <= r2 && p.y >= rect.y && p.y <= b2) {
           hit.add(stroke);
@@ -601,78 +712,105 @@
     return hit;
   }
 
-  /**
-   * Repaint the wet canvas to show the current selection highlight.
-   * Call after selectedStrokes changes and after redrawAllStrokes.
-   */
-  function redrawSelectionHighlight() {
-    if (!wetCanvas) return;
-    const ctx = wetCanvas.getContext("2d")!;
-    ctx.clearRect(0, 0, wetCanvas.width, wetCanvas.height);
-    if (selectedStrokes.size === 0) return;
+  // ── Canvas setup / resize ──
 
-    ctx.save();
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    ctx.strokeStyle = "rgba(255, 140, 0, 0.9)";
-
-    for (const stroke of selectedStrokes) {
-      if (stroke.points.length < 2) continue;
-      ctx.beginPath();
-      const first = pageToDrawCanvas(stroke.points[0].x, stroke.points[0].y);
-      ctx.moveTo(first.x, first.y);
-      for (let i = 1; i < stroke.points.length; i++) {
-        const dc = pageToDrawCanvas(stroke.points[i].x, stroke.points[i].y);
-        const width = 1 + stroke.points[i].pressure * 5;
-        if (ctx.lineWidth !== width) {
-          ctx.stroke();
-          ctx.beginPath();
-          const dcPrev = pageToDrawCanvas(stroke.points[i - 1].x, stroke.points[i - 1].y);
-          ctx.moveTo(dcPrev.x, dcPrev.y);
-          ctx.lineWidth = width;
-        }
-        ctx.lineTo(dc.x, dc.y);
-      }
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
-
-  // Sync both overlay canvases to the full scrollable area, then repaint.
-  function syncDrawCanvasSize() {
-    if (!dryCanvas || !wetCanvas || !canvas) return;
-    const wrap = dryCanvas.parentElement!;
-    // offsetWidth/offsetHeight give the full element size including padding,
-    // which is what the overlays need to cover. We also take the max with
-    // scrollWidth/scrollHeight to handle cases where zoomed content overflows.
+  function setupCanvases() {
+    if (!canvasContainer || !gridCanvas || !pdfCanvas || !dryCanvas || !wetCanvas) return;
     const dpr = window.devicePixelRatio || 1;
-    const w = Math.max(wrap.offsetWidth, wrap.scrollWidth);
-    const h = Math.max(wrap.offsetHeight, wrap.scrollHeight);
-    for (const c of [dryCanvas, wetCanvas]) {
-      c.style.width  = w + "px";
-      c.style.height = h + "px";
+    const w = canvasContainer.clientWidth;
+    const h = canvasContainer.clientHeight;
+    for (const c of [gridCanvas, pdfCanvas, dryCanvas, wetCanvas]) {
       c.width  = Math.round(w * dpr);
       c.height = Math.round(h * dpr);
-      c.getContext("2d")!.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
-    redrawAllStrokes();
+    gridCtx = gridCanvas.getContext("2d");
+    pdfCtx  = pdfCanvas.getContext("2d");
+    dryCtx  = dryCanvas.getContext("2d")!;
+    wetCtx  = wetCanvas.getContext("2d")!;
+    if (dryCtx) { dryCtx.lineCap = "round"; dryCtx.lineJoin = "round"; }
+    if (wetCtx) { wetCtx.lineCap = "round"; wetCtx.lineJoin = "round"; wetCtx.strokeStyle = "rgb(30, 80, 220)"; }
+    markDirty();
   }
 
-  // Zoom state (1.0 = auto-fit width, multiplier on top of that)
-  let zoomLevel = $state(1.0);
-  const ZOOM_STEP = 0.15;
-  const ZOOM_MIN = 0.3;
-  const ZOOM_MAX = 4.0;
+  let containerResizeObserver: ResizeObserver | null = null;
 
-  // Persist last page per book
-  function savedPageKey(bookId: number) {
-    return `gloss_page_${bookId}`;
+  function observeContainerResize(node: HTMLElement) {
+    containerResizeObserver?.disconnect();
+    containerResizeObserver = new ResizeObserver(() => {
+      setupCanvases();
+    });
+    containerResizeObserver.observe(node);
   }
 
+  // ── Camera helpers ──
+
+  function zoomAt(screenX: number, screenY: number, factor: number) {
+    const newScale = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, camera.scale * factor));
+    const wx = (screenX - camera.x) / camera.scale;
+    const wy = (screenY - camera.y) / camera.scale;
+    camera.x = screenX - wx * newScale;
+    camera.y = screenY - wy * newScale;
+    camera.scale = newScale;
+    markDirty();
+  }
+
+  function centreOnPage() {
+    if (!pageSize.w || !canvasContainer) return;
+    const vw = canvasContainer.clientWidth;
+    camera.x = (vw - pageSize.w * camera.scale) / 2;
+    camera.y = 0;
+    markDirty();
+  }
+
+  // ── PDF loading ──
+
+  async function loadPdfPage(pageNum: number) {
+    if (!selectedBook || !canvasContainer) return;
+    rendering = true;
+    try {
+      const containerW = canvasContainer.clientWidth;
+      const pageDisplayW = containerW - 80; // 40px margin each side
+      const dpr = window.devicePixelRatio || 1;
+      // pdfium scale = pixels per PDF point. We aim for pixelWidth wide output.
+      // 595pt ≈ standard A4 width; scale is approximate for non-A4 pages, but the
+      // bitmap is always drawn to fill pageDisplayW in world space so it looks correct
+      // regardless of the actual page width in points.
+      const pixelWidth = Math.round(pageDisplayW * dpr);
+      const approxScale = pixelWidth / 595;
+      const cacheKey = `${pageNum}:${pixelWidth}`;
+      let bitmap = bitmapCacheGet(cacheKey);
+
+      if (!bitmap) {
+        const buf: ArrayBuffer = await invoke("render_pdf_page", {
+          relativePath: selectedBook.file_path,
+          pageNumber: pageNum - 1,
+          scale: approxScale,
+        });
+        const header = new DataView(buf);
+        const width = header.getUint32(0, true);
+        const height = header.getUint32(4, true);
+        const rgba = new Uint8ClampedArray(buf, 8);
+        const imageData = new ImageData(rgba, width, height);
+        bitmap = await createImageBitmap(imageData);
+        bitmapCachePut(cacheKey, bitmap);
+      }
+
+      currentPdfBitmap = bitmap;
+      // pageSize in world units: display width fixed, height from bitmap aspect ratio
+      pageSize = { w: pageDisplayW, h: pageDisplayW * (bitmap.height / bitmap.width) };
+      centreOnPage();
+      markDirty();
+    } finally {
+      rendering = false;
+    }
+  }
+
+  // ── Page navigation ──
+
+  function savedPageKey(bookId: number) { return `gloss_page_${bookId}`; }
   function saveCurrentPage(bookId: number, page: number) {
     localStorage.setItem(savedPageKey(bookId), String(page));
   }
-
   function loadSavedPage(bookId: number): number {
     const v = localStorage.getItem(savedPageKey(bookId));
     return v ? Math.max(1, parseInt(v, 10)) : 1;
@@ -689,9 +827,7 @@
       await invoke<SourceDocument>("import_pdf");
       await loadSourceDocuments();
     } catch (e: unknown) {
-      if (e !== "cancelled") {
-        error = String(e);
-      }
+      if (e !== "cancelled") error = String(e);
     } finally {
       importing = false;
     }
@@ -702,61 +838,28 @@
     selectedBook = book;
     currentPage = loadSavedPage(book.id);
     currentPageId = null;
-    zoomLevel = 1.0;
-    pdfDoc = null;
     totalPages = 0;
+    strokes = [];
+    redoStack = [];
+    selectedStrokes = new Set();
+    selection = null;
+    currentPdfBitmap = null;
 
+    // Get page count from backend
     try {
-      const absPath = await invoke<string>("get_pdf_path", {
-        relativePath: book.file_path,
-      });
-      const url = convertFileSrc(absPath);
-      const doc = await pdfjsLib.getDocument({ url, isOffscreenCanvasSupported: false, isImageDecoderSupported: false }).promise;
-      pdfDoc = doc;
-      totalPages = doc.numPages;
-      // Clamp saved page in case book changed
+      totalPages = await invoke<number>("get_page_count", { relativePath: book.file_path });
       if (currentPage > totalPages) currentPage = 1;
-      await renderPage(currentPage);
+      await loadPdfPage(currentPage);
       resolvePageId(book.id, currentPage);
     } catch (e) {
       error = String(e);
     }
   }
 
-  async function renderPage(pageNum: number) {
-    if (!pdfDoc || !canvas) return;
-    rendering = true;
-    try {
-      const page = await pdfDoc.getPage(pageNum);
-      const wrap = canvas.parentElement;
-      const availableWidth = wrap
-        ? wrap.clientWidth - parseFloat(getComputedStyle(wrap).paddingLeft) - parseFloat(getComputedStyle(wrap).paddingRight)
-        : 600;
-      const fitScale = Math.min(
-        availableWidth / page.getViewport({ scale: 1 }).width,
-        1.8
-      );
-      const scale = fitScale * zoomLevel;
-      const dpr = window.devicePixelRatio || 1;
-      const viewport = page.getViewport({ scale });
-      canvas.width  = Math.round(viewport.width  * dpr);
-      canvas.height = Math.round(viewport.height * dpr);
-      canvas.style.width  = viewport.width  + "px";
-      canvas.style.height = viewport.height + "px";
-      const ctx = canvas.getContext("2d")!;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.clearRect(0, 0, viewport.width, viewport.height);
-      await page.render({ canvasContext: ctx, viewport }).promise;
-      requestAnimationFrame(syncDrawCanvasSize);
-    } finally {
-      rendering = false;
-    }
-  }
-
   async function goToPage(pageNum: number) {
     if (rendering) return;
     const clamped = Math.max(1, Math.min(totalPages, pageNum));
-    if (clamped === currentPage) return;
+    if (clamped === currentPage && currentPdfBitmap) return;
     currentPage = clamped;
     currentPageId = null;
     strokes = [];
@@ -764,57 +867,35 @@
     selectedStrokes = new Set();
     selection = null;
     if (selectedBook) saveCurrentPage(selectedBook.id, currentPage);
-    await renderPage(currentPage);
+    await loadPdfPage(currentPage);
     if (selectedBook) await resolvePageId(selectedBook.id, currentPage);
   }
 
-  async function prevPage() {
-    await goToPage(currentPage - 1);
-  }
-
-  async function nextPage() {
-    await goToPage(currentPage + 1);
-  }
-
-  async function zoomIn() {
-    zoomLevel = Math.min(ZOOM_MAX, +(zoomLevel + ZOOM_STEP).toFixed(2));
-    await renderPage(currentPage);
-  }
-
-  async function zoomOut() {
-    zoomLevel = Math.max(ZOOM_MIN, +(zoomLevel - ZOOM_STEP).toFixed(2));
-    await renderPage(currentPage);
-  }
-
-  async function resetZoom() {
-    zoomLevel = 1.0;
-    await renderPage(currentPage);
-  }
+  async function prevPage() { await goToPage(currentPage - 1); }
+  async function nextPage() { await goToPage(currentPage + 1); }
 
   function closeViewer() {
     selectedBook = null;
-    pdfDoc = null;
     currentPage = 1;
     currentPageId = null;
     totalPages = 0;
-    zoomLevel = 1.0;
     strokes = [];
     redoStack = [];
     selectedStrokes = new Set();
     selection = null;
+    currentPdfBitmap = null;
   }
 
   // ── Undo / Redo ──
+
   async function undoStroke() {
     if (strokes.length === 0) return;
     const removed = strokes[strokes.length - 1];
     strokes = strokes.slice(0, -1);
     redoStack = [...redoStack, [removed]];
     if (currentPageId !== null) cacheEvict(currentPageId);
-    if (removed.id !== null) {
-      invoke("delete_stroke", { strokeId: removed.id }).catch(() => {});
-    }
-    redrawAllStrokes();
+    if (removed.id !== null) invoke("delete_stroke", { strokeId: removed.id }).catch(() => {});
+    markDirty();
   }
 
   async function redoStroke() {
@@ -832,49 +913,71 @@
             points: restored.points.map(({ x, y }) => ({ x, y })),
             chunkId: restored.chunkId,
           },
-        }).then(id => {
-          restored.id = id;
-        }).catch(() => {});
+        }).then(id => { restored.id = id; }).catch(() => {});
       }
     }
-    redrawAllStrokes();
+    markDirty();
+  }
+
+  // ── Delete selected ──
+
+  async function deleteSelected() {
+    if (selectedStrokes.size === 0) return;
+    const deleted = [...selectedStrokes];
+    if (currentPageId !== null) cacheEvict(currentPageId);
+    for (const s of deleted) {
+      if (s.id !== null) invoke("delete_stroke", { strokeId: s.id }).catch(() => {});
+    }
+    redoStack = [...redoStack, deleted];
+    strokes = strokes.filter(s => !selectedStrokes.has(s));
+    selectedStrokes = new Set();
+    selection = null;
+    markDirty();
   }
 
   // ── AI rasterisation ──
   let aiWorking = $state(false);
   let aiDebugImage = $state<string | null>(null);
 
-  /**
-   * Composite the PDF canvas and the ink overlay (dryCanvas) into an offscreen
-   * canvas cropped to the current selection bbox, then export as base64 PNG.
-   *
-   * `selection` is in normalised page space (0–1 relative to the PDF canvas).
-   * The PDF canvas pixel dimensions directly map: x_px = normX * canvas.width.
-   * dryCanvas covers the full scroll area; the page sits at an offset inside it,
-   * so we use pageToDrawCanvas to find where the crop starts on the ink layer.
-   */
   async function rasteriseSelection(): Promise<string> {
-    if (!selection || !canvas || !dryCanvas) throw new Error("Nothing selected");
-
-    // PDF canvas pixel coords of the selection
-    const sx = selection.x * canvas.width;
-    const sy = selection.y * canvas.height;
-    const sw = selection.width  * canvas.width;
-    const sh = selection.height * canvas.height;
-
-    // dryCanvas pixel coords of the same region
-    const tl = pageToDrawCanvas(selection.x, selection.y);
-    const br = pageToDrawCanvas(selection.x + selection.width, selection.y + selection.height);
-    const dw = br.x - tl.x;
-    const dh = br.y - tl.y;
+    if (!selection || !currentPdfBitmap) throw new Error("Nothing selected");
+    // PDF bitmap dimensions
+    const bw = currentPdfBitmap.width;
+    const bh = currentPdfBitmap.height;
+    const sx = selection.x * bw;
+    const sy = selection.y * bh;
+    const sw = selection.width  * bw;
+    const sh = selection.height * bh;
 
     const offscreen = new OffscreenCanvas(Math.round(sw), Math.round(sh));
     const ctx = offscreen.getContext("2d")!;
+    ctx.drawImage(currentPdfBitmap, sx, sy, sw, sh, 0, 0, sw, sh);
 
-    // Draw PDF layer
-    ctx.drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
-    // Draw ink overlay (dryCanvas spans the full wrap; crop to the page region)
-    ctx.drawImage(dryCanvas, tl.x, tl.y, dw, dh, 0, 0, sw, sh);
+    // Also composite dry strokes for the selected region
+    // Create a tiny canvas with the camera transform to render strokes into selection bbox
+    if (dryCtx && dryCanvas) {
+      // Draw dry canvas region corresponding to selection
+      // Selection bbox in world coords
+      const wTL = normToWorld(selection.x, selection.y);
+      const wBR = normToWorld(selection.x + selection.width, selection.y + selection.height);
+      const worldW = wBR.x - wTL.x;
+      const worldH = wBR.y - wTL.y;
+      // Scale to fill sw × sh
+      const renderS = sw / worldW;
+      const inkCanvas = new OffscreenCanvas(Math.round(sw), Math.round(sh));
+      const inkCtx = inkCanvas.getContext("2d")!;
+      inkCtx.setTransform(renderS, 0, 0, renderS, -wTL.x * renderS, -wTL.y * renderS);
+      inkCtx.lineCap = "round";
+      inkCtx.lineJoin = "round";
+      inkCtx.strokeStyle = "rgb(30, 80, 220)";
+      for (const stroke of strokes) {
+        if (stroke.points.length < 2) continue;
+        if (stroke.bbox.maxX < selection.x || stroke.bbox.minX > selection.x + selection.width ||
+            stroke.bbox.maxY < selection.y || stroke.bbox.minY > selection.y + selection.height) continue;
+        drawStrokePoints(inkCtx as unknown as CanvasRenderingContext2D, stroke.points, 0);
+      }
+      ctx.drawImage(inkCanvas, 0, 0);
+    }
 
     const blob = await offscreen.convertToBlob({ type: "image/png" });
     return new Promise((resolve, reject) => {
@@ -898,28 +1001,26 @@
     }
   }
 
-  // ── Delete selected strokes ──
-  async function deleteSelected() {
-    if (selectedStrokes.size === 0) return;
-    const deleted = [...selectedStrokes];
-    if (currentPageId !== null) cacheEvict(currentPageId);
-    for (const s of deleted) {
-      if (s.id !== null) {
-        invoke("delete_stroke", { strokeId: s.id }).catch(() => {});
-      }
+  // ── Wheel handler ──
+
+  function handleWheel(e: WheelEvent) {
+    if (!selectedBook) return;
+    e.preventDefault();
+    if (e.ctrlKey || e.metaKey) {
+      const rect = canvasContainer.getBoundingClientRect();
+      const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+      zoomAt(e.clientX - rect.left, e.clientY - rect.top, factor);
+    } else {
+      camera.x -= e.deltaX;
+      camera.y -= e.deltaY;
+      markDirty();
     }
-    redoStack = [...redoStack, deleted];
-    strokes = strokes.filter(s => !selectedStrokes.has(s));
-    selectedStrokes = new Set();
-    selection = null;
-    redrawAllStrokes();
   }
 
-  // ── Keyboard navigation ──
-  async function handleKeydown(e: KeyboardEvent) {
-    if (!selectedBook || !pdfDoc) return;
+  // ── Keyboard ──
 
-    // Don't steal focus from inputs
+  async function handleKeydown(e: KeyboardEvent) {
+    if (!selectedBook) return;
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 
     if ((e.ctrlKey || e.metaKey) && e.key === "z") {
@@ -939,33 +1040,14 @@
       await nextPage();
     } else if (e.key === "+" || e.key === "=") {
       e.preventDefault();
-      await zoomIn();
+      if (canvasContainer) zoomAt(canvasContainer.clientWidth / 2, canvasContainer.clientHeight / 2, 1 + ZOOM_STEP);
     } else if (e.key === "-") {
       e.preventDefault();
-      await zoomOut();
+      if (canvasContainer) zoomAt(canvasContainer.clientWidth / 2, canvasContainer.clientHeight / 2, 1 - ZOOM_STEP);
     } else if (e.key === "0" && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
-      await resetZoom();
+      centreOnPage();
     }
-  }
-
-  // ── Ctrl+scroll zoom ──
-  async function handleWheel(e: WheelEvent) {
-    if (!selectedBook || !(e.ctrlKey || e.metaKey)) return;
-    e.preventDefault();
-    if (e.deltaY < 0) {
-      await zoomIn();
-    } else {
-      await zoomOut();
-    }
-  }
-
-  let wrapResizeObserver: ResizeObserver | null = null;
-
-  function observeWrapResize(node: HTMLElement) {
-    wrapResizeObserver?.disconnect();
-    wrapResizeObserver = new ResizeObserver(() => syncDrawCanvasSize());
-    wrapResizeObserver.observe(node);
   }
 
   onMount(() => {
@@ -977,10 +1059,10 @@
   onDestroy(() => {
     window.removeEventListener("keydown", handleKeydown);
     window.removeEventListener("wheel", handleWheel);
-    wrapResizeObserver?.disconnect();
+    containerResizeObserver?.disconnect();
   });
 
-  let zoomPercent = $derived(Math.round(zoomLevel * 100));
+  let zoomPercent = $derived(Math.round(camera.scale * 100));
 </script>
 
 <main class:viewer-open={!!selectedBook}>
@@ -1000,14 +1082,20 @@
         <p class="error">{error}</p>
       {/if}
 
-      <div class="canvas-wrap" onwheel={handleWheel} use:observeWrapResize>
-        <canvas bind:this={canvas}></canvas>
-        <canvas bind:this={dryCanvas} class="dry-canvas"></canvas>
+      <!-- Infinite canvas -->
+      <div
+        class="infinite-canvas"
+        bind:this={canvasContainer}
+        class:mode-erase={mode === 'erase'}
+        class:mode-select={mode === 'select'}
+        use:observeContainerResize
+      >
+        <canvas bind:this={gridCanvas} class="layer layer-grid"></canvas>
+        <canvas bind:this={pdfCanvas}  class="layer layer-pdf"></canvas>
+        <canvas bind:this={dryCanvas}  class="layer layer-dry"></canvas>
         <canvas
           bind:this={wetCanvas}
-          class="wet-canvas"
-          class:erasing={mode === 'erase'}
-          class:selecting={mode === 'select'}
+          class="layer layer-wet"
           onpointerdown={onPointerDown}
           onpointermove={onPointerMove}
           onpointerup={onPointerUp}
@@ -1036,11 +1124,7 @@
         </button>
 
         <span class="page-indicator">
-          {#if totalPages > 0}
-            {currentPage} / {totalPages}
-          {:else}
-            …
-          {/if}
+          {currentPage}{totalPages > 0 ? ` / ${totalPages}` : ''}
         </span>
 
         <!-- Next -->
@@ -1058,12 +1142,7 @@
         <div class="divider"></div>
 
         <!-- Undo -->
-        <button
-          class="ink-btn"
-          onclick={undoStroke}
-          disabled={strokes.length === 0}
-          aria-label="Undo stroke"
-        >
+        <button class="ink-btn" onclick={undoStroke} disabled={strokes.length === 0} aria-label="Undo stroke">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M9 14 4 9l5-5"/>
             <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>
@@ -1071,12 +1150,7 @@
         </button>
 
         <!-- Redo -->
-        <button
-          class="ink-btn"
-          onclick={redoStroke}
-          disabled={redoStack.length === 0}
-          aria-label="Redo stroke"
-        >
+        <button class="ink-btn" onclick={redoStroke} disabled={redoStack.length === 0} aria-label="Redo stroke">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M15 14l5-5-5-5"/>
             <path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/>
@@ -1089,7 +1163,7 @@
         <button
           class="tool-btn"
           class:active={mode === 'draw'}
-          onclick={() => { mode = 'draw'; selectedStrokes = new Set(); selection = null; redrawSelectionHighlight(); }}
+          onclick={() => { mode = 'draw'; selectedStrokes = new Set(); selection = null; markDirty(); }}
           aria-label="Draw"
           aria-pressed={mode === 'draw'}
         >
@@ -1105,7 +1179,7 @@
         <button
           class="tool-btn"
           class:active={mode === 'erase'}
-          onclick={() => { mode = 'erase'; selectedStrokes = new Set(); selection = null; redrawSelectionHighlight(); }}
+          onclick={() => { mode = 'erase'; selectedStrokes = new Set(); selection = null; markDirty(); }}
           aria-label="Erase"
           aria-pressed={mode === 'erase'}
         >
@@ -1119,7 +1193,7 @@
         <button
           class="tool-btn"
           class:active={mode === 'select'}
-          onclick={() => { mode = 'select'; selectedStrokes = new Set(); selection = null; redrawSelectionHighlight(); }}
+          onclick={() => { mode = 'select'; selectedStrokes = new Set(); selection = null; markDirty(); }}
           aria-label="Select"
           aria-pressed={mode === 'select'}
         >
@@ -1154,8 +1228,8 @@
         <!-- Zoom out -->
         <button
           class="zoom-btn"
-          onclick={zoomOut}
-          disabled={zoomLevel <= ZOOM_MIN || rendering}
+          onclick={() => { if (canvasContainer) zoomAt(canvasContainer.clientWidth / 2, canvasContainer.clientHeight / 2, 1 - ZOOM_STEP); }}
+          disabled={camera.scale <= ZOOM_MIN}
           aria-label="Zoom out"
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1165,20 +1239,15 @@
           </svg>
         </button>
 
-        <button
-          class="zoom-level"
-          onclick={resetZoom}
-          title="Reset zoom"
-          aria-label="Reset zoom to 100%"
-        >
+        <button class="zoom-level" onclick={centreOnPage} title="Centre page (Ctrl+0)" aria-label="Centre page">
           {zoomPercent}%
         </button>
 
         <!-- Zoom in -->
         <button
           class="zoom-btn"
-          onclick={zoomIn}
-          disabled={zoomLevel >= ZOOM_MAX || rendering}
+          onclick={() => { if (canvasContainer) zoomAt(canvasContainer.clientWidth / 2, canvasContainer.clientHeight / 2, 1 + ZOOM_STEP); }}
+          disabled={camera.scale >= ZOOM_MAX}
           aria-label="Zoom in"
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1188,127 +1257,119 @@
             <line x1="8" y1="11" x2="14" y2="11"/>
           </svg>
         </button>
+
+        <!-- Centre page -->
+        <button class="zoom-btn" onclick={centreOnPage} title="Centre page" aria-label="Centre page">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2"/>
+            <line x1="12" y1="8" x2="12" y2="16"/>
+            <line x1="8" y1="12" x2="16" y2="12"/>
+          </svg>
+        </button>
       </div>
     </div>
 
   {:else}
-    <!-- Library -->
-    <h1>Gloss</h1>
+    <!-- Library view -->
+    <div class="library">
+      <div class="library-header">
+        <h1>Gloss</h1>
+        <button onclick={importPdf} disabled={importing} class="import-btn">
+          {importing ? "Importing…" : "Import PDF"}
+        </button>
+      </div>
 
-    <button onclick={importPdf} disabled={importing}>
-      {importing ? "Importing…" : "Import PDF"}
-    </button>
+      {#if error}
+        <p class="error">{error}</p>
+      {/if}
 
-    {#if error}
-      <p class="error">{error}</p>
-    {/if}
-
-    {#if sourceDocuments.length === 0}
-      <p class="empty">No documents yet. Import a PDF to get started.</p>
-    {:else}
-      <ul>
-        {#each sourceDocuments as book (book.id)}
-          <li>
-            <button class="book-item" onclick={() => openBook(book)}>
-              <span class="title">{book.title}</span>
-              <span class="path">{book.file_path}</span>
-            </button>
-          </li>
-        {/each}
-      </ul>
-    {/if}
+      {#if sourceDocuments.length === 0}
+        <p class="empty">No books yet. Import a PDF to get started.</p>
+      {:else}
+        <ul>
+          {#each sourceDocuments as book (book.id)}
+            <li>
+              <button class="book-item" onclick={() => openBook(book)}>
+                <span class="title">{book.title}</span>
+                <span class="path">{book.file_path}</span>
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
   {/if}
 </main>
 
 <style>
-  :root {
-    font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-    font-size: 16px;
-    line-height: 24px;
-    color: #0f0f0f;
-    background-color: #f6f6f6;
+  :global(*, *::before, *::after) {
+    box-sizing: border-box;
   }
 
-  @media (prefers-color-scheme: dark) {
-    :root {
-      color: #f6f6f6;
-      background-color: #1a1a1a;
-    }
-    li {
-      background: #2a2a2a;
-    }
-    .path {
-      color: #aaa;
-    }
-    .book-item:hover {
-      background: #333 !important;
-    }
-    .viewer {
-      background: #1a1a1a;
-    }
-    .viewer-header {
-      border-bottom-color: #333;
-    }
-    .canvas-wrap {
-      background: #111;
-    }
-    .controls {
-      background: #1a1a1a;
-      border-top-color: #333;
-    }
-    .page-indicator {
-      color: #aaa;
-    }
-    .zoom-level {
-      color: #aaa;
-    }
-    .divider {
-      background: #444;
-    }
+  :global(body) {
+    margin: 0;
+    font-family: system-ui, sans-serif;
+    font-size: 15px;
+    background: #fff;
+    color: #1a1a1a;
   }
 
-  main {
-    max-width: 720px;
-    margin: 0 auto;
-    padding: 2rem 1rem;
-  }
-
-  main.viewer-open {
-    /* Remove default padding when viewer is open so we control layout fully */
-    padding: 0;
-    max-width: none;
-  }
-
-  h1 {
-    font-size: 2rem;
-    margin-bottom: 1.5rem;
-  }
-
-  /* Import button */
-  button {
-    padding: 0.6em 1.4em;
-    font-size: 1em;
-    font-weight: 600;
-    border: none;
-    border-radius: 6px;
-    background: #396cd8;
-    color: #fff;
+  :global(button) {
+    font: inherit;
     cursor: pointer;
-    transition: background 0.2s;
+    border: none;
   }
 
-  button:hover:not(:disabled) {
-    background: #2a55c0;
-  }
-
-  button:disabled {
-    opacity: 0.4;
+  :global(button:disabled) {
     cursor: not-allowed;
   }
 
+  main {
+    min-height: 100vh;
+  }
+
+  /* ── Library ── */
+  .library {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 2rem 1.5rem;
+  }
+
+  .library-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.5rem;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: 1.6em;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+
+  .import-btn {
+    padding: 0.45rem 1rem;
+    background: #1a1a1a;
+    color: #fff;
+    border-radius: 6px;
+    font-size: 0.9em;
+    transition: background 0.15s;
+  }
+
+  .import-btn:hover:not(:disabled) {
+    background: #333;
+  }
+
+  .import-btn:disabled {
+    background: #888;
+  }
+
   .error {
-    color: #c0392b;
-    margin-top: 0.75rem;
+    color: #c00;
+    font-size: 0.9em;
+    margin: 0.5rem 0;
   }
 
   .empty {
@@ -1316,7 +1377,6 @@
     margin-top: 1.5rem;
   }
 
-  /* Library list */
   ul {
     list-style: none;
     padding: 0;
@@ -1344,7 +1404,6 @@
     border-radius: 0;
     font-size: 1em;
     font-weight: 400;
-    cursor: pointer;
     transition: background 0.15s;
   }
 
@@ -1352,15 +1411,8 @@
     background: #e0e0e0 !important;
   }
 
-  .title {
-    font-weight: 600;
-  }
-
-  .path {
-    font-size: 0.8em;
-    color: #666;
-    font-family: monospace;
-  }
+  .title { font-weight: 600; }
+  .path  { font-size: 0.8em; color: #666; font-family: monospace; }
 
   /* ── Viewer ── */
   .viewer {
@@ -1402,58 +1454,39 @@
     flex-shrink: 0;
   }
 
-  .back-btn:hover {
-    background: #eee !important;
-  }
+  .back-btn:hover { background: #eee !important; }
+  .back-btn svg  { width: 18px; height: 18px; }
 
-  .back-btn svg {
-    width: 18px;
-    height: 18px;
-  }
-
-  .canvas-wrap {
-    flex: 1;
+  /* ── Infinite canvas ── */
+  .infinite-canvas {
     position: relative;
-    display: flex;
-    justify-content: center;
-    align-items: flex-start;
+    flex: 1;
+    overflow: hidden;
+    min-height: 0;
     background: #e8e8e8;
-    padding: 1rem;
-    overflow: auto;
-    min-height: 0; /* critical: allow flex child to shrink */
-  }
-
-  .canvas-wrap canvas {
-    border-radius: 2px;
-    box-shadow: 0 2px 16px rgba(0,0,0,0.18);
-  }
-
-  .dry-canvas {
-    position: absolute;
-    top: 0;
-    left: 0;
-    box-shadow: none;
-    pointer-events: none;
-  }
-
-  .wet-canvas {
-    position: absolute;
-    top: 0;
-    left: 0;
     cursor: crosshair;
     touch-action: none;
-    box-shadow: none;
   }
 
-  .wet-canvas.erasing {
-    cursor: cell;
+  .infinite-canvas.mode-erase { cursor: cell; }
+  .infinite-canvas.mode-select { cursor: default; }
+
+  .layer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    /* width/height set in JS to clientWidth/clientHeight in CSS px,
+       but the bitmap is dpr-scaled — keep CSS size at 100% */
+    width: 100%;
+    height: 100%;
   }
 
-  .wet-canvas.selecting {
-    cursor: default;
-  }
+  .layer-grid { pointer-events: none; }
+  .layer-pdf  { pointer-events: none; }
+  .layer-dry  { pointer-events: none; }
+  /* .layer-wet receives all pointer events — no overrides needed */
 
-  /* ── Navigation controls — pinned to bottom ── */
+  /* ── Controls bar ── */
   .controls {
     display: flex;
     align-items: center;
@@ -1462,6 +1495,14 @@
     padding: 0.75rem 1rem;
     border-top: 1px solid #ddd;
     background: #f6f6f6;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+
+  .divider {
+    width: 1px;
+    height: 22px;
+    background: #ddd;
     flex-shrink: 0;
   }
 
@@ -1479,38 +1520,19 @@
     transition: background 0.15s, border-color 0.15s, opacity 0.15s;
   }
 
-  .chevron:hover:not(:disabled) {
-    background: #eee !important;
-    border-color: #aaa;
-  }
-
-  .chevron:disabled {
-    opacity: 0.3;
-    cursor: not-allowed;
-  }
-
-  .chevron svg {
-    width: 20px;
-    height: 20px;
-  }
+  .chevron:hover:not(:disabled) { background: #eee !important; border-color: #aaa; }
+  .chevron:disabled { opacity: 0.3; }
+  .chevron svg { width: 20px; height: 20px; }
 
   .page-indicator {
     font-size: 0.9em;
     color: #666;
-    min-width: 5ch;
+    min-width: 3ch;
     text-align: center;
     font-variant-numeric: tabular-nums;
   }
 
-  .divider {
-    width: 1px;
-    height: 24px;
-    background: #ccc;
-    margin: 0 0.25rem;
-  }
-
-  .zoom-btn,
-  .ink-btn {
+  .ink-btn, .tool-btn, .zoom-btn {
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1519,161 +1541,68 @@
     padding: 0;
     background: transparent;
     color: inherit;
-    border: 1px solid #ccc;
-    border-radius: 8px;
-    transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+    border-radius: 6px;
+    transition: background 0.12s;
   }
 
-  .zoom-btn:hover:not(:disabled),
-  .ink-btn:hover:not(:disabled) {
-    background: #eee !important;
-    border-color: #aaa;
-  }
+  .ink-btn:hover:not(:disabled),
+  .tool-btn:hover:not(:disabled),
+  .zoom-btn:hover:not(:disabled) { background: #e4e4e4 !important; }
 
-  .zoom-btn:disabled,
-  .ink-btn:disabled {
-    opacity: 0.3;
-    cursor: not-allowed;
-  }
+  .ink-btn:disabled, .zoom-btn:disabled { opacity: 0.3; }
 
-  .zoom-btn svg,
-  .ink-btn svg {
-    width: 18px;
-    height: 18px;
-  }
-
-  .tool-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 36px;
-    height: 36px;
-    padding: 0;
-    background: transparent;
-    color: inherit;
-    border: 1px solid #ccc;
-    border-radius: 8px;
-    transition: background 0.15s, border-color 0.15s;
-  }
-
-  .tool-btn:hover:not(:disabled) {
-    background: #eee !important;
-    border-color: #aaa;
-  }
+  .ink-btn svg, .tool-btn svg, .zoom-btn svg { width: 20px; height: 20px; }
 
   .tool-btn.active {
-    background: #dce8ff !important;
-    border-color: #396cd8;
-    color: #396cd8;
-  }
-
-  .tool-btn svg {
-    width: 18px;
-    height: 18px;
-  }
-
-  @media (prefers-color-scheme: dark) {
-    .tool-btn.active {
-      background: #1e3a6e !important;
-      border-color: #6b9aff;
-      color: #6b9aff;
-    }
+    background: #e0e8ff !important;
+    color: #2040a0;
   }
 
   .zoom-level {
     font-size: 0.82em;
     font-variant-numeric: tabular-nums;
-    min-width: 3.8ch;
-    text-align: center;
-    padding: 0.25em 0.5em;
+    color: #444;
+    padding: 0.3rem 0.5rem;
     background: transparent;
-    color: #666;
-    border: 1px solid #ccc;
-    border-radius: 6px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background 0.15s;
+    border-radius: 5px;
+    min-width: 4.5ch;
+    text-align: center;
+    transition: background 0.12s;
   }
 
-  .zoom-level:hover {
-    background: #eee !important;
-  }
+  .zoom-level:hover { background: #e4e4e4 !important; }
 
+  .ai-btn { color: #2a6; }
+  .ai-btn.active { background: #e0ffe8 !important; }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spin { animation: spin 0.9s linear infinite; }
+
+  /* ── AI debug overlay ── */
   .ai-debug {
     position: absolute;
-    bottom: 1rem;
-    right: 1rem;
+    top: 60px;
+    right: 16px;
     background: #fff;
     border: 1px solid #ccc;
     border-radius: 8px;
-    box-shadow: 0 4px 24px rgba(0,0,0,0.22);
     padding: 0.5rem;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.15);
     z-index: 100;
-    max-width: 320px;
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
+    max-width: 360px;
   }
 
-  .ai-debug img {
-    max-width: 100%;
-    border-radius: 4px;
-    display: block;
-    box-shadow: none;
-  }
+  .ai-debug img { display: block; max-width: 100%; border-radius: 4px; }
 
   .ai-debug-close {
-    align-self: flex-end;
+    position: absolute;
+    top: 6px;
+    right: 8px;
     background: transparent;
-    border: none;
-    color: #666;
-    font-size: 0.9em;
-    padding: 0 0.2em;
-    cursor: pointer;
-    line-height: 1;
-    width: auto;
-    height: auto;
-    border-radius: 4px;
+    font-size: 0.85em;
+    color: #888;
+    padding: 2px 4px;
   }
 
-  .ai-debug-close:hover {
-    background: #eee !important;
-    color: #000;
-  }
-
-  @media (prefers-color-scheme: dark) {
-    .ai-debug {
-      background: #222;
-      border-color: #444;
-    }
-    .ai-debug-close {
-      color: #aaa;
-    }
-    .ai-debug-close:hover {
-      background: #333 !important;
-      color: #fff;
-    }
-  }
-
-  .ai-btn:not(:disabled).active {
-    background: #dce8ff !important;
-    border-color: #396cd8;
-    color: #396cd8;
-  }
-
-  @media (prefers-color-scheme: dark) {
-    .ai-btn:not(:disabled).active {
-      background: #1e3a6e !important;
-      border-color: #6b9aff;
-      color: #6b9aff;
-    }
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
-
-  .spin {
-    animation: spin 0.9s linear infinite;
-  }
+  .ai-debug-close:hover { color: #000; }
 </style>

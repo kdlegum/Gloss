@@ -1,6 +1,130 @@
+use percent_encoding::percent_decode_str;
+use pdfium_render::prelude::*;
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_fs::{FilePath, FsExt};
+
+// ── Pdfium worker ────────────────────────────────────────────────────────────
+// pdfium_render's Pdfium is !Send, so it must live on a single dedicated thread.
+// All PDF work is dispatched to that thread via a channel.
+
+type PdfJob = Box<dyn FnOnce(&Pdfium) + Send + 'static>;
+
+#[derive(Clone)]
+struct PdfiumWorker(std::sync::mpsc::SyncSender<PdfJob>);
+
+impl PdfiumWorker {
+    /// Spawn the worker thread and bind pdfium.
+    fn spawn(lib_path: std::path::PathBuf) -> Result<Self, String> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<PdfJob>(64);
+        std::thread::Builder::new()
+            .name("pdfium-worker".into())
+            .spawn(move || {
+                let pdfium = Pdfium::new(
+                    Pdfium::bind_to_library(&lib_path)
+                        .expect("failed to bind pdfium library"),
+                );
+                for job in rx {
+                    job(&pdfium);
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Self(tx))
+    }
+
+    /// Spawn the worker thread, binding pdfium from the system loader (Android).
+    fn spawn_system() -> Result<Self, String> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<PdfJob>(64);
+        std::thread::Builder::new()
+            .name("pdfium-worker".into())
+            .spawn(move || {
+                let pdfium = Pdfium::new(
+                    Pdfium::bind_to_system_library()
+                        .expect("failed to bind pdfium system library"),
+                );
+                for job in rx {
+                    job(&pdfium);
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Self(tx))
+    }
+
+    /// Run a closure on the pdfium thread and await its result.
+    async fn run<F, T>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(&Pdfium) -> Result<T, String> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let job: PdfJob = Box::new(move |pdfium| {
+            let _ = done_tx.send(f(pdfium));
+        });
+        self.0.send(job).map_err(|_| "pdfium worker closed".to_string())?;
+        done_rx.await.map_err(|_| "pdfium worker dropped result".to_string())?
+    }
+}
+
+// ── Rendered page ────────────────────────────────────────────────────────────
+// Raw RGBA bytes + dimensions. Sent directly to the frontend so it can build
+// an ImageData without any PNG encode/decode round-trip.
+#[derive(serde::Serialize, Clone)]
+struct RenderedPage {
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+// ── PDF render cache ─────────────────────────────────────────────────────────
+// Keyed by (relative_path, page_number, scale * 1000 as u32).
+// Stores raw RGBA renders so we never re-rasterize the same page twice.
+const PDF_CACHE_MAX: usize = 20;
+
+struct PdfCache {
+    order: Vec<(String, usize, u32)>,
+    data: HashMap<(String, usize, u32), Arc<RenderedPage>>,
+}
+
+impl PdfCache {
+    fn new() -> Self {
+        Self {
+            order: Vec::new(),
+            data: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, key: &(String, usize, u32)) -> Option<Arc<RenderedPage>> {
+        if let Some(val) = self.data.get(key) {
+            // Move to front (most recently used)
+            self.order.retain(|k| k != key);
+            self.order.insert(0, key.clone());
+            return Some(Arc::clone(val));
+        }
+        None
+    }
+
+    fn put(&mut self, key: (String, usize, u32), value: RenderedPage) -> Arc<RenderedPage> {
+        if self.data.contains_key(&key) {
+            self.order.retain(|k| k != &key);
+        } else if self.order.len() >= PDF_CACHE_MAX {
+            if let Some(evict) = self.order.pop() {
+                self.data.remove(&evict);
+            }
+        }
+        self.order.insert(0, key.clone());
+        let arc = Arc::new(value);
+        self.data.insert(key, Arc::clone(&arc));
+        arc
+    }
+}
+
+struct AppState {
+    pdf_cache: Mutex<PdfCache>,
+    pdfium: PdfiumWorker,
+}
 
 #[derive(serde::Deserialize, serde::Serialize, bincode::Encode, bincode::Decode, Clone, Copy)]
 struct Point {
@@ -40,24 +164,47 @@ async fn import_pdf(
     app: tauri::AppHandle,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<SourceDocument, String> {
-    // Open file picker
+    // Open file picker — returns FilePath::Path on desktop, FilePath::Url on Android
     let picked = app
         .dialog()
         .file()
         .add_filter("PDF", &["pdf"])
         .blocking_pick_file();
 
-    let src_path = match picked {
-        Some(p) => p.into_path().map_err(|e| e.to_string())?,
+    let file_path = match picked {
+        Some(p) => p,
         None => return Err("cancelled".into()),
     };
 
-    // Derive destination inside the app data directory
-    let file_name = src_path
-        .file_name()
-        .ok_or("invalid file name")?
-        .to_string_lossy()
-        .to_string();
+    // Extract filename. On Android the content URI's last path segment is percent-encoded
+    // and may contain a sub-path like "primary:Download/foo.pdf" — take just the tail.
+    let file_name: String = match &file_path {
+        FilePath::Path(p) => p
+            .file_name()
+            .ok_or("invalid file name")?
+            .to_string_lossy()
+            .to_string(),
+        FilePath::Url(u) => {
+            let raw = u
+                .path_segments()
+                .and_then(|mut s| s.next_back().map(str::to_owned))
+                .unwrap_or_else(|| "import.pdf".into());
+            // Percent-decode and take the tail after any "/" within the segment
+            // e.g. "primary%3ADownload%2Ffoo.pdf" -> "foo.pdf"
+            let decoded = percent_decode_str(&raw).decode_utf8_lossy().to_string();
+            decoded
+                .rsplit('/')
+                .next()
+                .unwrap_or("import.pdf")
+                .to_string()
+        }
+    };
+
+    let file_name = if file_name.to_lowercase().ends_with(".pdf") {
+        file_name
+    } else {
+        format!("{}.pdf", file_name)
+    };
 
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let pdfs_dir = data_dir.join("pdfs");
@@ -66,7 +213,7 @@ async fn import_pdf(
     // Avoid overwriting an existing file by appending a counter if needed
     let mut dest_path = pdfs_dir.join(&file_name);
     if dest_path.exists() {
-        let stem = src_path
+        let stem = std::path::Path::new(&file_name)
             .file_stem()
             .unwrap_or_default()
             .to_string_lossy()
@@ -81,7 +228,10 @@ async fn import_pdf(
         }
     }
 
-    std::fs::copy(&src_path, &dest_path).map_err(|e| e.to_string())?;
+    // Read via tauri-plugin-fs — handles content:// URIs on Android via JNI,
+    // falls back to plain std::fs on desktop.
+    let bytes = app.fs().read(file_path).map_err(|e| e.to_string())?;
+    std::fs::write(&dest_path, &bytes).map_err(|e| e.to_string())?;
 
     // Relative path stored in DB (relative to app data dir)
     let relative_path = format!(
@@ -89,7 +239,7 @@ async fn import_pdf(
         dest_path.file_name().unwrap().to_string_lossy()
     );
 
-    let title = src_path
+    let title = std::path::Path::new(&file_name)
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy()
@@ -253,6 +403,100 @@ async fn load_strokes(
         .collect()
 }
 
+/// Return the number of pages in the PDF at the given relative path.
+#[tauri::command]
+async fn get_page_count(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    relative_path: String,
+) -> Result<usize, String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let abs_path = data_dir.join(&relative_path);
+
+    state.pdfium.run(move |pdfium| {
+        let doc = pdfium.load_pdf_from_file(&abs_path, None).map_err(|e| e.to_string())?;
+        Ok(doc.pages().len() as usize)
+    }).await
+}
+
+/// Render a single PDF page and return raw RGBA bytes with dimensions.
+/// `scale` is CSS pixels per PDF user-unit (point). Typical value: 1.0–2.0.
+/// Results are cached by (path, page, scale) so subsequent calls are O(1).
+///
+/// Returns a binary response: [width: u32 LE][height: u32 LE][RGBA data...].
+/// Using `tauri::ipc::Response` sends raw bytes over IPC instead of JSON-encoding
+/// millions of pixel values, which would otherwise take seconds.
+#[tauri::command]
+async fn render_pdf_page(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    relative_path: String,
+    page_number: usize,
+    scale: f32,
+) -> Result<tauri::ipc::Response, String> {
+    let scale_key = (scale * 1000.0).round() as u32;
+    let cache_key = (relative_path.clone(), page_number, scale_key);
+
+    // Check cache first (lock briefly, then release)
+    {
+        let mut cache = state.pdf_cache.lock().map_err(|e| e.to_string())?;
+        if let Some(page) = cache.get(&cache_key) {
+            return Ok(rendered_page_to_response(&page));
+        }
+    }
+
+    // Resolve absolute path
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let abs_path = data_dir.join(&relative_path);
+
+    // Render on the dedicated pdfium worker thread
+    let rendered = state.pdfium.run(move |pdfium| {
+        let doc = pdfium
+            .load_pdf_from_file(&abs_path, None)
+            .map_err(|e| e.to_string())?;
+
+        let page = doc
+            .pages()
+            .get(page_number as i32)
+            .map_err(|e| e.to_string())?;
+
+        // pdfium page dimensions are in PDF user-units (points). scale converts to CSS px.
+        let width_px = (page.width().value * scale).round() as i32;
+        let height_px = (page.height().value * scale).round() as i32;
+
+        let bitmap = page
+            .render_with_config(
+                &PdfRenderConfig::new()
+                    .set_target_width(width_px)
+                    .set_target_height(height_px),
+            )
+            .map_err(|e| e.to_string())?;
+
+        // Return raw RGBA bytes — no PNG encode/decode round-trip needed.
+        Ok(RenderedPage {
+            width: bitmap.width() as u32,
+            height: bitmap.height() as u32,
+            data: bitmap.as_rgba_bytes(),
+        })
+    }).await?;
+
+    // Store in cache
+    let cached = {
+        let mut cache = state.pdf_cache.lock().map_err(|e| e.to_string())?;
+        cache.put(cache_key, rendered)
+    };
+    Ok(rendered_page_to_response(&cached))
+}
+
+/// Pack a RenderedPage into a binary IPC response: width (4B LE) + height (4B LE) + RGBA data.
+fn rendered_page_to_response(page: &RenderedPage) -> tauri::ipc::Response {
+    let mut buf = Vec::with_capacity(8 + page.data.len());
+    buf.extend_from_slice(&page.width.to_le_bytes());
+    buf.extend_from_slice(&page.height.to_le_bytes());
+    buf.extend_from_slice(&page.data);
+    tauri::ipc::Response::new(buf)
+}
+
 async fn init_db(app: &tauri::App) -> Result<SqlitePool, Box<dyn std::error::Error>> {
     let data_dir = app.path().app_data_dir()?;
     std::fs::create_dir_all(&data_dir)?;
@@ -273,15 +517,47 @@ async fn init_db(app: &tauri::App) -> Result<SqlitePool, Box<dyn std::error::Err
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let pool = tauri::async_runtime::block_on(init_db(app))
                 .expect("failed to initialise database");
             app.manage(pool);
+
+            let pdfium = if cfg!(target_os = "android") {
+                PdfiumWorker::spawn_system()
+                    .expect("failed to start pdfium worker")
+            } else {
+                let exe_dir = std::env::current_exe()
+                    .expect("can't find exe")
+                    .parent()
+                    .expect("exe has no parent dir")
+                    .to_path_buf();
+                let lib_name = if cfg!(target_os = "windows") { "pdfium.dll" }
+                    else if cfg!(target_os = "macos") { "libpdfium.dylib" }
+                    else { "libpdfium.so" };
+                PdfiumWorker::spawn(exe_dir.join(lib_name))
+                    .expect("failed to start pdfium worker")
+            };
+
+            app.manage(AppState {
+                pdf_cache: Mutex::new(PdfCache::new()),
+                pdfium,
+            });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![import_pdf, list_textbooks, get_pdf_path, get_or_create_page, save_stroke, load_strokes, delete_stroke])
+        .invoke_handler(tauri::generate_handler![
+            import_pdf,
+            list_textbooks,
+            get_pdf_path,
+            get_or_create_page,
+            save_stroke,
+            load_strokes,
+            delete_stroke,
+            render_pdf_page,
+            get_page_count,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

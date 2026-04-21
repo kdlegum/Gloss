@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(cargo metadata:*)",
-      "Bash(npm run:*)"
+      "Bash(npm run:*)",
+      "Bash(\"C:\\\\Users\\\\kdleg\\\\AppData\\\\Local\\\\Android\\\\Sdk\\\\platform-tools\\\\adb\" -s c250fe44412d install -r \"src-tauri/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk\")",
+      "WebSearch",
+      "Bash(cargo search *)"
     ]
   }
 }
