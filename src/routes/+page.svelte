@@ -1,11 +1,20 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount, onDestroy } from "svelte";
+  import { fade } from "svelte/transition";
 
   interface SourceDocument {
     id: number;
     title: string;
     file_path: string;
+  }
+
+  interface RenderedPdfBitmap {
+    bitmap: ImageBitmap;
+    bitmapWidth: number;
+    bitmapHeight: number;
+    pageWidthPoints: number;
+    pageHeightPoints: number;
   }
 
   let sourceDocuments = $state<SourceDocument[]>([]);
@@ -86,6 +95,7 @@
   interface StrokeOutput {
     id: number;
     colour: string;
+    thickness: number;
     points: { x: number; y: number }[];
     min_x: number;
     min_y: number;
@@ -100,6 +110,8 @@
     if (!cached) cachePut(pageId, loaded);
     strokes = loaded.map(s => ({
       id: s.id,
+      colour: s.colour,
+      thickness: s.thickness ?? 1,
       points: s.points.map(p => ({ x: p.x, y: p.y, pressure: 0.5 })),
       bbox: { minX: s.min_x, minY: s.min_y, maxX: s.max_x, maxY: s.max_y },
       chunkId: s.chunk_id,
@@ -111,6 +123,28 @@
   // ── Tool mode ──
   type Mode = 'draw' | 'erase' | 'select';
   let mode = $state<Mode>('draw');
+  const PEN_COLOURS = [
+    "#ec9fba",
+    "#efbf93",
+    "#e8db7f",
+    "#add39f",
+    "#96d8d7",
+    "#a9c2f6",
+    "#c0afe9",
+    "#ea9fd3",
+    "#111111",
+    "#e53935",
+    "#ff7a00",
+    "#ffbf00",
+    "#2f9e44",
+    "#118ab2",
+    "#2351d1",
+  ];
+  const DEFAULT_PEN_COLOUR = "#2351d1";
+  const DEFAULT_PEN_THICKNESS = 3;
+  let penColour = $state(DEFAULT_PEN_COLOUR);
+  let penThickness = $state(DEFAULT_PEN_THICKNESS);
+  let showPenOptions = $state(false);
 
   // ── Select state ──
   type Rect = { x: number; y: number; w: number; h: number }; // normalised page space
@@ -122,7 +156,14 @@
   // ── Drawing state ──
   type Point = { x: number; y: number; pressure: number };  // normalised page space
   type BBox = { minX: number; minY: number; maxX: number; maxY: number };
-  type Stroke = { id: number | null; points: Point[]; bbox: BBox; chunkId: number | null };
+  type Stroke = {
+    id: number | null;
+    colour: string;
+    thickness: number;
+    points: Point[];
+    bbox: BBox;
+    chunkId: number | null;
+  };
 
   let isDrawing = $state(false);
   let currentStroke: Point[] = [];
@@ -178,7 +219,12 @@
   const PDF_BITMAP_CACHE_MAX = 10;
   const pdfBitmapCacheOrder: string[] = [];
   const pdfBitmapCache = new Map<string, ImageBitmap>();
+  const pdfBitmapMetaCache = new Map<string, Omit<RenderedPdfBitmap, "bitmap">>();
+  const pdfBitmapRequests = new Map<string, Promise<RenderedPdfBitmap>>();
   let currentPdfBitmap: ImageBitmap | null = null;
+  let currentPdfBitmapKey: string | null = null;
+  let currentPdfPagePoints = { w: 0, h: 0 };
+  let pdfLoadVersion = 0;
 
   function bitmapCacheGet(key: string): ImageBitmap | undefined {
     const v = pdfBitmapCache.get(key);
@@ -197,9 +243,146 @@
       const evict = pdfBitmapCacheOrder.pop()!;
       pdfBitmapCache.get(evict)?.close();
       pdfBitmapCache.delete(evict);
+      pdfBitmapMetaCache.delete(evict);
     }
     pdfBitmapCacheOrder.unshift(key);
     pdfBitmapCache.set(key, bm);
+  }
+
+  function bitmapMetaCachePut(key: string, rendered: Omit<RenderedPdfBitmap, "bitmap">) {
+    pdfBitmapMetaCache.set(key, rendered);
+  }
+
+  function makePdfBitmapCacheKey(relativePath: string, pageNum: number, pixelWidth: number) {
+    return `${relativePath}:${pageNum}:${pixelWidth}`;
+  }
+
+  function getPageDisplayWidth() {
+    return Math.max(240, canvasContainer.clientWidth - 144);
+  }
+
+  function quantizePdfPixelWidth(pixelWidth: number) {
+    return Math.max(256, Math.ceil(pixelWidth / 256) * 256);
+  }
+
+  function getPreviewPdfPixelWidth(pageDisplayW = getPageDisplayWidth()) {
+    const dpr = window.devicePixelRatio || 1;
+    return quantizePdfPixelWidth(pageDisplayW * dpr);
+  }
+
+  function getUpgradePdfPixelWidth() {
+    if (!canvasContainer || !pageSize.w || !currentPdfPagePoints.w) return 0;
+    const dpr = window.devicePixelRatio || 1;
+    const screenWidth = pageSize.w * Math.max(1, camera.scale);
+    return quantizePdfPixelWidth(screenWidth * dpr * 1.15);
+  }
+
+  function hasEnoughPdfResolution(bitmap: ImageBitmap | null, desiredPixelWidth: number) {
+    return !!bitmap && bitmap.width >= desiredPixelWidth * 0.9;
+  }
+
+  async function decodeRenderedPdfBitmap(buf: ArrayBuffer): Promise<RenderedPdfBitmap> {
+    const header = new DataView(buf);
+    const pageWidthPoints = header.getFloat32(0, true);
+    const pageHeightPoints = header.getFloat32(4, true);
+    const width = header.getUint32(8, true);
+    const height = header.getUint32(12, true);
+    const rgba = new Uint8ClampedArray(buf, 16);
+    const bitmap = await createImageBitmap(new ImageData(rgba, width, height));
+    return {
+      bitmap,
+      bitmapWidth: width,
+      bitmapHeight: height,
+      pageWidthPoints,
+      pageHeightPoints,
+    };
+  }
+
+  async function fetchPdfBitmap(pageNum: number, targetPixelWidth: number): Promise<{ key: string; rendered: RenderedPdfBitmap }> {
+    if (!selectedBook) throw new Error("No selected book");
+    const bookPath = selectedBook.file_path;
+    const cacheKey = makePdfBitmapCacheKey(bookPath, pageNum, targetPixelWidth);
+    const cached = bitmapCacheGet(cacheKey);
+
+    if (cached) {
+      const meta = pdfBitmapMetaCache.get(cacheKey);
+      if (!meta) {
+        throw new Error(`Missing cached PDF metadata for ${cacheKey}`);
+      }
+      return {
+        key: cacheKey,
+        rendered: {
+          bitmap: cached,
+          ...meta,
+        },
+      };
+    }
+    const inFlight = pdfBitmapRequests.get(cacheKey);
+    if (inFlight) return { key: cacheKey, rendered: await inFlight };
+
+    const request = (async () => {
+      try {
+        const buf: ArrayBuffer = await invoke("render_pdf_page", {
+          relativePath: bookPath,
+          pageNumber: pageNum - 1,
+          targetWidth: targetPixelWidth,
+        });
+        const rendered = await decodeRenderedPdfBitmap(buf);
+        bitmapCachePut(cacheKey, rendered.bitmap);
+        bitmapMetaCachePut(cacheKey, {
+          bitmapWidth: rendered.bitmapWidth,
+          bitmapHeight: rendered.bitmapHeight,
+          pageWidthPoints: rendered.pageWidthPoints,
+          pageHeightPoints: rendered.pageHeightPoints,
+        });
+        return rendered;
+      } finally {
+        pdfBitmapRequests.delete(cacheKey);
+      }
+    })();
+
+    pdfBitmapRequests.set(cacheKey, request);
+    return { key: cacheKey, rendered: await request };
+  }
+
+  function applyRenderedPdfBitmap(
+    bookPath: string,
+    pageNum: number,
+    loadVersion: number,
+    cacheKey: string,
+    rendered: RenderedPdfBitmap,
+  ) {
+    if (
+      pdfLoadVersion !== loadVersion ||
+      !selectedBook ||
+      selectedBook.file_path !== bookPath ||
+      currentPage !== pageNum
+    ) {
+      return false;
+    }
+
+    currentPdfPagePoints = { w: rendered.pageWidthPoints, h: rendered.pageHeightPoints };
+    currentPdfBitmap = rendered.bitmap;
+    currentPdfBitmapKey = cacheKey;
+    markDirty();
+    return true;
+  }
+
+  async function requestCurrentPdfBitmap() {
+    if (!selectedBook || !currentPdfPagePoints.w) return;
+    const bookPath = selectedBook.file_path;
+    const targetPixelWidth = getUpgradePdfPixelWidth();
+    if (!targetPixelWidth || hasEnoughPdfResolution(currentPdfBitmap, targetPixelWidth)) return;
+
+    try {
+      const loadVersion = pdfLoadVersion;
+      const { key, rendered } = await fetchPdfBitmap(currentPage, targetPixelWidth);
+      if (!currentPdfBitmap || rendered.bitmapWidth >= currentPdfBitmap.width) {
+        applyRenderedPdfBitmap(bookPath, currentPage, loadVersion, key, rendered);
+      }
+    } catch {
+      // Background upgrades should not disrupt navigation or input.
+    }
   }
 
   // ── Coordinate transforms ──
@@ -251,6 +434,43 @@
       if (p.y > maxY) maxY = p.y;
     }
     return { minX, minY, maxX, maxY };
+  }
+
+  function clearSelectionState() {
+    selectedStrokes = new Set();
+    selection = null;
+  }
+
+  function activateDrawTool() {
+    const wasDrawMode = mode === 'draw';
+    mode = 'draw';
+    clearSelectionState();
+    selectOrigin = null;
+    selectRect = null;
+    showPenOptions = wasDrawMode ? !showPenOptions : true;
+    markDirty();
+  }
+
+  function activateEraseTool() {
+    mode = 'erase';
+    showPenOptions = false;
+    clearSelectionState();
+    selectOrigin = null;
+    selectRect = null;
+    markDirty();
+  }
+
+  function activateSelectTool() {
+    mode = 'select';
+    showPenOptions = false;
+    clearSelectionState();
+    selectOrigin = null;
+    selectRect = null;
+    markDirty();
+  }
+
+  function widthForPoint(thickness: number, pressure: number) {
+    return (thickness * (0.5 + pressure)) / camera.scale;
   }
 
   // ── Erase eraser hit radius in world units ──
@@ -354,6 +574,7 @@
 
     activePointerId = e.pointerId;
     wetCanvas.setPointerCapture(e.pointerId);
+    showPenOptions = false;
     isDrawing = true;
     currentStroke = [];
     currentStroke.push(getPagePoint(e));
@@ -381,6 +602,7 @@
         camera.scale = newScale;
         lastPinchDist = newDist;
         lastPinchMid  = newMid;
+        requestCurrentPdfBitmap();
       } else if (touchPointers.length === 1 && activePointerId === null) {
         // 1-finger pan
         const cur = touchPointers[0];
@@ -464,7 +686,14 @@
     if (e.pointerId !== activePointerId) return;
     if (isDrawing && currentStroke.length >= 2) {
       const completed = currentStroke;
-      const stroke: Stroke = { id: null, points: completed, bbox: computeBBox(completed), chunkId: null };
+      const stroke: Stroke = {
+        id: null,
+        colour: penColour,
+        thickness: penThickness,
+        points: completed,
+        bbox: computeBBox(completed),
+        chunkId: null,
+      };
       strokes = [...strokes, stroke];
       redoStack = [];
       if (currentPageId !== null) {
@@ -472,7 +701,8 @@
         invoke<number>("save_stroke", {
           pageId: currentPageId,
           stroke: {
-            colour: "rgba(30, 80, 220, 0.85)",
+            colour: stroke.colour,
+            thickness: stroke.thickness,
             points: completed.map(({ x, y }) => ({ x, y })),
             chunkId: stroke.chunkId,
           },
@@ -582,17 +812,13 @@
     const visMaxX = visMinX + (canvasContainer.clientWidth  / camera.scale) / pageSize.w;
     const visMaxY = visMinY + (canvasContainer.clientHeight / camera.scale) / pageSize.h;
 
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    ctx.strokeStyle = "rgb(30, 80, 220)";
-
     for (const stroke of strokes) {
       if (stroke.points.length < 2) continue;
       if (
         stroke.bbox.maxX < visMinX || stroke.bbox.minX > visMaxX ||
         stroke.bbox.maxY < visMinY || stroke.bbox.minY > visMaxY
       ) continue;
-      drawStrokePoints(ctx, stroke.points, 0);
+      drawStrokePoints(ctx, stroke.points, stroke.colour, stroke.thickness, 0);
     }
 
     // Draw selection highlight on dry canvas
@@ -603,7 +829,7 @@
       ctx.lineJoin = "round";
       for (const stroke of selectedStrokes) {
         if (stroke.points.length < 2) continue;
-        drawStrokePoints(ctx, stroke.points, 0);
+        drawStrokePoints(ctx, stroke.points, "rgba(255, 140, 0, 0.9)", stroke.thickness, 0);
       }
       ctx.restore();
     }
@@ -618,14 +844,15 @@
     // Wet stroke
     if (isDrawing && currentStroke.length >= 2) {
       const pts = currentStroke;
+      ctx.strokeStyle = penColour;
       if (lastDrawnStrokeIndex < 2) {
         ctx.clearRect(
           -camera.x / camera.scale, -camera.y / camera.scale,
           wetCanvas.width / (camera.scale * dpr), wetCanvas.height / (camera.scale * dpr),
         );
-        drawStrokePoints(ctx, pts, 0);
+        drawStrokePoints(ctx, pts, penColour, penThickness, 0);
       } else {
-        drawStrokePoints(ctx, pts, Math.max(0, lastDrawnStrokeIndex - 1));
+        drawStrokePoints(ctx, pts, penColour, penThickness, Math.max(0, lastDrawnStrokeIndex - 1));
       }
       lastDrawnStrokeIndex = pts.length;
     } else if (selectRect) {
@@ -656,17 +883,24 @@
    * Draw stroke points in world space. ctx must have camera setTransform applied.
    * Points are in normalised page space; converted to world here.
    */
-  function drawStrokePoints(ctx: CanvasRenderingContext2D, pts: Point[], startIdx: number) {
+  function drawStrokePoints(
+    ctx: CanvasRenderingContext2D,
+    pts: Point[],
+    colour: string,
+    thickness: number,
+    startIdx: number,
+  ) {
     if (pts.length - startIdx < 2) return;
     const slice = pts.slice(startIdx);
     const wc = slice.map(p => normToWorld(p.x, p.y));
 
+    ctx.strokeStyle = colour;
     ctx.beginPath();
     ctx.moveTo(wc[0].x, wc[0].y);
-    ctx.lineWidth = (1 + slice[0].pressure * 5) / camera.scale;
+    ctx.lineWidth = widthForPoint(thickness, slice[0].pressure);
 
     for (let i = 1; i < wc.length - 1; i++) {
-      const width = (1 + slice[i].pressure * 5) / camera.scale;
+      const width = widthForPoint(thickness, slice[i].pressure);
       if (Math.abs(ctx.lineWidth - width) > PRESSURE_WIDTH_THRESHOLD / camera.scale) {
         ctx.stroke();
         ctx.beginPath();
@@ -728,7 +962,7 @@
     dryCtx  = dryCanvas.getContext("2d")!;
     wetCtx  = wetCanvas.getContext("2d")!;
     if (dryCtx) { dryCtx.lineCap = "round"; dryCtx.lineJoin = "round"; }
-    if (wetCtx) { wetCtx.lineCap = "round"; wetCtx.lineJoin = "round"; wetCtx.strokeStyle = "rgb(30, 80, 220)"; }
+    if (wetCtx) { wetCtx.lineCap = "round"; wetCtx.lineJoin = "round"; }
     markDirty();
   }
 
@@ -738,6 +972,7 @@
     containerResizeObserver?.disconnect();
     containerResizeObserver = new ResizeObserver(() => {
       setupCanvases();
+      requestCurrentPdfBitmap();
     });
     containerResizeObserver.observe(node);
   }
@@ -752,6 +987,7 @@
     camera.y = screenY - wy * newScale;
     camera.scale = newScale;
     markDirty();
+    requestCurrentPdfBitmap();
   }
 
   function centreOnPage() {
@@ -767,39 +1003,28 @@
   async function loadPdfPage(pageNum: number) {
     if (!selectedBook || !canvasContainer) return;
     rendering = true;
+    const loadVersion = ++pdfLoadVersion;
     try {
-      const containerW = canvasContainer.clientWidth;
-      const pageDisplayW = containerW - 80; // 40px margin each side
-      const dpr = window.devicePixelRatio || 1;
-      // pdfium scale = pixels per PDF point. We aim for pixelWidth wide output.
-      // 595pt ≈ standard A4 width; scale is approximate for non-A4 pages, but the
-      // bitmap is always drawn to fill pageDisplayW in world space so it looks correct
-      // regardless of the actual page width in points.
-      const pixelWidth = Math.round(pageDisplayW * dpr);
-      const approxScale = pixelWidth / 595;
-      const cacheKey = `${pageNum}:${pixelWidth}`;
-      let bitmap = bitmapCacheGet(cacheKey);
+      const pageDisplayW = getPageDisplayWidth();
+      const previewPixelWidth = getPreviewPdfPixelWidth(pageDisplayW);
+      currentPdfBitmap = null;
+      currentPdfBitmapKey = null;
+      const { key, rendered } = await fetchPdfBitmap(pageNum, previewPixelWidth);
+      if (loadVersion !== pdfLoadVersion) return;
 
-      if (!bitmap) {
-        const buf: ArrayBuffer = await invoke("render_pdf_page", {
-          relativePath: selectedBook.file_path,
-          pageNumber: pageNum - 1,
-          scale: approxScale,
-        });
-        const header = new DataView(buf);
-        const width = header.getUint32(0, true);
-        const height = header.getUint32(4, true);
-        const rgba = new Uint8ClampedArray(buf, 8);
-        const imageData = new ImageData(rgba, width, height);
-        bitmap = await createImageBitmap(imageData);
-        bitmapCachePut(cacheKey, bitmap);
-      }
-
-      currentPdfBitmap = bitmap;
-      // pageSize in world units: display width fixed, height from bitmap aspect ratio
-      pageSize = { w: pageDisplayW, h: pageDisplayW * (bitmap.height / bitmap.width) };
+      currentPdfPagePoints = { w: rendered.pageWidthPoints, h: rendered.pageHeightPoints };
+      pageSize = {
+        w: pageDisplayW,
+        h: pageDisplayW * (currentPdfPagePoints.h / currentPdfPagePoints.w),
+      };
+      currentPdfBitmap = rendered.bitmap;
+      currentPdfBitmapKey = key;
       centreOnPage();
       markDirty();
+      const upgradePixelWidth = getUpgradePdfPixelWidth();
+      if (upgradePixelWidth > previewPixelWidth * 1.1) {
+        void requestCurrentPdfBitmap();
+      }
     } finally {
       rendering = false;
     }
@@ -844,6 +1069,8 @@
     selectedStrokes = new Set();
     selection = null;
     currentPdfBitmap = null;
+    currentPdfBitmapKey = null;
+    currentPdfPagePoints = { w: 0, h: 0 };
 
     // Get page count from backend
     try {
@@ -884,6 +1111,8 @@
     selectedStrokes = new Set();
     selection = null;
     currentPdfBitmap = null;
+    currentPdfBitmapKey = null;
+    currentPdfPagePoints = { w: 0, h: 0 };
   }
 
   // ── Undo / Redo ──
@@ -909,7 +1138,8 @@
         invoke<number>("save_stroke", {
           pageId: currentPageId,
           stroke: {
-            colour: "rgba(30, 80, 220, 0.85)",
+            colour: restored.colour,
+            thickness: restored.thickness,
             points: restored.points.map(({ x, y }) => ({ x, y })),
             chunkId: restored.chunkId,
           },
@@ -969,12 +1199,11 @@
       inkCtx.setTransform(renderS, 0, 0, renderS, -wTL.x * renderS, -wTL.y * renderS);
       inkCtx.lineCap = "round";
       inkCtx.lineJoin = "round";
-      inkCtx.strokeStyle = "rgb(30, 80, 220)";
       for (const stroke of strokes) {
         if (stroke.points.length < 2) continue;
         if (stroke.bbox.maxX < selection.x || stroke.bbox.minX > selection.x + selection.width ||
             stroke.bbox.maxY < selection.y || stroke.bbox.minY > selection.y + selection.height) continue;
-        drawStrokePoints(inkCtx as unknown as CanvasRenderingContext2D, stroke.points, 0);
+        drawStrokePoints(inkCtx as unknown as CanvasRenderingContext2D, stroke.points, stroke.colour, stroke.thickness, 0);
       }
       ctx.drawImage(inkCanvas, 0, 0);
     }
@@ -1160,26 +1389,65 @@
         <div class="divider"></div>
 
         <!-- Draw -->
-        <button
-          class="tool-btn"
-          class:active={mode === 'draw'}
-          onclick={() => { mode = 'draw'; selectedStrokes = new Set(); selection = null; markDirty(); }}
-          aria-label="Draw"
-          aria-pressed={mode === 'draw'}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 19l7-7 3 3-7 7-3-3z"/>
-            <path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/>
-            <path d="M2 2l7.586 7.586"/>
-            <circle cx="11" cy="11" r="2"/>
-          </svg>
-        </button>
+        <div class="pen-tool">
+          <button
+            class="tool-btn"
+            class:active={mode === 'draw'}
+            onclick={activateDrawTool}
+            aria-label="Draw"
+            aria-pressed={mode === 'draw'}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 19l7-7 3 3-7 7-3-3z"/>
+              <path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/>
+              <path d="M2 2l7.586 7.586"/>
+              <circle cx="11" cy="11" r="2"/>
+            </svg>
+          </button>
+          {#if showPenOptions}
+            <div class="pen-popout" transition:fade={{ duration: 140 }}>
+              <div class="pen-popout-header">
+                <span class="pen-popout-title">Pen</span>
+                <span class="pen-preview" style={`--pen-preview-colour: ${penColour}; --pen-preview-size: ${penThickness}px;`}>
+                  <span class="pen-preview-dot"></span>
+                </span>
+              </div>
+              <label class="pen-slider-group" for="pen-thickness">
+                <span>Thickness</span>
+                <span>{penThickness.toFixed(1)} px</span>
+              </label>
+              <input
+                id="pen-thickness"
+                class="pen-slider"
+                type="range"
+                min="1"
+                max="12"
+                step="0.5"
+                value={penThickness}
+                oninput={(e) => penThickness = Number((e.currentTarget as HTMLInputElement).value)}
+              />
+              <div class="pen-colours" aria-label="Pen colours">
+                {#each PEN_COLOURS as colour}
+                  <button
+                    class="colour-swatch"
+                    class:selected={penColour === colour}
+                    type="button"
+                    onclick={() => penColour = colour}
+                    aria-label={`Select ${colour} pen`}
+                    aria-pressed={penColour === colour}
+                    style={`--swatch-colour: ${colour};`}
+                  ></button>
+                {/each}
+              </div>
+            </div>
+          {/if}
+        </div>
 
         <!-- Erase -->
         <button
           class="tool-btn"
           class:active={mode === 'erase'}
-          onclick={() => { mode = 'erase'; selectedStrokes = new Set(); selection = null; markDirty(); }}
+          onclick={activateEraseTool}
           aria-label="Erase"
           aria-pressed={mode === 'erase'}
         >
@@ -1193,7 +1461,7 @@
         <button
           class="tool-btn"
           class:active={mode === 'select'}
-          onclick={() => { mode = 'select'; selectedStrokes = new Set(); selection = null; markDirty(); }}
+          onclick={activateSelectTool}
           aria-label="Select"
           aria-pressed={mode === 'select'}
         >
@@ -1556,6 +1824,113 @@
   .tool-btn.active {
     background: #e0e8ff !important;
     color: #2040a0;
+  }
+
+  .pen-tool {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+
+  .pen-popout {
+    position: absolute;
+    bottom: calc(100% + 10px);
+    left: 50%;
+    transform: translateX(-50%);
+    width: 230px;
+    padding: 0.8rem;
+    background: rgba(255, 255, 255, 0.96);
+    border: 1px solid rgba(32, 64, 160, 0.14);
+    border-radius: 14px;
+    box-shadow: 0 12px 32px rgba(25, 34, 68, 0.18);
+    backdrop-filter: blur(8px);
+    z-index: 30;
+  }
+
+  .pen-popout::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    width: 14px;
+    height: 14px;
+    background: rgba(255, 255, 255, 0.96);
+    border-right: 1px solid rgba(32, 64, 160, 0.14);
+    border-bottom: 1px solid rgba(32, 64, 160, 0.14);
+    transform: translate(-50%, -50%) rotate(45deg);
+  }
+
+  .pen-popout-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.7rem;
+  }
+
+  .pen-popout-title {
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: #28405e;
+  }
+
+  .pen-preview {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 999px;
+    background: #f3f6fb;
+    border: 1px solid rgba(40, 64, 94, 0.12);
+  }
+
+  .pen-preview-dot {
+    width: max(6px, var(--pen-preview-size));
+    height: max(6px, var(--pen-preview-size));
+    border-radius: 999px;
+    background: var(--pen-preview-colour);
+  }
+
+  .pen-slider-group {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 0.35rem;
+    font-size: 0.8rem;
+    color: #4a5870;
+  }
+
+  .pen-slider {
+    width: 100%;
+    margin: 0 0 0.8rem;
+    accent-color: #2351d1;
+  }
+
+  .pen-colours {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 0.55rem;
+  }
+
+  .colour-swatch {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    justify-self: center;
+    border-radius: 999px;
+    background: var(--swatch-colour);
+    border: 2px solid rgba(255, 255, 255, 0.96);
+    box-shadow: 0 0 0 1px rgba(50, 62, 88, 0.18);
+    transition: transform 0.12s, box-shadow 0.12s;
+  }
+
+  .colour-swatch:hover {
+    transform: scale(1.08);
+  }
+
+  .colour-swatch.selected {
+    box-shadow: 0 0 0 2px #1f3f93, 0 0 0 5px rgba(31, 63, 147, 0.16);
   }
 
   .zoom-level {
