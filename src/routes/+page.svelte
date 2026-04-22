@@ -1,5 +1,12 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import {
+    attachConsole,
+    error as pluginError,
+    info as pluginInfo,
+    warn as pluginWarn,
+  } from "@tauri-apps/plugin-log";
   import { onMount, onDestroy } from "svelte";
   import { fade } from "svelte/transition";
 
@@ -20,10 +27,53 @@
   let sourceDocuments = $state<SourceDocument[]>([]);
   let importing = $state(false);
   let error = $state<string | null>(null);
+  let detachLogConsole: (() => void) | null = null;
+
+  function formatLogError(err: unknown): string {
+    if (err instanceof Error) return err.message;
+    return String(err);
+  }
+
+  async function appLogInfo(message: string) {
+    try {
+      await pluginInfo(message);
+    } catch (err) {
+      console.info(message, err);
+    }
+  }
+
+  async function appLogWarn(message: string) {
+    try {
+      await pluginWarn(message);
+    } catch (err) {
+      console.warn(message, err);
+    }
+  }
+
+  async function appLogError(message: string) {
+    try {
+      await pluginError(message);
+    } catch (err) {
+      console.error(message, err);
+    }
+  }
+
+  async function logChunkingStatus(sourceDocumentId: number, context: string) {
+    try {
+      const status = await invoke<string>("get_chunking_status", { sourceDocumentId });
+      await appLogInfo(`[chunking] ${context}: doc=${sourceDocumentId} status=${status}`);
+    } catch (err) {
+      await appLogWarn(
+        `[chunking] ${context}: failed to load status for doc=${sourceDocumentId}: ${formatLogError(err)}`,
+      );
+    }
+  }
 
   // PDF viewer state
   let selectedBook = $state<SourceDocument | null>(null);
   let currentPage = $state(1);
+  let pageInputValue = $state("1");
+  let pageInputFocused = $state(false);
   let totalPages = $state(0);
   let rendering = $state(false);
 
@@ -63,6 +113,15 @@
     strokeCacheData.delete(pageId);
   }
 
+  async function prefetchChunksForPage(pageId: number) {
+    try {
+      const chunks = await invoke<ChunkInfo[]>("get_chunks_for_page", { pageId });
+      for (const chunk of chunks) void ensureChunkSurface(chunk.id);
+    } catch {
+      // Prefetch should stay silent.
+    }
+  }
+
   function prefetchPage(bookId: number, pageNum: number) {
     if (pageNum < 1 || (totalPages > 0 && pageNum > totalPages)) return;
     const key = `${bookId}:${pageNum}`;
@@ -71,6 +130,7 @@
       pageNumber: pageNum,
     }).then(pageId => {
       pageIdLookup.set(key, pageId);
+      void prefetchChunksForPage(pageId);
       if (strokeCacheData.has(pageId)) return;
       return invoke<StrokeOutput[]>("load_strokes", { pageId }).then(data => {
         cachePut(pageId, data);
@@ -88,6 +148,7 @@
     pageIdLookup.set(key, pageId);
     currentPageId = pageId;
     await loadAndDrawStrokes(pageId);
+    void loadChunksForPage(pageId);
     prefetchPage(bookId, pageNum - 1);
     prefetchPage(bookId, pageNum + 1);
   }
@@ -171,6 +232,18 @@
   let strokes = $state<Stroke[]>([]);
   let redoStack = $state<Stroke[][]>([]);
   let activePointerId: number | null = null;
+  const CHUNK_TAP_MAX_DISTANCE = 10;
+
+  interface PendingChunkTap {
+    pointerId: number;
+    pointerType: string;
+    chunk: ChunkInfo;
+    startClientX: number;
+    startClientY: number;
+    startPoint: Point;
+  }
+
+  let pendingChunkTap = $state<PendingChunkTap | null>(null);
 
   const PRESSURE_WIDTH_THRESHOLD = 0.5;
 
@@ -192,11 +265,13 @@
   let canvasContainer = $state<HTMLDivElement>(null!);
   let gridCanvas = $state<HTMLCanvasElement>(null!);
   let pdfCanvas  = $state<HTMLCanvasElement>(null!);
+  let chunkOverlayCanvas = $state<HTMLCanvasElement>(null!);
   let dryCanvas  = $state<HTMLCanvasElement>(null!);
   let wetCanvas  = $state<HTMLCanvasElement>(null!);
 
   let gridCtx: CanvasRenderingContext2D | null = null;
   let pdfCtx:  CanvasRenderingContext2D | null = null;
+  let chunkOverlayCtx: CanvasRenderingContext2D | null = null;
   let dryCtx:  CanvasRenderingContext2D | null = null;
   let wetCtx:  CanvasRenderingContext2D | null = null;
 
@@ -550,10 +625,35 @@
 
   // ── Pointer events ──
 
+  function beginPendingChunkTap(e: PointerEvent, chunk: ChunkInfo) {
+    pendingChunkTap = {
+      pointerId: e.pointerId,
+      pointerType: e.pointerType,
+      chunk,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      startPoint: getPagePoint(e),
+    };
+  }
+
+  function pendingChunkTapMoved(e: PointerEvent): boolean {
+    if (!pendingChunkTap) return false;
+    const dx = e.clientX - pendingChunkTap.startClientX;
+    const dy = e.clientY - pendingChunkTap.startClientY;
+    return Math.hypot(dx, dy) > CHUNK_TAP_MAX_DISTANCE;
+  }
+
   function onPointerDown(e: PointerEvent) {
     if (e.pointerType === 'touch') {
       touchPointers = touchPointers.filter(p => p.id !== e.pointerId);
       touchPointers = [...touchPointers, { id: e.pointerId, x: e.clientX, y: e.clientY }];
+      if (touchPointers.length === 1 && mode !== 'erase') {
+        const { x, y } = pointerToNorm(e.clientX, e.clientY);
+        const hit = chunkAt(x, y);
+        if (hit) beginPendingChunkTap(e, hit);
+      } else if (touchPointers.length > 1 && pendingChunkTap?.pointerType === 'touch') {
+        pendingChunkTap = null;
+      }
       if (touchPointers.length === 2) {
         lastPinchDist = touchDist(touchPointers[0], touchPointers[1]);
         lastPinchMid  = touchMid(touchPointers[0], touchPointers[1]);
@@ -567,6 +667,18 @@
 
     if (!isPenOrMouse(e)) return;
     if (activePointerId !== null) return;
+
+    if (mode !== 'erase') {
+      const { x, y } = pointerToNorm(e.clientX, e.clientY);
+      const hit = chunkAt(x, y);
+      if (hit) {
+        activePointerId = e.pointerId;
+        wetCanvas.setPointerCapture(e.pointerId);
+        beginPendingChunkTap(e, hit);
+        e.preventDefault();
+        return;
+      }
+    }
 
     if (mode === 'erase') {
       activePointerId = e.pointerId;
@@ -603,6 +715,16 @@
   function onPointerMove(e: PointerEvent) {
     if (e.pointerType === 'touch') {
       touchPointers = touchPointers.map(p => p.id === e.pointerId ? { id: e.pointerId, x: e.clientX, y: e.clientY } : p);
+      if (pendingChunkTap?.pointerId === e.pointerId && pendingChunkTap.pointerType === 'touch') {
+        if (touchPointers.length > 1) {
+          pendingChunkTap = null;
+        } else if (!pendingChunkTapMoved(e)) {
+          e.preventDefault();
+          return;
+        } else {
+          pendingChunkTap = null;
+        }
+      }
       if (touchPointers.length === 2) {
         const [a, b] = touchPointers;
         const newDist = touchDist(a, b);
@@ -630,6 +752,45 @@
         camera.x += dx;
         camera.y += dy;
         lastPinchMid = { x: cur.x, y: cur.y };
+      }
+      markDirty();
+      e.preventDefault();
+      return;
+    }
+
+    if (pendingChunkTap?.pointerId === e.pointerId && pendingChunkTap.pointerType === e.pointerType) {
+      if (!pendingChunkTapMoved(e)) {
+        e.preventDefault();
+        return;
+      }
+
+      const pending = pendingChunkTap;
+      pendingChunkTap = null;
+
+      if (mode === 'select') {
+        selectOrigin = { x: pending.startPoint.x, y: pending.startPoint.y };
+        selectedStrokes = new Set();
+        selection = null;
+        const { x, y } = pointerToNorm(e.clientX, e.clientY);
+        selectRect = {
+          x: Math.min(pending.startPoint.x, x),
+          y: Math.min(pending.startPoint.y, y),
+          w: Math.abs(x - pending.startPoint.x),
+          h: Math.abs(y - pending.startPoint.y),
+        };
+        markDirty();
+        e.preventDefault();
+        return;
+      }
+
+      showPenOptions = false;
+      isDrawing = true;
+      currentStroke = [pending.startPoint];
+      lastDrawnStrokeIndex = 0;
+
+      const events: PointerEvent[] = e.getCoalescedEvents?.() ?? [e];
+      for (const ce of events) {
+        currentStroke.push(getPagePoint(ce));
       }
       markDirty();
       e.preventDefault();
@@ -672,11 +833,32 @@
 
   function onPointerUp(e: PointerEvent) {
     if (e.pointerType === 'touch') {
+      const tappedChunk =
+        pendingChunkTap?.pointerId === e.pointerId && pendingChunkTap.pointerType === 'touch'
+          ? pendingChunkTap.chunk
+          : null;
+      if (tappedChunk) pendingChunkTap = null;
       touchPointers = touchPointers.filter(p => p.id !== e.pointerId);
       if (touchPointers.length === 1) {
         lastPinchMid = { x: touchPointers[0].x, y: touchPointers[0].y };
       }
       e.preventDefault();
+      if (tappedChunk) {
+        void openChunkView(tappedChunk);
+      }
+      return;
+    }
+
+    if (pendingChunkTap?.pointerId === e.pointerId && pendingChunkTap.pointerType === e.pointerType) {
+      const tappedChunk = pendingChunkTap.chunk;
+      pendingChunkTap = null;
+      activePointerId = null;
+      isDrawing = false;
+      currentStroke = [];
+      lastDrawnStrokeIndex = 0;
+      markDirty();
+      e.preventDefault();
+      void openChunkView(tappedChunk);
       return;
     }
 
@@ -737,8 +919,15 @@
   function onPointerCancel(e: PointerEvent) {
     if (e.pointerType === 'touch') {
       touchPointers = touchPointers.filter(p => p.id !== e.pointerId);
+      if (pendingChunkTap?.pointerId === e.pointerId && pendingChunkTap.pointerType === 'touch') {
+        pendingChunkTap = null;
+      }
       e.preventDefault();
       return;
+    }
+
+    if (pendingChunkTap?.pointerId === e.pointerId && pendingChunkTap.pointerType === e.pointerType) {
+      pendingChunkTap = null;
     }
 
     if (mode === 'erase' || mode === 'select') {
@@ -763,8 +952,40 @@
   function renderAll() {
     renderGrid();
     renderPdf();
+    renderChunkOverlay();
     renderDryStrokes();
     renderWetLayer();
+  }
+
+  function renderChunkOverlay() {
+    if (!chunkOverlayCtx || !chunkOverlayCanvas) return;
+    const ctx = chunkOverlayCtx;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.setTransform(camera.scale * dpr, 0, 0, camera.scale * dpr, camera.x * dpr, camera.y * dpr);
+    ctx.clearRect(
+      -camera.x / camera.scale, -camera.y / camera.scale,
+      chunkOverlayCanvas.width / (camera.scale * dpr), chunkOverlayCanvas.height / (camera.scale * dpr),
+    );
+    if (!pageSize.w || currentChunks.length === 0) return;
+
+    for (const c of currentChunks) {
+      const colour = CHUNK_COLOURS[c.chunk_type] ?? CHUNK_COLOURS.other;
+      const tl = normToWorld(c.bbox_x, c.bbox_y);
+      const w  = c.bbox_w * pageSize.w;
+      const h  = c.bbox_h * pageSize.h;
+      const isActive = chunkView?.chunk.id === c.id;
+      ctx.save();
+      ctx.globalAlpha = isActive ? 0.24 : 0.15;
+      ctx.fillStyle = colour;
+      ctx.fillRect(tl.x, tl.y, w, h);
+      if (isActive) {
+        ctx.globalAlpha = 0.9;
+        ctx.strokeStyle = colour;
+        ctx.lineWidth = 1.5 / camera.scale;
+        ctx.strokeRect(tl.x, tl.y, w, h);
+      }
+      ctx.restore();
+    }
   }
 
   function renderGrid() {
@@ -967,16 +1188,17 @@
   // ── Canvas setup / resize ──
 
   function setupCanvases() {
-    if (!canvasContainer || !gridCanvas || !pdfCanvas || !dryCanvas || !wetCanvas) return;
+    if (!canvasContainer || !gridCanvas || !pdfCanvas || !chunkOverlayCanvas || !dryCanvas || !wetCanvas) return;
     const dpr = window.devicePixelRatio || 1;
     const w = canvasContainer.clientWidth;
     const h = canvasContainer.clientHeight;
-    for (const c of [gridCanvas, pdfCanvas, dryCanvas, wetCanvas]) {
+    for (const c of [gridCanvas, pdfCanvas, chunkOverlayCanvas, dryCanvas, wetCanvas]) {
       c.width  = Math.round(w * dpr);
       c.height = Math.round(h * dpr);
     }
     gridCtx = gridCanvas.getContext("2d");
     pdfCtx  = pdfCanvas.getContext("2d");
+    chunkOverlayCtx = chunkOverlayCanvas.getContext("2d");
     dryCtx  = dryCanvas.getContext("2d")!;
     wetCtx  = wetCanvas.getContext("2d")!;
     if (dryCtx) { dryCtx.lineCap = "round"; dryCtx.lineJoin = "round"; }
@@ -1022,6 +1244,7 @@
     if (!selectedBook || !canvasContainer) return;
     rendering = true;
     const loadVersion = ++pdfLoadVersion;
+    void appLogInfo(`[viewer] loading doc=${selectedBook.id} page=${pageNum}`);
     try {
       const pageDisplayW = getPageDisplayWidth();
       const previewPixelWidth = getPreviewPdfPixelWidth(pageDisplayW);
@@ -1045,6 +1268,14 @@
       if (upgradePixelWidth > previewPixelWidth * 1.1) {
         void requestCurrentPdfBitmap();
       }
+      void appLogInfo(
+        `[viewer] loaded doc=${selectedBook.id} page=${pageNum} bitmap=${rendered.bitmapWidth}x${rendered.bitmapHeight}`,
+      );
+    } catch (err) {
+      void appLogError(
+        `[viewer] failed to load doc=${selectedBook.id} page=${pageNum}: ${formatLogError(err)}`,
+      );
+      throw err;
     } finally {
       rendering = false;
     }
@@ -1063,16 +1294,24 @@
 
   async function loadSourceDocuments() {
     sourceDocuments = await invoke<SourceDocument[]>("list_textbooks");
+    void appLogInfo(`[library] loaded ${sourceDocuments.length} documents`);
   }
 
   async function importPdf() {
     error = null;
     importing = true;
     try {
-      await invoke<SourceDocument>("import_pdf");
+      const doc = await invoke<SourceDocument>("import_pdf");
+      void appLogInfo(
+        `[import] imported doc=${doc.id} title="${doc.title}" path="${doc.file_path}"`,
+      );
+      void logChunkingStatus(doc.id, "after import");
       await loadSourceDocuments();
     } catch (e: unknown) {
-      if (e !== "cancelled") error = String(e);
+      if (e !== "cancelled") {
+        error = String(e);
+        void appLogError(`[import] failed: ${formatLogError(e)}`);
+      }
     } finally {
       importing = false;
     }
@@ -1080,6 +1319,9 @@
 
   async function openBook(book: SourceDocument) {
     error = null;
+    if (chunkView) closeChunkView();
+    pendingChunkTap = null;
+    void appLogInfo(`[viewer] opening doc=${book.id} title="${book.title}"`);
     selectedBook = book;
     currentPage = loadSavedPage(book.id);
     currentPageId = null;
@@ -1091,15 +1333,20 @@
     currentPdfBitmap = null;
     currentPdfBitmapKey = null;
     currentPdfPagePoints = { w: 0, h: 0 };
+    currentChunks = [];
+    chunkSurfaceCache.clear();
 
     // Get page count from backend
     try {
       totalPages = await invoke<number>("get_page_count", { relativePath: book.file_path });
+      void appLogInfo(`[viewer] doc=${book.id} page_count=${totalPages}`);
+      void logChunkingStatus(book.id, "on open");
       if (currentPage > totalPages) currentPage = 1;
       await loadPdfPage(currentPage);
       resolvePageId(book.id, currentPage);
     } catch (e) {
       error = String(e);
+      void appLogError(`[viewer] failed to open doc=${book.id}: ${formatLogError(e)}`);
     }
   }
 
@@ -1107,12 +1354,15 @@
     if (rendering) return;
     const clamped = Math.max(1, Math.min(totalPages, pageNum));
     if (clamped === currentPage && currentPdfBitmap) return;
+    if (chunkView) closeChunkView();
+    pendingChunkTap = null;
     currentPage = clamped;
     currentPageId = null;
     strokes = [];
     redoStack = [];
     selectedStrokes = new Set();
     selection = null;
+    currentChunks = [];
     if (selectedBook) saveCurrentPage(selectedBook.id, currentPage);
     await loadPdfPage(currentPage);
     if (selectedBook) await resolvePageId(selectedBook.id, currentPage);
@@ -1121,7 +1371,43 @@
   async function prevPage() { await goToPage(currentPage - 1); }
   async function nextPage() { await goToPage(currentPage + 1); }
 
+  function getClampedPageNumber(rawValue: string) {
+    const trimmed = rawValue.trim();
+    if (!/^\d+$/.test(trimmed)) return null;
+    const parsed = Number(trimmed);
+    if (!Number.isSafeInteger(parsed)) return null;
+    return Math.max(1, totalPages > 0 ? Math.min(totalPages, parsed) : parsed);
+  }
+
+  async function commitPageInput() {
+    const targetPage = getClampedPageNumber(pageInputValue);
+    if (targetPage === null) {
+      pageInputValue = String(currentPage);
+      return;
+    }
+
+    pageInputValue = String(targetPage);
+    await goToPage(targetPage);
+  }
+
+  function handlePageInputKeydown(event: KeyboardEvent) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void commitPageInput();
+      return;
+    }
+
+    if (event.key === "Escape") {
+      event.preventDefault();
+      pageInputValue = String(currentPage);
+      pageInputFocused = false;
+      (event.currentTarget as HTMLInputElement).blur();
+    }
+  }
+
   function closeViewer() {
+    if (chunkView) closeChunkView();
+    pendingChunkTap = null;
     selectedBook = null;
     currentPage = 1;
     currentPageId = null;
@@ -1133,6 +1419,9 @@
     currentPdfBitmap = null;
     currentPdfBitmapKey = null;
     currentPdfPagePoints = { w: 0, h: 0 };
+    currentChunks = [];
+    chunkSurfaceCache.clear();
+    chunkView = null;
   }
 
   // ── Undo / Redo ──
@@ -1250,6 +1539,355 @@
     }
   }
 
+  // ── Chunks ──
+  interface ChunkInfo {
+    id: number;
+    chunk_type: string;
+    bbox_x: number;
+    bbox_y: number;
+    bbox_w: number;
+    bbox_h: number;
+    status: string;
+  }
+
+  interface SurfaceStrokeOutput {
+    id: number;
+    colour: string;
+    thickness: number;
+    points: { x: number; y: number }[];
+    min_x: number;
+    min_y: number;
+    max_x: number;
+    max_y: number;
+  }
+
+  interface ChunkSurfaceCache {
+    surfaceId: number;
+    strokes: Stroke[];
+  }
+
+  const CHUNK_COLOURS: Record<string, string> = {
+    definition: "#efcf5a",
+    theorem:    "#4f8fe2",
+    example:    "#5ec779",
+    proof:      "#a78bd9",
+    exercise:   "#e69a4c",
+    other:      "#b8b8b8",
+  };
+
+  let currentChunks = $state<ChunkInfo[]>([]);
+  const chunkSurfaceCache = new Map<number, ChunkSurfaceCache>();
+  const chunkSurfaceRequests = new Map<number, Promise<ChunkSurfaceCache>>();
+  let chunkMode = $state<'draw' | 'erase'>('draw');
+
+  let chunkView = $state<{
+    chunk: ChunkInfo;
+    surfaceId: number;
+    strokes: Stroke[];
+  } | null>(null);
+
+  async function loadChunksForPage(pageId: number) {
+    try {
+      currentChunks = await invoke<ChunkInfo[]>("get_chunks_for_page", { pageId });
+      void appLogInfo(
+        `[chunking] page data loaded: pageId=${pageId} currentPage=${currentPage} chunks=${currentChunks.length}`,
+      );
+    } catch {
+      currentChunks = [];
+      void appLogWarn(`[chunking] failed to load chunks for pageId=${pageId}`);
+    }
+    markDirty();
+    // Preload surfaces for this page's chunks so tap-open is instant.
+    for (const c of currentChunks) void ensureChunkSurface(c.id);
+  }
+
+  async function ensureChunkSurface(chunkId: number): Promise<ChunkSurfaceCache> {
+    const cached = chunkSurfaceCache.get(chunkId);
+    if (cached) return cached;
+    const existing = chunkSurfaceRequests.get(chunkId);
+    if (existing) return existing;
+
+    const req = (async () => {
+      const surfaceId = await invoke<number>("get_or_create_chunk_surface", { chunkId });
+      const raw = await invoke<SurfaceStrokeOutput[]>("load_surface_strokes", { surfaceId });
+      const strokes: Stroke[] = raw.map(s => ({
+        id: s.id,
+        colour: s.colour,
+        thickness: s.thickness ?? 1,
+        points: s.points.map(p => ({ x: p.x, y: p.y, pressure: 0.5 })),
+        bbox: { minX: s.min_x, minY: s.min_y, maxX: s.max_x, maxY: s.max_y },
+        chunkId,
+      }));
+      const entry: ChunkSurfaceCache = { surfaceId, strokes };
+      chunkSurfaceCache.set(chunkId, entry);
+      return entry;
+    })();
+    chunkSurfaceRequests.set(chunkId, req);
+    try {
+      return await req;
+    } finally {
+      chunkSurfaceRequests.delete(chunkId);
+    }
+  }
+
+  function chunkAt(normX: number, normY: number): ChunkInfo | null {
+    for (const c of currentChunks) {
+      if (
+        normX >= c.bbox_x && normX <= c.bbox_x + c.bbox_w &&
+        normY >= c.bbox_y && normY <= c.bbox_y + c.bbox_h
+      ) return c;
+    }
+    return null;
+  }
+
+  async function openChunkView(chunk: ChunkInfo) {
+    const cache = await ensureChunkSurface(chunk.id);
+    void appLogInfo(
+      `[chunk] open chunkId=${chunk.id} type=${chunk.chunk_type} cachedStrokes=${cache.strokes.length}`,
+    );
+    chunkMode = 'draw';
+    chunkView = {
+      chunk,
+      surfaceId: cache.surfaceId,
+      strokes: [...cache.strokes],
+    };
+    redoStack = [];
+    markDirty();
+  }
+
+  function closeChunkView() {
+    if (chunkView) {
+      void appLogInfo(
+        `[chunk] close chunkId=${chunkView.chunk.id} strokes=${chunkView.strokes.length}`,
+      );
+      const cached = chunkSurfaceCache.get(chunkView.chunk.id);
+      if (cached) cached.strokes = [...chunkView.strokes];
+    }
+    chunkView = null;
+    chunkMode = 'draw';
+    chunkWetCtx = null;
+    chunkDryCtx = null;
+    chunkWetCanvas = null!;
+    chunkDryCanvas = null!;
+    chunkIsDrawing = false;
+    chunkCurrentStroke = [];
+    chunkActivePointerId = null;
+    redoStack = [];
+    markDirty();
+  }
+
+  function formatChunkType(chunkType: string) {
+    return chunkType.charAt(0).toUpperCase() + chunkType.slice(1);
+  }
+
+  // ── Chunk view canvases ──
+  let chunkWetCanvas = $state<HTMLCanvasElement>(null!);
+  let chunkDryCanvas = $state<HTMLCanvasElement>(null!);
+  let chunkWetCtx: CanvasRenderingContext2D | null = null;
+  let chunkDryCtx: CanvasRenderingContext2D | null = null;
+
+  // Chunk drawing state (separate from page strokes)
+  let chunkIsDrawing = false;
+  let chunkCurrentStroke: Point[] = [];
+  let chunkActivePointerId: number | null = null;
+
+  function setupChunkCanvases(node: HTMLDivElement) {
+    const resize = () => {
+      if (!chunkWetCanvas || !chunkDryCanvas) return;
+      const dpr = window.devicePixelRatio || 1;
+      const w = node.clientWidth;
+      const h = node.clientHeight;
+      for (const c of [chunkDryCanvas, chunkWetCanvas]) {
+        c.width = Math.round(w * dpr);
+        c.height = Math.round(h * dpr);
+      }
+      chunkDryCtx = chunkDryCanvas.getContext("2d");
+      chunkWetCtx = chunkWetCanvas.getContext("2d");
+      if (chunkDryCtx) { chunkDryCtx.lineCap = "round"; chunkDryCtx.lineJoin = "round"; }
+      if (chunkWetCtx) { chunkWetCtx.lineCap = "round"; chunkWetCtx.lineJoin = "round"; }
+      redrawChunkDry();
+    };
+    resize();
+    queueMicrotask(resize);
+    const ro = new ResizeObserver(resize);
+    ro.observe(node);
+    return { destroy() { ro.disconnect(); } };
+  }
+
+  function pointerToChunkNorm(clientX: number, clientY: number): { x: number; y: number } {
+    const rect = chunkWetCanvas.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left) / rect.width,
+      y: (clientY - rect.top) / rect.height,
+    };
+  }
+
+  function redrawChunkDry() {
+    if (!chunkDryCtx || !chunkDryCanvas || !chunkView) return;
+    const ctx = chunkDryCtx;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, chunkDryCanvas.clientWidth, chunkDryCanvas.clientHeight);
+    const W = chunkDryCanvas.clientWidth;
+    const H = chunkDryCanvas.clientHeight;
+    for (const stroke of chunkView.strokes) {
+      if (stroke.points.length < 2) continue;
+      ctx.strokeStyle = stroke.colour;
+      ctx.lineWidth = stroke.thickness;
+      ctx.beginPath();
+      ctx.moveTo(stroke.points[0].x * W, stroke.points[0].y * H);
+      for (let i = 1; i < stroke.points.length - 1; i++) {
+        const mid = {
+          x: ((stroke.points[i].x + stroke.points[i + 1].x) / 2) * W,
+          y: ((stroke.points[i].y + stroke.points[i + 1].y) / 2) * H,
+        };
+        ctx.quadraticCurveTo(stroke.points[i].x * W, stroke.points[i].y * H, mid.x, mid.y);
+      }
+      const last = stroke.points.length - 1;
+      ctx.quadraticCurveTo(
+        stroke.points[last - 1].x * W, stroke.points[last - 1].y * H,
+        stroke.points[last].x * W, stroke.points[last].y * H,
+      );
+      ctx.stroke();
+    }
+  }
+
+  function drawChunkWet() {
+    if (!chunkWetCtx || !chunkWetCanvas) return;
+    const ctx = chunkWetCtx;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, chunkWetCanvas.clientWidth, chunkWetCanvas.clientHeight);
+    if (!chunkIsDrawing || chunkCurrentStroke.length < 2) return;
+    const W = chunkWetCanvas.clientWidth;
+    const H = chunkWetCanvas.clientHeight;
+    ctx.strokeStyle = penColour;
+    ctx.lineWidth = penThickness;
+    ctx.beginPath();
+    ctx.moveTo(chunkCurrentStroke[0].x * W, chunkCurrentStroke[0].y * H);
+    for (let i = 1; i < chunkCurrentStroke.length; i++) {
+      ctx.lineTo(chunkCurrentStroke[i].x * W, chunkCurrentStroke[i].y * H);
+    }
+    ctx.stroke();
+  }
+
+  function onChunkPointerDown(e: PointerEvent) {
+    if (!chunkView) return;
+    if (e.pointerType !== 'pen' && e.pointerType !== 'mouse' && e.pointerType !== 'touch') return;
+    if (chunkActivePointerId !== null) return;
+    chunkActivePointerId = e.pointerId;
+    chunkWetCanvas.setPointerCapture(e.pointerId);
+    const { x, y } = pointerToChunkNorm(e.clientX, e.clientY);
+
+    if (chunkMode === 'erase') {
+      eraseInChunk(x, y);
+      e.preventDefault();
+      return;
+    }
+
+    chunkIsDrawing = true;
+    chunkCurrentStroke = [{ x, y, pressure: e.pressure > 0 ? e.pressure : 0.5 }];
+    e.preventDefault();
+  }
+
+  function onChunkPointerMove(e: PointerEvent) {
+    if (!chunkView || e.pointerId !== chunkActivePointerId) return;
+    e.preventDefault();
+    const { x, y } = pointerToChunkNorm(e.clientX, e.clientY);
+    if (chunkMode === 'erase') {
+      eraseInChunk(x, y);
+      return;
+    }
+    if (!chunkIsDrawing) return;
+    chunkCurrentStroke.push({ x, y, pressure: e.pressure > 0 ? e.pressure : 0.5 });
+    drawChunkWet();
+  }
+
+  async function onChunkPointerUp(e: PointerEvent) {
+    if (!chunkView || e.pointerId !== chunkActivePointerId) return;
+    e.preventDefault();
+    chunkActivePointerId = null;
+    if (chunkMode === 'erase') return;
+    if (!chunkIsDrawing) return;
+    chunkIsDrawing = false;
+
+    const pts = chunkCurrentStroke;
+    chunkCurrentStroke = [];
+    drawChunkWet();
+    if (pts.length < 2) return;
+
+    const stroke: Stroke = {
+      id: null,
+      colour: penColour,
+      thickness: penThickness,
+      points: pts,
+      bbox: computeBBox(pts),
+      chunkId: chunkView.chunk.id,
+    };
+    chunkView.strokes = [...chunkView.strokes, stroke];
+    redrawChunkDry();
+
+    try {
+      const id = await invoke<number>("save_surface_stroke", {
+        surfaceId: chunkView.surfaceId,
+        stroke: {
+          colour: stroke.colour,
+          thickness: stroke.thickness,
+          points: pts.map(({ x, y }) => ({ x, y })),
+        },
+      });
+      stroke.id = id;
+    } catch (err) {
+      console.error("save_surface_stroke failed", err);
+    }
+  }
+
+  function onChunkPointerCancel(e: PointerEvent) {
+    if (!chunkView || e.pointerId !== chunkActivePointerId) return;
+    chunkActivePointerId = null;
+    chunkIsDrawing = false;
+    chunkCurrentStroke = [];
+    drawChunkWet();
+  }
+
+  async function eraseInChunk(x: number, y: number) {
+    if (!chunkView) return;
+    const rNorm = 0.015;
+    const keep: Stroke[] = [];
+    const remove: Stroke[] = [];
+    for (const s of chunkView.strokes) {
+      const hit = s.points.some(p => {
+        const dx = p.x - x, dy = p.y - y;
+        return dx * dx + dy * dy <= rNorm * rNorm;
+      });
+      if (hit) remove.push(s); else keep.push(s);
+    }
+    if (remove.length === 0) return;
+    chunkView.strokes = keep;
+    redrawChunkDry();
+    for (const s of remove) {
+      if (s.id !== null) invoke("delete_surface_stroke", { strokeId: s.id }).catch(() => {});
+    }
+  }
+
+  // ── Chunking progress events ──
+  let chunkingUnlisten: UnlistenFn | null = null;
+  async function setupChunkingListener() {
+    chunkingUnlisten = await listen<{ source_document_id: number; page_number: number; phase: string }>(
+      "chunking_progress",
+      (e) => {
+        void appLogInfo(
+          `[chunking] progress event doc=${e.payload.source_document_id} page=${e.payload.page_number} phase=${e.payload.phase}`,
+        );
+        if (!selectedBook) return;
+        if (e.payload.source_document_id !== selectedBook.id) return;
+        if (e.payload.page_number !== currentPage) return;
+        if (e.payload.phase !== "grouped") return;
+        if (currentPageId !== null) void loadChunksForPage(currentPageId);
+      },
+    );
+  }
+
   // ── Wheel handler ──
 
   function handleWheel(e: WheelEvent) {
@@ -1271,6 +1909,14 @@
   async function handleKeydown(e: KeyboardEvent) {
     if (!selectedBook) return;
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+
+    if (chunkView) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeChunkView();
+      }
+      return;
+    }
 
     if ((e.ctrlKey || e.metaKey) && e.key === "z") {
       e.preventDefault();
@@ -1300,18 +1946,35 @@
   }
 
   onMount(() => {
+    void (async () => {
+      try {
+        detachLogConsole = await attachConsole();
+        await appLogInfo("[logging] attached webview console logger");
+      } catch (err) {
+        console.warn("[logging] failed to attach webview console logger", err);
+      }
+    })();
     loadSourceDocuments();
     window.addEventListener("keydown", handleKeydown);
     window.addEventListener("wheel", handleWheel, { passive: false });
+    void setupChunkingListener();
   });
 
   onDestroy(() => {
     window.removeEventListener("keydown", handleKeydown);
     window.removeEventListener("wheel", handleWheel);
     containerResizeObserver?.disconnect();
+    chunkingUnlisten?.();
+    detachLogConsole?.();
   });
 
   let zoomPercent = $derived(Math.round(camera.scale * 100));
+
+  $effect(() => {
+    currentPage;
+    if (pageInputFocused) return;
+    pageInputValue = String(currentPage);
+  });
 </script>
 
 <main class:viewer-open={!!selectedBook}>
@@ -1341,6 +2004,7 @@
       >
         <canvas bind:this={gridCanvas} class="layer layer-grid"></canvas>
         <canvas bind:this={pdfCanvas}  class="layer layer-pdf"></canvas>
+        <canvas bind:this={chunkOverlayCanvas} class="layer layer-chunk"></canvas>
         <canvas bind:this={dryCanvas}  class="layer layer-dry"></canvas>
         <canvas
           bind:this={wetCanvas}
@@ -1351,6 +2015,74 @@
           onpointercancel={onPointerCancel}
         ></canvas>
       </div>
+
+      {#if chunkView}
+        <div class="chunk-sheet-backdrop">
+          <div
+            class="chunk-sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`${formatChunkType(chunkView.chunk.chunk_type)} notes`}
+            transition:fade={{ duration: 140 }}
+          >
+            <div class="chunk-sheet-header">
+              <div class="chunk-sheet-copy">
+                <span
+                  class="chunk-type-pill"
+                  style={`--chunk-accent: ${CHUNK_COLOURS[chunkView.chunk.chunk_type] ?? CHUNK_COLOURS.other};`}
+                >
+                  {formatChunkType(chunkView.chunk.chunk_type)}
+                </span>
+                <h2>Chunk notes</h2>
+                <p>These notes stay attached to this chunk instead of the whole page.</p>
+              </div>
+              <div class="chunk-sheet-actions">
+                <button
+                  class="tool-btn"
+                  class:active={chunkMode === 'draw'}
+                  onclick={() => chunkMode = 'draw'}
+                  aria-label="Draw in chunk note"
+                  aria-pressed={chunkMode === 'draw'}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 19l7-7 3 3-7 7-3-3z"/>
+                    <path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/>
+                    <path d="M2 2l7.586 7.586"/>
+                    <circle cx="11" cy="11" r="2"/>
+                  </svg>
+                </button>
+                <button
+                  class="tool-btn"
+                  class:active={chunkMode === 'erase'}
+                  onclick={() => chunkMode = 'erase'}
+                  aria-label="Erase in chunk note"
+                  aria-pressed={chunkMode === 'erase'}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M20 20H7L3 16l10-10 7 7-2.5 2.5"/>
+                    <path d="M6.5 17.5l5-5"/>
+                  </svg>
+                </button>
+                <button class="chunk-close-btn" type="button" onclick={closeChunkView} aria-label="Close chunk notes">
+                  Close
+                </button>
+              </div>
+            </div>
+
+            <div class="chunk-sheet-surface" class:mode-erase={chunkMode === 'erase'} use:setupChunkCanvases>
+              <canvas bind:this={chunkDryCanvas} class="chunk-layer chunk-layer-dry"></canvas>
+              <canvas
+                bind:this={chunkWetCanvas}
+                class="chunk-layer chunk-layer-wet"
+                onpointerdown={onChunkPointerDown}
+                onpointermove={onChunkPointerMove}
+                onpointerup={onChunkPointerUp}
+                onpointercancel={onChunkPointerCancel}
+              ></canvas>
+            </div>
+          </div>
+        </div>
+      {/if}
 
       {#if aiDebugImage}
         <div class="ai-debug" role="dialog" aria-label="Debug preview">
@@ -1372,9 +2104,30 @@
           </svg>
         </button>
 
-        <span class="page-indicator">
-          {currentPage}{totalPages > 0 ? ` / ${totalPages}` : ''}
-        </span>
+        <div class="page-indicator">
+          <input
+            class="page-input"
+            type="text"
+            inputmode="numeric"
+            pattern="[0-9]*"
+            aria-label="Page number"
+            disabled={rendering}
+            value={pageInputValue}
+            onfocus={(event) => {
+              pageInputFocused = true;
+              event.currentTarget.select();
+            }}
+            oninput={(event) => pageInputValue = event.currentTarget.value.replace(/\D/g, '')}
+            onblur={async () => {
+              pageInputFocused = false;
+              await commitPageInput();
+            }}
+            onkeydown={handlePageInputKeydown}
+          />
+          {#if totalPages > 0}
+            <span class="page-total">/ {totalPages}</span>
+          {/if}
+        </div>
 
         <!-- Next -->
         <button
@@ -1771,10 +2524,135 @@
 
   .layer-grid { pointer-events: none; }
   .layer-pdf  { pointer-events: none; }
+  .layer-chunk { pointer-events: none; }
   .layer-dry  { pointer-events: none; }
   /* .layer-wet receives all pointer events — no overrides needed */
 
   /* ── Controls bar ── */
+  .chunk-sheet-backdrop {
+    position: absolute;
+    inset: 0;
+    z-index: 120;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    background: rgba(18, 24, 35, 0.3);
+    backdrop-filter: blur(4px);
+  }
+
+  .chunk-sheet {
+    width: min(920px, 100%);
+    height: min(720px, 100%);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.97);
+    border: 1px solid rgba(41, 52, 76, 0.14);
+    border-radius: 18px;
+    box-shadow: 0 24px 60px rgba(17, 25, 40, 0.24);
+  }
+
+  .chunk-sheet-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 1rem 1rem 0.85rem;
+    border-bottom: 1px solid rgba(41, 52, 76, 0.1);
+  }
+
+  .chunk-sheet-copy h2 {
+    margin: 0.45rem 0 0.2rem;
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: #213047;
+  }
+
+  .chunk-sheet-copy p {
+    margin: 0;
+    color: #627089;
+    font-size: 0.9rem;
+  }
+
+  .chunk-type-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.32rem 0.65rem;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--chunk-accent) 20%, white);
+    color: #243041;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+  }
+
+  .chunk-sheet-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-shrink: 0;
+  }
+
+  .chunk-close-btn {
+    padding: 0.55rem 0.85rem;
+    border-radius: 10px;
+    background: #1f2f49;
+    color: #fff;
+    font-size: 0.88rem;
+    font-weight: 600;
+  }
+
+  .chunk-close-btn:hover {
+    background: #152238 !important;
+  }
+
+  .chunk-sheet-surface {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    background:
+      radial-gradient(circle at top left, rgba(239, 207, 90, 0.16), transparent 28%),
+      linear-gradient(180deg, #fbfcfe 0%, #f2f5fa 100%);
+    touch-action: none;
+  }
+
+  .chunk-sheet-surface.mode-erase {
+    cursor: cell;
+  }
+
+  .chunk-layer {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  .chunk-layer-dry {
+    pointer-events: none;
+  }
+
+  @media (max-width: 720px) {
+    .chunk-sheet-backdrop {
+      padding: 0.65rem;
+    }
+
+    .chunk-sheet {
+      width: 100%;
+      height: 100%;
+    }
+
+    .chunk-sheet-header {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    .chunk-sheet-actions {
+      justify-content: flex-end;
+    }
+  }
+
   .controls {
     display: flex;
     align-items: center;
@@ -1813,11 +2691,40 @@
   .chevron svg { width: 20px; height: 20px; }
 
   .page-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
     font-size: 0.9em;
     color: #666;
-    min-width: 3ch;
-    text-align: center;
     font-variant-numeric: tabular-nums;
+  }
+
+  .page-input {
+    width: 4.5ch;
+    padding: 0.2rem 0.35rem;
+    background: #fff;
+    color: inherit;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    text-align: center;
+    font: inherit;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .page-input:focus {
+    outline: none;
+    border-color: #999;
+    box-shadow: 0 0 0 2px rgba(32, 64, 160, 0.12);
+  }
+
+  .page-input:disabled {
+    background: #f3f3f3;
+    color: #888;
+  }
+
+  .page-total {
+    min-width: 3ch;
+    text-align: left;
   }
 
   .ink-btn, .tool-btn, .zoom-btn {

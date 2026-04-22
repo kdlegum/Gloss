@@ -1,3 +1,7 @@
+mod chunking;
+mod ollama;
+
+use log::info;
 use pdfium_render::prelude::*;
 use percent_encoding::percent_decode_str;
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
@@ -6,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_fs::{FilePath, FsExt};
+use tauri_plugin_log::{Target, TargetKind, TimezoneStrategy};
 
 // ── Pdfium worker ────────────────────────────────────────────────────────────
 // pdfium_render's Pdfium is !Send, so it must live on a single dedicated thread.
@@ -14,7 +19,7 @@ use tauri_plugin_fs::{FilePath, FsExt};
 type PdfJob = Box<dyn FnOnce(&Pdfium) + Send + 'static>;
 
 #[derive(Clone)]
-struct PdfiumWorker(std::sync::mpsc::SyncSender<PdfJob>);
+pub struct PdfiumWorker(std::sync::mpsc::SyncSender<PdfJob>);
 
 impl PdfiumWorker {
     /// Spawn the worker thread and bind pdfium.
@@ -52,7 +57,7 @@ impl PdfiumWorker {
     }
 
     /// Run a closure on the pdfium thread and await its result.
-    async fn run<F, T>(&self, f: F) -> Result<T, String>
+    pub async fn run<F, T>(&self, f: F) -> Result<T, String>
     where
         F: FnOnce(&Pdfium) -> Result<T, String> + Send + 'static,
         T: Send + 'static,
@@ -298,9 +303,62 @@ async fn get_or_create_note_surface_id(
     }
 }
 
+#[derive(serde::Serialize)]
+struct ChunkInfo {
+    id: i64,
+    chunk_type: String,
+    bbox_x: f32,
+    bbox_y: f32,
+    bbox_w: f32,
+    bbox_h: f32,
+    status: String,
+}
+
+#[tauri::command]
+async fn get_chunks_for_page(
+    page_id: i64,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<Vec<ChunkInfo>, String> {
+    let rows = sqlx::query(
+        "SELECT id, chunk_type, bbox_x, bbox_y, bbox_w, bbox_h, status \
+         FROM chunks WHERE page_id = ? ORDER BY bbox_y, bbox_x",
+    )
+    .bind(page_id)
+    .fetch_all(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ChunkInfo {
+            id: r.get("id"),
+            chunk_type: r.get("chunk_type"),
+            bbox_x: r.get("bbox_x"),
+            bbox_y: r.get("bbox_y"),
+            bbox_w: r.get("bbox_w"),
+            bbox_h: r.get("bbox_h"),
+            status: r.get("status"),
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn get_chunking_status(
+    source_document_id: i64,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<String, String> {
+    let row = sqlx::query("SELECT chunking_status FROM source_documents WHERE id = ?")
+        .bind(source_document_id)
+        .fetch_one(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(row.get("chunking_status"))
+}
+
 #[tauri::command]
 async fn import_pdf(
     app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<SourceDocument, String> {
     // Open file picker — returns FilePath::Path on desktop, FilePath::Url on Android
@@ -390,6 +448,26 @@ async fn import_pdf(
             .map_err(|e| e.to_string())?;
 
     let id: i64 = row.get("id");
+    info!(
+        target: "gloss_lib::import",
+        "imported pdf doc_id={} title=\"{}\" relative_path=\"{}\"",
+        id,
+        title,
+        relative_path
+    );
+
+    // Kick off background chunking. Errors are swallowed inside run_for_document.
+    let pool_clone = pool.inner().clone();
+    let pdfium_clone = state.pdfium.clone();
+    let app_clone = app.clone();
+    info!(
+        target: "gloss_lib::import",
+        "spawning background chunking for doc_id={}",
+        id
+    );
+    tokio::spawn(async move {
+        chunking::run_for_document(pool_clone, pdfium_clone, app_clone, id).await;
+    });
 
     Ok(SourceDocument {
         id,
@@ -739,12 +817,27 @@ async fn init_db(app: &tauri::App) -> Result<SqlitePool, Box<dyn std::error::Err
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .clear_targets()
+                .target(Target::new(TargetKind::Stdout))
+                .target(Target::new(TargetKind::LogDir {
+                    file_name: Some("gloss".to_string()),
+                }))
+                .target(Target::new(TargetKind::Webview))
+                .level(log::LevelFilter::Info)
+                .level_for("gloss_lib::chunking", log::LevelFilter::Debug)
+                .level_for("gloss_lib::ollama", log::LevelFilter::Debug)
+                .timezone_strategy(TimezoneStrategy::UseLocal)
+                .build(),
+        )
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let pool = tauri::async_runtime::block_on(init_db(app))
                 .expect("failed to initialise database");
+            info!(target: "gloss_lib::startup", "database initialised");
             app.manage(pool);
 
             let pdfium = if cfg!(target_os = "android") {
@@ -764,11 +857,13 @@ pub fn run() {
                 };
                 PdfiumWorker::spawn(exe_dir.join(lib_name)).expect("failed to start pdfium worker")
             };
+            info!(target: "gloss_lib::startup", "pdfium worker initialised");
 
             app.manage(AppState {
                 pdf_cache: Mutex::new(PdfCache::new()),
                 pdfium,
             });
+            info!(target: "gloss_lib::startup", "gloss startup complete");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -786,6 +881,8 @@ pub fn run() {
             delete_surface_stroke,
             render_pdf_page,
             get_page_count,
+            get_chunks_for_page,
+            get_chunking_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
