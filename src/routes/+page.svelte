@@ -217,6 +217,8 @@
   // ── PDF bitmap cache ──
   // Keyed by "pageNum:scaleKey". Stores rendered ImageBitmaps.
   const PDF_BITMAP_CACHE_MAX = 10;
+  const PDF_PREVIEW_DPR_CAP = 1.25;
+  const PDF_PREVIEW_MAX_WIDTH = 1280;
   const pdfBitmapCacheOrder: string[] = [];
   const pdfBitmapCache = new Map<string, ImageBitmap>();
   const pdfBitmapMetaCache = new Map<string, Omit<RenderedPdfBitmap, "bitmap">>();
@@ -267,7 +269,11 @@
 
   function getPreviewPdfPixelWidth(pageDisplayW = getPageDisplayWidth()) {
     const dpr = window.devicePixelRatio || 1;
-    return quantizePdfPixelWidth(pageDisplayW * dpr);
+    const previewPixelWidth = Math.min(
+      pageDisplayW * Math.min(dpr, PDF_PREVIEW_DPR_CAP),
+      PDF_PREVIEW_MAX_WIDTH,
+    );
+    return quantizePdfPixelWidth(previewPixelWidth);
   }
 
   function getUpgradePdfPixelWidth() {
@@ -343,6 +349,18 @@
 
     pdfBitmapRequests.set(cacheKey, request);
     return { key: cacheKey, rendered: await request };
+  }
+
+  function prefetchPdfBitmap(pageNum: number, targetPixelWidth: number) {
+    if (!selectedBook) return;
+    if (pageNum < 1 || (totalPages > 0 && pageNum > totalPages)) return;
+
+    const cacheKey = makePdfBitmapCacheKey(selectedBook.file_path, pageNum, targetPixelWidth);
+    if (pdfBitmapCache.has(cacheKey) || pdfBitmapRequests.has(cacheKey)) return;
+
+    void fetchPdfBitmap(pageNum, targetPixelWidth).catch(() => {
+      // Prefetch should never interrupt active navigation.
+    });
   }
 
   function applyRenderedPdfBitmap(
@@ -1021,6 +1039,8 @@
       currentPdfBitmapKey = key;
       centreOnPage();
       markDirty();
+      prefetchPdfBitmap(pageNum - 1, previewPixelWidth);
+      prefetchPdfBitmap(pageNum + 1, previewPixelWidth);
       const upgradePixelWidth = getUpgradePdfPixelWidth();
       if (upgradePixelWidth > previewPixelWidth * 1.1) {
         void requestCurrentPdfBitmap();
