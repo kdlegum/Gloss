@@ -1,15 +1,17 @@
 // Background PDF chunking pipeline.
 //
-// Flow per document:
-//   1. For every page: extract text blocks via pdfium + persist to `text_blocks`.
-//   2. Check Ollama health. If unavailable, write one chunk per block (fallback).
-//   3. Otherwise, per page: ask the LLM to group blocks + classify, persist to `chunks`,
+// Flow per viewed page:
+//   1. Extract text blocks for that page via pdfium + persist to `text_blocks`.
+//   2. Check the selected LLM provider. If unavailable, write one chunk per block.
+//   3. Otherwise ask the provider to group blocks + classify, persist to `chunks`,
 //      update `text_blocks.chunk_id`.
 //
 // Progress is reported via Tauri events (`chunking_progress`) so the frontend can
 // re-render the overlay as chunks land.
 
-use crate::ollama::{BlockForPrompt, GroupedChunk, OllamaClient};
+use crate::llm::{BlockForPrompt, GroupedChunk, LlmProvider};
+use crate::ollama::OllamaClient;
+use crate::openai::OpenAiClient;
 use crate::PdfiumWorker;
 use log::{debug, error, info, warn};
 use pdfium_render::prelude::*;
@@ -51,26 +53,37 @@ const ALLOWED_TYPES: &[&str] = &[
     "proof",
     "exercise",
     "example",
-    "other",
+    "explanation",
+    "noise",
 ];
 
 // ── Top-level orchestrator ──────────────────────────────────────────────────
 
-/// Runs the full chunking pipeline for one document. Called from a
-/// `tokio::spawn` task in `import_pdf`; never propagates errors — any
+/// Runs the chunking pipeline for one page. Called from a `tokio::spawn`
+/// task when the viewer resolves a page; never propagates errors — any
 /// failures mark `chunking_status='failed'` and log.
-pub async fn run_for_document(
+pub async fn run_for_page(
     pool: SqlitePool,
     pdfium: PdfiumWorker,
     app: AppHandle,
     doc_id: i64,
+    page_number: i64,
+    provider: LlmProvider,
 ) {
-    info!(target: "gloss_lib::chunking", "starting chunking job for doc_id={}", doc_id);
-    if let Err(e) = run_inner(&pool, &pdfium, &app, doc_id).await {
+    info!(
+        target: "gloss_lib::chunking",
+        "starting chunking job for doc_id={} page={} provider={}",
+        doc_id,
+        page_number,
+        provider
+    );
+    if let Err(e) = run_inner(&pool, &pdfium, &app, doc_id, page_number, provider).await {
         error!(
             target: "gloss_lib::chunking",
-            "chunking job failed for doc_id={}: {}",
+            "chunking job failed for doc_id={} page={} provider={}: {}",
             doc_id,
+            page_number,
+            provider,
             e
         );
         let _ = sqlx::query("UPDATE source_documents SET chunking_status = 'failed' WHERE id = ?")
@@ -78,7 +91,13 @@ pub async fn run_for_document(
             .execute(&pool)
             .await;
     } else {
-        info!(target: "gloss_lib::chunking", "finished chunking job for doc_id={}", doc_id);
+        info!(
+            target: "gloss_lib::chunking",
+            "finished chunking job for doc_id={} page={} provider={}",
+            doc_id,
+            page_number,
+            provider
+        );
     }
 }
 
@@ -87,8 +106,14 @@ async fn run_inner(
     pdfium: &PdfiumWorker,
     app: &AppHandle,
     doc_id: i64,
+    page_number: i64,
+    provider: LlmProvider,
 ) -> Result<(), String> {
-    // Resolve absolute path + page count.
+    if page_number < 1 {
+        return Err(format!("invalid page number {}", page_number));
+    }
+
+    // Resolve absolute path.
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let row = sqlx::query("SELECT file_path FROM source_documents WHERE id = ?")
         .bind(doc_id)
@@ -99,54 +124,32 @@ async fn run_inner(
     let abs_path = data_dir.join(&relative_path);
     info!(
         target: "gloss_lib::chunking",
-        "doc_id={} resolved path to {}",
+        "doc_id={} page={} resolved path to {}",
         doc_id,
+        page_number,
         abs_path.display()
     );
 
+    let page_id = get_or_create_page(pool, doc_id, page_number).await?;
+    let page_index = (page_number - 1) as usize;
+
     set_status(pool, doc_id, "extracting").await?;
 
-    let page_count = {
-        let p = abs_path.clone();
-        pdfium
-            .run(move |pdfium| {
-                let doc = pdfium
-                    .load_pdf_from_file(&p, None)
-                    .map_err(|e| e.to_string())?;
-                Ok(doc.pages().len() as usize)
-            })
-            .await?
-    };
-    info!(
-        target: "gloss_lib::chunking",
-        "doc_id={} page_count={}",
-        doc_id,
-        page_count
-    );
-
-    // Phase 1: extract + persist blocks for every page.
-    for page_num in 0..page_count {
-        let page_number = page_num as i64 + 1;
-        let page_id = get_or_create_page(pool, doc_id, page_num as i64 + 1).await?;
-
-        // Skip if this page already has extracted blocks (resume support).
-        let existing: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM text_blocks WHERE page_id = ?")
-                .bind(page_id)
-                .fetch_one(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-        if existing > 0 {
-            info!(
-                target: "gloss_lib::chunking",
-                "doc_id={} page={} skipping extraction; {} text blocks already exist",
-                doc_id,
-                page_number,
-                existing
-            );
-            continue;
-        }
-
+    let existing_blocks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM text_blocks WHERE page_id = ?")
+            .bind(page_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    if existing_blocks > 0 {
+        info!(
+            target: "gloss_lib::chunking",
+            "doc_id={} page={} skipping extraction; {} text blocks already exist",
+            doc_id,
+            page_number,
+            existing_blocks
+        );
+    } else {
         let p = abs_path.clone();
         info!(
             target: "gloss_lib::chunking",
@@ -155,7 +158,7 @@ async fn run_inner(
             page_number
         );
         let blocks = pdfium
-            .run(move |pdfium| extract_blocks_from_page(pdfium, &p, page_num))
+            .run(move |pdfium| extract_blocks_from_page(pdfium, &p, page_index))
             .await
             .unwrap_or_else(|e| {
                 warn!(
@@ -179,115 +182,195 @@ async fn run_inner(
         emit_progress(app, doc_id, page_number, "extracted");
     }
 
-    // Phase 2: grouping. Try Ollama once; if down, use fallback for every page.
     set_status(pool, doc_id, "grouping").await?;
-    let ollama = OllamaClient::new();
-    let use_llm = ollama.health_check().await;
+    let existing_chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE page_id = ?")
+        .bind(page_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    if existing_chunks > 0 {
+        info!(
+            target: "gloss_lib::chunking",
+            "doc_id={} page={} skipping grouping; {} chunks already exist",
+            doc_id,
+            page_number,
+            existing_chunks
+        );
+        set_status(pool, doc_id, "done").await?;
+        return Ok(());
+    }
+
+    let use_llm = provider_health_check(provider).await;
     info!(
         target: "gloss_lib::chunking",
-        "doc_id={} ollama_available={}",
+        "doc_id={} page={} provider={} available={}",
         doc_id,
+        page_number,
+        provider,
         use_llm
     );
 
-    for page_num in 0..page_count {
-        let page_number = page_num as i64 + 1;
-        let page_id = get_or_create_page(pool, doc_id, page_num as i64 + 1).await?;
+    let blocks = load_unchunked_blocks(pool, page_id).await?;
+    if blocks.is_empty() {
+        warn!(
+            target: "gloss_lib::chunking",
+            "doc_id={} page={} has no unchunked blocks to group",
+            doc_id,
+            page_number
+        );
+        set_status(pool, doc_id, "done").await?;
+        return Ok(());
+    }
+    info!(
+        target: "gloss_lib::chunking",
+        "doc_id={} page={} grouping {} blocks",
+        doc_id,
+        page_number,
+        blocks.len()
+    );
 
-        // Skip if this page already has chunks.
-        let existing_chunks: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE page_id = ?")
-                .bind(page_id)
-                .fetch_one(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-        if existing_chunks > 0 {
-            info!(
-                target: "gloss_lib::chunking",
-                "doc_id={} page={} skipping grouping; {} chunks already exist",
-                doc_id,
-                page_number,
-                existing_chunks
-            );
-            continue;
+    let used_llm = if use_llm {
+        match try_llm_chunking(provider, &blocks).await {
+            Ok(groups) if validate_groups(&groups, &blocks) => {
+                persist_chunks(pool, doc_id, page_id, &blocks, &groups, true).await?;
+                link_proofs_to_theorems(pool, page_id).await?;
+                info!(
+                    target: "gloss_lib::chunking",
+                    "doc_id={} page={} provider={} persisted {} LLM chunk groups",
+                    doc_id,
+                    page_number,
+                    provider,
+                    groups.len()
+                );
+                true
+            }
+            Ok(groups) => {
+                warn!(
+                    target: "gloss_lib::chunking",
+                    "doc_id={} page={} provider={} received invalid LLM grouping ({} groups); using fallback",
+                    doc_id,
+                    page_number,
+                    provider,
+                    groups.len()
+                );
+                false
+            }
+            Err(err) => {
+                warn!(
+                    target: "gloss_lib::chunking",
+                    "doc_id={} page={} provider={} LLM grouping failed: {}; using fallback",
+                    doc_id,
+                    page_number,
+                    provider,
+                    err
+                );
+                false
+            }
         }
+    } else {
+        false
+    };
 
-        let blocks = load_unchunked_blocks(pool, page_id).await?;
-        if blocks.is_empty() {
-            warn!(
-                target: "gloss_lib::chunking",
-                "doc_id={} page={} has no unchunked blocks to group",
-                doc_id,
-                page_number
-            );
-            continue;
-        }
+    if !used_llm {
+        fallback_one_chunk_per_block(pool, doc_id, page_id, &blocks).await?;
         info!(
             target: "gloss_lib::chunking",
-            "doc_id={} page={} grouping {} blocks",
+            "doc_id={} page={} fell back to one chunk per block ({})",
             doc_id,
             page_number,
             blocks.len()
         );
-
-        let used_llm = if use_llm {
-            match try_llm_chunking(&ollama, &blocks).await {
-                Ok(groups) if validate_groups(&groups, &blocks) => {
-                    persist_chunks(pool, doc_id, page_id, &blocks, &groups, true).await?;
-                    info!(
-                        target: "gloss_lib::chunking",
-                        "doc_id={} page={} persisted {} LLM chunk groups",
-                        doc_id,
-                        page_number,
-                        groups.len()
-                    );
-                    true
-                }
-                Ok(groups) => {
-                    warn!(
-                        target: "gloss_lib::chunking",
-                        "doc_id={} page={} received invalid LLM grouping ({} groups); using fallback",
-                        doc_id,
-                        page_number,
-                        groups.len()
-                    );
-                    false
-                }
-                Err(err) => {
-                    warn!(
-                        target: "gloss_lib::chunking",
-                        "doc_id={} page={} LLM grouping failed: {}; using fallback",
-                        doc_id,
-                        page_number,
-                        err
-                    );
-                    false
-                }
-            }
-        } else {
-            false
-        };
-
-        if !used_llm {
-            fallback_one_chunk_per_block(pool, doc_id, page_id, &blocks).await?;
-            info!(
-                target: "gloss_lib::chunking",
-                "doc_id={} page={} fell back to one chunk per block ({})",
-                doc_id,
-                page_number,
-                blocks.len()
-            );
-        }
-
-        emit_progress(app, doc_id, page_number, "grouped");
     }
+
+    emit_progress(app, doc_id, page_number, "grouped");
 
     set_status(pool, doc_id, "done").await?;
     Ok(())
 }
 
+pub async fn rechunk_page(
+    pool: &SqlitePool,
+    app: &AppHandle,
+    doc_id: i64,
+    page_number: i64,
+    provider: LlmProvider,
+) -> Result<(), String> {
+    info!(
+        target: "gloss_lib::chunking",
+        "starting manual re-chunk for doc_id={} page={} provider={}",
+        doc_id,
+        page_number,
+        provider
+    );
+    match rechunk_inner(pool, app, doc_id, page_number, provider).await {
+        Ok(()) => {
+            info!(
+                target: "gloss_lib::chunking",
+                "finished manual re-chunk for doc_id={} page={} provider={}",
+                doc_id,
+                page_number,
+                provider
+            );
+            Ok(())
+        }
+        Err(err) => {
+            error!(
+                target: "gloss_lib::chunking",
+                "manual re-chunk failed for doc_id={} page={} provider={}: {}",
+                doc_id,
+                page_number,
+                provider,
+                err
+            );
+            let _ = set_status(pool, doc_id, "failed").await;
+            Err(err)
+        }
+    }
+}
+
+async fn rechunk_inner(
+    pool: &SqlitePool,
+    app: &AppHandle,
+    doc_id: i64,
+    page_number: i64,
+    provider: LlmProvider,
+) -> Result<(), String> {
+    if page_number < 1 {
+        return Err(format!("invalid page number {}", page_number));
+    }
+
+    let page_id = get_or_create_page(pool, doc_id, page_number).await?;
+    let blocks = load_blocks_for_page(pool, page_id).await?;
+    if blocks.is_empty() {
+        return Err("page has no extracted text blocks to re-chunk".into());
+    }
+
+    set_status(pool, doc_id, "grouping").await?;
+    let groups = try_llm_chunking(provider, &blocks).await?;
+    if !validate_groups(&groups, &blocks) {
+        return Err(format!(
+            "received invalid {} grouping with {} groups",
+            provider,
+            groups.len()
+        ));
+    }
+
+    replace_chunks(pool, doc_id, page_id, &blocks, &groups, true).await?;
+    link_proofs_to_theorems(pool, page_id).await?;
+    emit_progress(app, doc_id, page_number, "grouped");
+    set_status(pool, doc_id, "done").await?;
+    Ok(())
+}
+
+async fn provider_health_check(provider: LlmProvider) -> bool {
+    match provider {
+        LlmProvider::Ollama => OllamaClient::new().health_check().await,
+        LlmProvider::OpenAI => OpenAiClient::new().health_check().await,
+    }
+}
+
 async fn try_llm_chunking(
-    ollama: &OllamaClient,
+    provider: LlmProvider,
     blocks: &[PersistedBlock],
 ) -> Result<Vec<GroupedChunk>, String> {
     let prompt_blocks: Vec<BlockForPrompt> = blocks
@@ -298,10 +381,16 @@ async fn try_llm_chunking(
         })
         .collect();
 
-    ollama
-        .chunk_blocks(&prompt_blocks)
-        .await
-        .map_err(|e| e.to_string())
+    match provider {
+        LlmProvider::Ollama => OllamaClient::new()
+            .chunk_blocks(&prompt_blocks)
+            .await
+            .map_err(|e| e.to_string()),
+        LlmProvider::OpenAI => OpenAiClient::new()
+            .chunk_blocks(&prompt_blocks)
+            .await
+            .map_err(|e| e.to_string()),
+    }
 }
 
 /// A valid grouping covers every block exactly once with no unknown ids.
@@ -417,8 +506,78 @@ async fn load_unchunked_blocks(
         .collect())
 }
 
+async fn load_blocks_for_page(pool: &SqlitePool, page_id: i64) -> Result<Vec<PersistedBlock>, String> {
+    let rows = sqlx::query(
+        "SELECT id, text, bbox_x, bbox_y, bbox_w, bbox_h \
+         FROM text_blocks WHERE page_id = ? ORDER BY order_idx",
+    )
+    .bind(page_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| PersistedBlock {
+            id: r.get("id"),
+            text: r.get("text"),
+            bbox_x: r.get("bbox_x"),
+            bbox_y: r.get("bbox_y"),
+            bbox_w: r.get("bbox_w"),
+            bbox_h: r.get("bbox_h"),
+        })
+        .collect())
+}
+
 async fn persist_chunks(
     pool: &SqlitePool,
+    doc_id: i64,
+    page_id: i64,
+    blocks: &[PersistedBlock],
+    groups: &[GroupedChunk],
+    ai_suggested: bool,
+) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    persist_chunks_in_tx(&mut tx, doc_id, page_id, blocks, groups, ai_suggested).await?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn replace_chunks(
+    pool: &SqlitePool,
+    doc_id: i64,
+    page_id: i64,
+    blocks: &[PersistedBlock],
+    groups: &[GroupedChunk],
+    ai_suggested: bool,
+) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM chunks WHERE page_id = ?")
+        .bind(page_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    persist_chunks_in_tx(
+        &mut tx,
+        doc_id,
+        page_id,
+        blocks,
+        groups,
+        ai_suggested,
+    )
+    .await?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+    debug!(
+        target: "gloss_lib::chunking",
+        "replaced chunks for page_id={} with {} groups",
+        page_id,
+        groups.len()
+    );
+    Ok(())
+}
+
+async fn persist_chunks_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     doc_id: i64,
     page_id: i64,
     blocks: &[PersistedBlock],
@@ -428,7 +587,6 @@ async fn persist_chunks(
     let by_id: std::collections::HashMap<i64, &PersistedBlock> =
         blocks.iter().map(|b| (b.id, b)).collect();
 
-    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     for g in groups {
         let members: Vec<&PersistedBlock> = g
             .block_ids
@@ -448,8 +606,9 @@ async fn persist_chunks(
 
         let row = sqlx::query(
             "INSERT INTO chunks \
-             (source_document_id, page_id, chunk_type, bbox_x, bbox_y, bbox_w, bbox_h, ocr_text, ai_suggested) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+             (source_document_id, page_id, chunk_type, bbox_x, bbox_y, bbox_w, bbox_h, ocr_text, \
+              title, subject, ai_suggested) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(doc_id)
         .bind(page_id)
@@ -459,8 +618,10 @@ async fn persist_chunks(
         .bind(bbox.2)
         .bind(bbox.3)
         .bind(text)
+        .bind(&g.title)
+        .bind(&g.subject)
         .bind(if ai_suggested { 1 } else { 0 })
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|e| e.to_string())?;
         let chunk_id: i64 = row.get("id");
@@ -469,12 +630,76 @@ async fn persist_chunks(
             sqlx::query("UPDATE text_blocks SET chunk_id = ? WHERE id = ?")
                 .bind(chunk_id)
                 .bind(id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .map_err(|e| e.to_string())?;
         }
     }
-    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn link_proofs_to_theorems(pool: &SqlitePool, page_id: i64) -> Result<(), String> {
+    let proofs = sqlx::query(
+        "SELECT id, subject FROM chunks \
+         WHERE page_id = ? AND chunk_type = 'proof' AND subject IS NOT NULL",
+    )
+    .bind(page_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if proofs.is_empty() {
+        return Ok(());
+    }
+
+    let candidates = sqlx::query(
+        "SELECT id, title FROM chunks \
+         WHERE page_id = ? AND chunk_type != 'proof' AND title IS NOT NULL",
+    )
+    .bind(page_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    for proof_row in &proofs {
+        let proof_id: i64 = proof_row.get("id");
+        let subject: String = proof_row.get("subject");
+        let subject_lower = subject.trim().to_lowercase();
+
+        // Prefer the longest matching title to avoid short false-positive matches.
+        let best = candidates
+            .iter()
+            .filter_map(|c| {
+                let title: String = c.get("title");
+                let title_lower = title.trim().to_lowercase();
+                if title_lower.contains(&subject_lower) || subject_lower.contains(&title_lower) {
+                    Some((c.get::<i64, _>("id"), title.len()))
+                } else {
+                    None
+                }
+            })
+            .max_by_key(|(_, len)| *len);
+
+        if let Some((target_id, _)) = best {
+            sqlx::query("UPDATE chunks SET proves_chunk_id = ? WHERE id = ?")
+                .bind(target_id)
+                .bind(proof_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            debug!(
+                target: "gloss_lib::chunking",
+                "linked proof chunk_id={} -> theorem chunk_id={} (subject={:?})",
+                proof_id, target_id, subject
+            );
+        } else {
+            debug!(
+                target: "gloss_lib::chunking",
+                "no theorem match for proof chunk_id={} subject={:?}",
+                proof_id, subject
+            );
+        }
+    }
     Ok(())
 }
 
@@ -489,7 +714,7 @@ async fn fallback_one_chunk_per_block(
         let row = sqlx::query(
             "INSERT INTO chunks \
              (source_document_id, page_id, chunk_type, bbox_x, bbox_y, bbox_w, bbox_h, ocr_text, ai_suggested) \
-             VALUES (?, ?, 'other', ?, ?, ?, ?, ?, 0) RETURNING id",
+             VALUES (?, ?, 'explanation', ?, ?, ?, ?, ?, 0) RETURNING id",
         )
         .bind(doc_id)
         .bind(page_id)
@@ -537,12 +762,21 @@ fn union_bbox(blocks: &[&PersistedBlock]) -> (f32, f32, f32, f32) {
 
 fn normalise_chunk_type(raw: &str) -> &'static str {
     let lower = raw.trim().to_lowercase();
+    // Accept the old name gracefully.
+    if lower == "other" {
+        return "explanation";
+    }
     for t in ALLOWED_TYPES {
         if lower == *t {
             return t;
         }
     }
-    "other"
+    debug!(
+        target: "gloss_lib::chunking",
+        "unknown chunk_type {:?} from LLM; coercing to 'explanation'",
+        raw
+    );
+    "explanation"
 }
 
 fn emit_progress(app: &AppHandle, doc_id: i64, page_number: i64, phase: &'static str) {

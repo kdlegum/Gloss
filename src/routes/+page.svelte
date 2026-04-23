@@ -24,10 +24,21 @@
     pageHeightPoints: number;
   }
 
+  type ChunkingProvider = "ollama" | "openai";
+
+  const CHUNKING_PROVIDER_STORAGE_KEY = "gloss_chunking_provider";
+  function isChunkingProvider(value: string | null): value is ChunkingProvider {
+    return value === "ollama" || value === "openai";
+  }
+
   let sourceDocuments = $state<SourceDocument[]>([]);
   let importing = $state(false);
   let error = $state<string | null>(null);
   let detachLogConsole: (() => void) | null = null;
+  let chunkingProvider = $state<ChunkingProvider>("ollama");
+  let currentChunkingStatus = $state("pending");
+  let currentPageChunkingActive = $state(false);
+  let reChunkingPage = $state(false);
 
   function formatLogError(err: unknown): string {
     if (err instanceof Error) return err.message;
@@ -61,11 +72,54 @@
   async function logChunkingStatus(sourceDocumentId: number, context: string) {
     try {
       const status = await invoke<string>("get_chunking_status", { sourceDocumentId });
+      if (selectedBook?.id === sourceDocumentId) {
+        currentChunkingStatus = status;
+      }
       await appLogInfo(`[chunking] ${context}: doc=${sourceDocumentId} status=${status}`);
+      return status;
     } catch (err) {
       await appLogWarn(
         `[chunking] ${context}: failed to load status for doc=${sourceDocumentId}: ${formatLogError(err)}`,
       );
+      return null;
+    }
+  }
+
+  async function ensureChunkingForPage(sourceDocumentId: number, pageNumber: number, context: string) {
+    try {
+      const started = await invoke<boolean>("ensure_chunking_for_page", {
+        sourceDocumentId,
+        pageNumber,
+        provider: chunkingProvider,
+      });
+      if (started && selectedBook?.id === sourceDocumentId) {
+        currentChunkingStatus = "extracting";
+      }
+      await appLogInfo(
+        `[chunking] ${context}: doc=${sourceDocumentId} page=${pageNumber} provider=${chunkingProvider} ${started ? "started page chunking" : "page chunking already active or complete"}`,
+      );
+      void logChunkingStatus(sourceDocumentId, `${context} status`);
+      void refreshCurrentPageChunkingActive(sourceDocumentId, pageNumber);
+    } catch (err) {
+      await appLogWarn(
+        `[chunking] ${context}: failed to ensure chunking for doc=${sourceDocumentId} page=${pageNumber}: ${formatLogError(err)}`,
+      );
+    }
+  }
+
+  async function refreshCurrentPageChunkingActive(sourceDocumentId: number, pageNumber: number) {
+    try {
+      const active = await invoke<boolean>("is_chunking_page_active", {
+        sourceDocumentId,
+        pageNumber,
+      });
+      if (selectedBook?.id === sourceDocumentId && currentPage === pageNumber) {
+        currentPageChunkingActive = active;
+      }
+    } catch {
+      if (selectedBook?.id === sourceDocumentId && currentPage === pageNumber) {
+        currentPageChunkingActive = false;
+      }
     }
   }
 
@@ -149,8 +203,9 @@
     currentPageId = pageId;
     await loadAndDrawStrokes(pageId);
     void loadChunksForPage(pageId);
-    prefetchPage(bookId, pageNum - 1);
+    void ensureChunkingForPage(bookId, pageNum, "page visible");
     prefetchPage(bookId, pageNum + 1);
+    prefetchPage(bookId, pageNum - 1);
   }
 
   interface StrokeOutput {
@@ -969,7 +1024,8 @@
     if (!pageSize.w || currentChunks.length === 0) return;
 
     for (const c of currentChunks) {
-      const colour = CHUNK_COLOURS[c.chunk_type] ?? CHUNK_COLOURS.other;
+      const colour = CHUNK_COLOURS[c.chunk_type];
+      if (!colour) continue;
       const tl = normToWorld(c.bbox_x, c.bbox_y);
       const w  = c.bbox_w * pageSize.w;
       const h  = c.bbox_h * pageSize.h;
@@ -1283,6 +1339,19 @@
 
   // ── Page navigation ──
 
+  function loadChunkingProvider(): ChunkingProvider {
+    if (typeof localStorage === "undefined") return "ollama";
+    const stored = localStorage.getItem(CHUNKING_PROVIDER_STORAGE_KEY);
+    return isChunkingProvider(stored) ? stored : "ollama";
+  }
+
+  function setChunkingProvider(provider: ChunkingProvider) {
+    if (chunkingProvider === provider) return;
+    chunkingProvider = provider;
+    localStorage.setItem(CHUNKING_PROVIDER_STORAGE_KEY, provider);
+    void appLogInfo(`[chunking] provider switched to ${provider}`);
+  }
+
   function savedPageKey(bookId: number) { return `gloss_page_${bookId}`; }
   function saveCurrentPage(bookId: number, page: number) {
     localStorage.setItem(savedPageKey(bookId), String(page));
@@ -1334,6 +1403,9 @@
     currentPdfBitmapKey = null;
     currentPdfPagePoints = { w: 0, h: 0 };
     currentChunks = [];
+    currentChunkingStatus = "pending";
+    currentPageChunkingActive = false;
+    reChunkingPage = false;
     chunkSurfaceCache.clear();
 
     // Get page count from backend
@@ -1363,6 +1435,7 @@
     selectedStrokes = new Set();
     selection = null;
     currentChunks = [];
+    currentPageChunkingActive = false;
     if (selectedBook) saveCurrentPage(selectedBook.id, currentPage);
     await loadPdfPage(currentPage);
     if (selectedBook) await resolvePageId(selectedBook.id, currentPage);
@@ -1420,6 +1493,9 @@
     currentPdfBitmapKey = null;
     currentPdfPagePoints = { w: 0, h: 0 };
     currentChunks = [];
+    currentChunkingStatus = "pending";
+    currentPageChunkingActive = false;
+    reChunkingPage = false;
     chunkSurfaceCache.clear();
     chunkView = null;
   }
@@ -1548,6 +1624,9 @@
     bbox_w: number;
     bbox_h: number;
     status: string;
+    title: string | null;
+    subject: string | null;
+    proves_chunk_id: number | null;
   }
 
   interface SurfaceStrokeOutput {
@@ -1567,12 +1646,12 @@
   }
 
   const CHUNK_COLOURS: Record<string, string> = {
-    definition: "#efcf5a",
-    theorem:    "#4f8fe2",
-    example:    "#5ec779",
-    proof:      "#a78bd9",
-    exercise:   "#e69a4c",
-    other:      "#b8b8b8",
+    definition:  "#efcf5a",
+    theorem:     "#4f8fe2",
+    example:     "#5ec779",
+    proof:       "#a78bd9",
+    exercise:    "#e69a4c",
+    explanation: "#b8b8b8",
   };
 
   let currentChunks = $state<ChunkInfo[]>([]);
@@ -1585,6 +1664,55 @@
     surfaceId: number;
     strokes: Stroke[];
   } | null>(null);
+
+  let chunkingBusy = $derived(
+    reChunkingPage || currentPageChunkingActive,
+  );
+  let canRechunkPage = $derived(
+    !!selectedBook && currentChunks.length > 0 && !chunkingBusy,
+  );
+
+  async function reChunkCurrentPage() {
+    if (!selectedBook || !canRechunkPage) return;
+
+    const providerLabel = chunkingProvider === "openai" ? "OpenAI" : "Ollama";
+    const confirmed = window.confirm(
+      `Re-chunk this page with ${providerLabel}?\n\nChunk-attached notes on this page will be deleted when the new chunks are saved. Page notes will stay.`,
+    );
+    if (!confirmed) return;
+
+    error = null;
+    reChunkingPage = true;
+    currentPageChunkingActive = true;
+    currentChunkingStatus = "grouping";
+
+    try {
+      await invoke("rechunk_page", {
+        sourceDocumentId: selectedBook.id,
+        pageNumber: currentPage,
+        provider: chunkingProvider,
+      });
+      await appLogInfo(
+        `[chunking] manual re-chunk complete: doc=${selectedBook.id} page=${currentPage} provider=${chunkingProvider}`,
+      );
+      if (currentPageId !== null) {
+        await loadChunksForPage(currentPageId);
+      }
+      await logChunkingStatus(selectedBook.id, "after manual re-chunk");
+    } catch (err) {
+      currentChunkingStatus = "failed";
+      error = String(err);
+      await appLogError(
+        `[chunking] manual re-chunk failed: doc=${selectedBook.id} page=${currentPage} provider=${chunkingProvider}: ${formatLogError(err)}`,
+      );
+    } finally {
+      reChunkingPage = false;
+      if (selectedBook) {
+        void logChunkingStatus(selectedBook.id, "after manual re-chunk settle");
+        void refreshCurrentPageChunkingActive(selectedBook.id, currentPage);
+      }
+    }
+  }
 
   async function loadChunksForPage(pageId: number) {
     try {
@@ -1877,10 +2005,15 @@
       "chunking_progress",
       (e) => {
         void appLogInfo(
-          `[chunking] progress event doc=${e.payload.source_document_id} page=${e.payload.page_number} phase=${e.payload.phase}`,
+        `[chunking] progress event doc=${e.payload.source_document_id} page=${e.payload.page_number} phase=${e.payload.phase}`,
         );
         if (!selectedBook) return;
         if (e.payload.source_document_id !== selectedBook.id) return;
+        if (e.payload.phase === "extracted") currentChunkingStatus = "grouping";
+        if (e.payload.phase === "grouped") {
+          currentChunkingStatus = "done";
+          currentPageChunkingActive = false;
+        }
         if (e.payload.page_number !== currentPage) return;
         if (e.payload.phase !== "grouped") return;
         if (currentPageId !== null) void loadChunksForPage(currentPageId);
@@ -1946,6 +2079,7 @@
   }
 
   onMount(() => {
+    chunkingProvider = loadChunkingProvider();
     void (async () => {
       try {
         detachLogConsole = await attachConsole();
@@ -1988,6 +2122,39 @@
           </svg>
         </button>
         <span class="viewer-title">{selectedBook.title}</span>
+        <div class="viewer-header-actions">
+          <div class="chunking-provider-group">
+            <span class="chunking-provider-label">Chunking AI</span>
+            <div class="chunking-provider-toggle" role="group" aria-label="Chunking AI provider">
+              <button
+                class="chunking-provider-btn"
+                class:active={chunkingProvider === "ollama"}
+                onclick={() => setChunkingProvider("ollama")}
+                aria-pressed={chunkingProvider === "ollama"}
+                type="button"
+              >
+                Ollama
+              </button>
+              <button
+                class="chunking-provider-btn"
+                class:active={chunkingProvider === "openai"}
+                onclick={() => setChunkingProvider("openai")}
+                aria-pressed={chunkingProvider === "openai"}
+                type="button"
+              >
+                OpenAI
+              </button>
+            </div>
+          </div>
+          <button
+            class="rechunk-btn"
+            onclick={reChunkCurrentPage}
+            disabled={!canRechunkPage}
+            type="button"
+          >
+            {reChunkingPage ? "Re-chunking..." : "Re-chunk page"}
+          </button>
+        </div>
       </div>
 
       {#if error}
@@ -2029,11 +2196,17 @@
               <div class="chunk-sheet-copy">
                 <span
                   class="chunk-type-pill"
-                  style={`--chunk-accent: ${CHUNK_COLOURS[chunkView.chunk.chunk_type] ?? CHUNK_COLOURS.other};`}
+                  style={`--chunk-accent: ${CHUNK_COLOURS[chunkView.chunk.chunk_type] ?? '#b8b8b8'};`}
                 >
                   {formatChunkType(chunkView.chunk.chunk_type)}
                 </span>
-                <h2>Chunk notes</h2>
+                {#if chunkView.chunk.title}
+                  <h2>{chunkView.chunk.title}</h2>
+                {:else if chunkView.chunk.subject}
+                  <h2>Proof of {chunkView.chunk.subject}</h2>
+                {:else}
+                  <h2>Chunk notes</h2>
+                {/if}
                 <p>These notes stay attached to this chunk instead of the whole page.</p>
               </div>
               <div class="chunk-sheet-actions">
@@ -2471,14 +2644,88 @@
     padding: 0.75rem 1rem;
     border-bottom: 1px solid #ddd;
     flex-shrink: 0;
+    flex-wrap: wrap;
   }
 
   .viewer-title {
+    flex: 1 1 220px;
+    min-width: 0;
     font-weight: 600;
     font-size: 1.05em;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  .viewer-header-actions {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+
+  .chunking-provider-group {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    flex-wrap: wrap;
+  }
+
+  .chunking-provider-label {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #667285;
+    letter-spacing: 0.01em;
+  }
+
+  .chunking-provider-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.15rem;
+    padding: 0.18rem;
+    background: #f3f5f9;
+    border: 1px solid #d7dde7;
+    border-radius: 999px;
+  }
+
+  .chunking-provider-btn {
+    padding: 0.38rem 0.8rem;
+    background: transparent;
+    color: #556274;
+    border-radius: 999px;
+    font-size: 0.84rem;
+    font-weight: 600;
+    transition: background 0.12s, color 0.12s;
+  }
+
+  .chunking-provider-btn:hover {
+    background: #e7ebf4 !important;
+  }
+
+  .chunking-provider-btn.active {
+    background: #1f2f49 !important;
+    color: #fff;
+  }
+
+  .rechunk-btn {
+    padding: 0.55rem 0.9rem;
+    background: #eef2f8;
+    color: #1f2f49;
+    border: 1px solid #d6dde8;
+    border-radius: 10px;
+    font-size: 0.88rem;
+    font-weight: 600;
+    transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+  }
+
+  .rechunk-btn:hover:not(:disabled) {
+    background: #e5ebf5 !important;
+    border-color: #c5cfdd;
+  }
+
+  .rechunk-btn:disabled {
+    opacity: 0.55;
   }
 
   .back-btn {
@@ -2497,6 +2744,19 @@
 
   .back-btn:hover { background: #eee !important; }
   .back-btn svg  { width: 18px; height: 18px; }
+
+  @media (max-width: 720px) {
+    .viewer-header-actions {
+      width: 100%;
+      justify-content: space-between;
+      margin-left: 0;
+    }
+
+    .chunking-provider-group {
+      flex: 1 1 100%;
+      justify-content: space-between;
+    }
+  }
 
   /* ── Infinite canvas ── */
   .infinite-canvas {

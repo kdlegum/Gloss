@@ -1,11 +1,14 @@
 mod chunking;
+mod llm;
+mod openai;
 mod ollama;
 
+use crate::llm::LlmProvider;
 use log::info;
 use pdfium_render::prelude::*;
 use percent_encoding::percent_decode_str;
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
@@ -133,6 +136,59 @@ impl PdfCache {
 struct AppState {
     pdf_cache: Mutex<PdfCache>,
     pdfium: PdfiumWorker,
+    chunking_jobs: Arc<Mutex<HashSet<(i64, i64)>>>,
+}
+
+fn spawn_chunking_job(
+    app: tauri::AppHandle,
+    pool: SqlitePool,
+    state: &AppState,
+    doc_id: i64,
+    page_number: i64,
+    provider: LlmProvider,
+) -> Result<bool, String> {
+    if !begin_chunking_job(state, doc_id, page_number)? {
+        return Ok(false);
+    }
+
+    let chunking_jobs = Arc::clone(&state.chunking_jobs);
+    let pdfium = state.pdfium.clone();
+    info!(
+        target: "gloss_lib::chunking",
+        "spawning tracked chunking job for doc_id={} page={} provider={}",
+        doc_id,
+        page_number,
+        provider
+    );
+    tokio::spawn(async move {
+        chunking::run_for_page(pool, pdfium, app, doc_id, page_number, provider).await;
+        finish_chunking_job(&chunking_jobs, doc_id, page_number);
+    });
+    Ok(true)
+}
+
+fn begin_chunking_job(state: &AppState, doc_id: i64, page_number: i64) -> Result<bool, String> {
+    let mut jobs = state.chunking_jobs.lock().map_err(|e| e.to_string())?;
+    if !jobs.insert((doc_id, page_number)) {
+        info!(
+            target: "gloss_lib::chunking",
+            "chunking job already running for doc_id={} page={}",
+            doc_id,
+            page_number
+        );
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn finish_chunking_job(
+    chunking_jobs: &Arc<Mutex<HashSet<(i64, i64)>>>,
+    doc_id: i64,
+    page_number: i64,
+) {
+    if let Ok(mut jobs) = chunking_jobs.lock() {
+        jobs.remove(&(doc_id, page_number));
+    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize, bincode::Encode, bincode::Decode, Clone, Copy)]
@@ -312,6 +368,9 @@ struct ChunkInfo {
     bbox_w: f32,
     bbox_h: f32,
     status: String,
+    title: Option<String>,
+    subject: Option<String>,
+    proves_chunk_id: Option<i64>,
 }
 
 #[tauri::command]
@@ -320,7 +379,8 @@ async fn get_chunks_for_page(
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<Vec<ChunkInfo>, String> {
     let rows = sqlx::query(
-        "SELECT id, chunk_type, bbox_x, bbox_y, bbox_w, bbox_h, status \
+        "SELECT id, chunk_type, bbox_x, bbox_y, bbox_w, bbox_h, status, \
+                title, subject, proves_chunk_id \
          FROM chunks WHERE page_id = ? ORDER BY bbox_y, bbox_x",
     )
     .bind(page_id)
@@ -338,6 +398,9 @@ async fn get_chunks_for_page(
             bbox_w: r.get("bbox_w"),
             bbox_h: r.get("bbox_h"),
             status: r.get("status"),
+            title: r.get("title"),
+            subject: r.get("subject"),
+            proves_chunk_id: r.get("proves_chunk_id"),
         })
         .collect())
 }
@@ -356,9 +419,101 @@ async fn get_chunking_status(
 }
 
 #[tauri::command]
-async fn import_pdf(
+async fn is_chunking_page_active(
+    source_document_id: i64,
+    page_number: i64,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let jobs = state.chunking_jobs.lock().map_err(|e| e.to_string())?;
+    Ok(jobs.contains(&(source_document_id, page_number)))
+}
+
+#[tauri::command]
+async fn ensure_chunking_for_page(
+    source_document_id: i64,
+    page_number: i64,
+    provider: String,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<bool, String> {
+    if page_number < 1 {
+        return Err(format!("invalid page number {}", page_number));
+    }
+    let provider = provider.parse::<LlmProvider>()?;
+
+    sqlx::query("INSERT OR IGNORE INTO pages (source_document_id, page_number) VALUES (?, ?)")
+        .bind(source_document_id)
+        .bind(page_number)
+        .execute(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+    let page_row =
+        sqlx::query("SELECT id FROM pages WHERE source_document_id = ? AND page_number = ?")
+            .bind(source_document_id)
+            .bind(page_number)
+            .fetch_one(pool.inner())
+            .await
+            .map_err(|e| e.to_string())?;
+    let page_id: i64 = page_row.get("id");
+    let existing_chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE page_id = ?")
+        .bind(page_id)
+        .fetch_one(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+    if existing_chunks > 0 {
+        info!(
+            target: "gloss_lib::chunking",
+            "not starting chunking for doc_id={} page={} because {} chunks already exist",
+            source_document_id,
+            page_number,
+            existing_chunks
+        );
+        return Ok(false);
+    }
+
+    spawn_chunking_job(
+        app,
+        pool.inner().clone(),
+        state.inner(),
+        source_document_id,
+        page_number,
+        provider,
+    )
+}
+
+#[tauri::command]
+async fn rechunk_page(
+    source_document_id: i64,
+    page_number: i64,
+    provider: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<(), String> {
+    if page_number < 1 {
+        return Err(format!("invalid page number {}", page_number));
+    }
+    let provider = provider.parse::<LlmProvider>()?;
+    if !begin_chunking_job(state.inner(), source_document_id, page_number)? {
+        return Err("chunking already active for this page".into());
+    }
+
+    let result = chunking::rechunk_page(
+        pool.inner(),
+        &app,
+        source_document_id,
+        page_number,
+        provider,
+    )
+    .await;
+    finish_chunking_job(&state.chunking_jobs, source_document_id, page_number);
+    result
+}
+
+#[tauri::command]
+async fn import_pdf(
+    app: tauri::AppHandle,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<SourceDocument, String> {
     // Open file picker — returns FilePath::Path on desktop, FilePath::Url on Android
@@ -455,19 +610,6 @@ async fn import_pdf(
         title,
         relative_path
     );
-
-    // Kick off background chunking. Errors are swallowed inside run_for_document.
-    let pool_clone = pool.inner().clone();
-    let pdfium_clone = state.pdfium.clone();
-    let app_clone = app.clone();
-    info!(
-        target: "gloss_lib::import",
-        "spawning background chunking for doc_id={}",
-        id
-    );
-    tokio::spawn(async move {
-        chunking::run_for_document(pool_clone, pdfium_clone, app_clone, id).await;
-    });
 
     Ok(SourceDocument {
         id,
@@ -755,8 +897,8 @@ async fn render_pdf_page(
                 .map_err(|e| e.to_string())?;
 
             let width_px = target_width as i32;
-            let height_px = ((target_width as f32) * (page.height().value / page.width().value))
-                .round() as i32;
+            let height_px =
+                ((target_width as f32) * (page.height().value / page.width().value)).round() as i32;
 
             let bitmap = page
                 .render_with_config(
@@ -827,6 +969,8 @@ pub fn run() {
                 .target(Target::new(TargetKind::Webview))
                 .level(log::LevelFilter::Info)
                 .level_for("gloss_lib::chunking", log::LevelFilter::Debug)
+                .level_for("gloss_lib::llm", log::LevelFilter::Debug)
+                .level_for("gloss_lib::openai", log::LevelFilter::Debug)
                 .level_for("gloss_lib::ollama", log::LevelFilter::Debug)
                 .timezone_strategy(TimezoneStrategy::UseLocal)
                 .build(),
@@ -862,6 +1006,7 @@ pub fn run() {
             app.manage(AppState {
                 pdf_cache: Mutex::new(PdfCache::new()),
                 pdfium,
+                chunking_jobs: Arc::new(Mutex::new(HashSet::new())),
             });
             info!(target: "gloss_lib::startup", "gloss startup complete");
             Ok(())
@@ -883,6 +1028,9 @@ pub fn run() {
             get_page_count,
             get_chunks_for_page,
             get_chunking_status,
+            is_chunking_page_active,
+            ensure_chunking_for_page,
+            rechunk_page,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

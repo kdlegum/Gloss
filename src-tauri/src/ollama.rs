@@ -1,35 +1,17 @@
-// Minimal Ollama HTTP client for the chunker.
-// Talks to a locally running Ollama server (default http://localhost:11434).
-
-use log::{debug, info, warn};
+use crate::llm::{build_prompt, parse_chunks, BlockForPrompt, GroupedChunk, LlmError};
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+const LOG_TARGET: &str = "gloss_lib::ollama";
 const DEFAULT_BASE_URL: &str = "http://localhost:11434";
-const DEFAULT_MODEL: &str = "gemma3:4b";
+const DEFAULT_MODEL: &str = "gemma4:latest";
 
 #[derive(Clone)]
 pub struct OllamaClient {
     base_url: String,
     model: String,
     client: reqwest::Client,
-}
-
-#[derive(Debug)]
-pub enum OllamaError {
-    Unavailable,
-    Http(String),
-    Parse(String),
-}
-
-impl std::fmt::Display for OllamaError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unavailable => write!(f, "ollama unavailable"),
-            Self::Http(s) => write!(f, "ollama http error: {s}"),
-            Self::Parse(s) => write!(f, "ollama parse error: {s}"),
-        }
-    }
 }
 
 impl OllamaClient {
@@ -52,7 +34,7 @@ impl OllamaClient {
         let fut = self.client.get(&url).timeout(Duration::from_secs(2)).send();
         let healthy = matches!(fut.await, Ok(r) if r.status().is_success());
         info!(
-            target: "gloss_lib::ollama",
+            target: LOG_TARGET,
             "health_check base_url={} healthy={}",
             self.base_url,
             healthy
@@ -65,12 +47,12 @@ impl OllamaClient {
     pub async fn chunk_blocks(
         &self,
         blocks: &[BlockForPrompt<'_>],
-    ) -> Result<Vec<GroupedChunk>, OllamaError> {
+    ) -> Result<Vec<GroupedChunk>, LlmError> {
         if blocks.is_empty() {
             return Ok(Vec::new());
         }
         info!(
-            target: "gloss_lib::ollama",
+            target: LOG_TARGET,
             "chunk_blocks model={} block_count={}",
             self.model,
             blocks.len()
@@ -94,39 +76,28 @@ impl OllamaClient {
             .await
             .map_err(|e| {
                 if e.is_connect() || e.is_timeout() {
-                    OllamaError::Unavailable
+                    LlmError::Unavailable
                 } else {
-                    OllamaError::Http(e.to_string())
+                    LlmError::Http(e.to_string())
                 }
             })?;
 
         if !resp.status().is_success() {
-            return Err(OllamaError::Http(format!("status {}", resp.status())));
+            return Err(LlmError::Http(format!("status {}", resp.status())));
         }
 
         let body: GenerateResponse = resp
             .json()
             .await
-            .map_err(|e| OllamaError::Http(e.to_string()))?;
+            .map_err(|e| LlmError::Http(e.to_string()))?;
         debug!(
-            target: "gloss_lib::ollama",
+            target: LOG_TARGET,
             "received {} response chars from ollama",
             body.response.len()
         );
 
-        parse_chunks(&body.response)
+        parse_chunks(&body.response, LOG_TARGET)
     }
-}
-
-pub struct BlockForPrompt<'a> {
-    pub id: i64,
-    pub text: &'a str,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct GroupedChunk {
-    pub block_ids: Vec<i64>,
-    pub chunk_type: String,
 }
 
 #[derive(Serialize)]
@@ -146,65 +117,4 @@ struct GenerateOptions {
 #[derive(Deserialize)]
 struct GenerateResponse {
     response: String,
-}
-
-#[derive(Deserialize)]
-struct ChunkResponseWrapper {
-    chunks: Vec<GroupedChunk>,
-}
-
-fn build_prompt(blocks: &[BlockForPrompt<'_>]) -> String {
-    let mut s = String::new();
-    s.push_str(
-        "You are grouping paragraphs from a mathematics textbook page into semantic chunks.\n\
-         Each chunk is a coherent unit such as: a definition, a theorem, a proof, an example,\n\
-         an exercise, or a general explanatory passage (\"other\").\n\n\
-         Rules:\n\
-         - Every block id must appear in exactly one chunk.\n\
-         - Preserve reading order: block ids in each chunk must be a contiguous run.\n\
-         - chunk_type must be one of: definition, theorem, proof, exercise, example, other.\n\n\
-         Return ONLY valid JSON matching this schema:\n\
-         { \"chunks\": [ { \"block_ids\": [int, ...], \"chunk_type\": \"...\" }, ... ] }\n\n\
-         Blocks (id :: text):\n",
-    );
-    for b in blocks {
-        let snippet: String = b.text.chars().take(300).collect();
-        let snippet = snippet.replace('\n', " ");
-        s.push_str(&format!("{} :: {}\n", b.id, snippet));
-    }
-    s
-}
-
-fn parse_chunks(raw: &str) -> Result<Vec<GroupedChunk>, OllamaError> {
-    // Ollama with format:"json" normally returns a clean JSON object, but models
-    // occasionally wrap it in markdown fences. Strip those defensively.
-    let trimmed = raw.trim();
-    let stripped = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .unwrap_or(trimmed);
-    let stripped = stripped.strip_suffix("```").unwrap_or(stripped).trim();
-
-    if let Ok(wrapper) = serde_json::from_str::<ChunkResponseWrapper>(stripped) {
-        debug!(
-            target: "gloss_lib::ollama",
-            "parsed wrapped ollama chunk response with {} groups",
-            wrapper.chunks.len()
-        );
-        return Ok(wrapper.chunks);
-    }
-    // Fallback: some models skip the wrapper and emit a bare array.
-    if let Ok(arr) = serde_json::from_str::<Vec<GroupedChunk>>(stripped) {
-        debug!(
-            target: "gloss_lib::ollama",
-            "parsed bare ollama chunk response with {} groups",
-            arr.len()
-        );
-        return Ok(arr);
-    }
-    warn!(
-        target: "gloss_lib::ollama",
-        "failed to parse ollama chunk response"
-    );
-    Err(OllamaError::Parse(raw.to_string()))
 }
