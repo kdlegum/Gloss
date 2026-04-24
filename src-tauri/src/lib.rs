@@ -462,6 +462,7 @@ struct ChunkInfo {
     proves_chunk_id: Option<i64>,
     ocr_text: Option<String>,
     formatted_body_md: Option<String>,
+    glossary_md: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -480,6 +481,7 @@ struct ChunkForTranscription {
     proves_chunk_id: Option<i64>,
     ocr_text: Option<String>,
     formatted_body_md: Option<String>,
+    glossary_md: Option<String>,
 }
 
 #[tauri::command]
@@ -489,7 +491,7 @@ async fn get_chunks_for_page(
 ) -> Result<Vec<ChunkInfo>, String> {
     let rows = sqlx::query(
         "SELECT id, chunk_type, bbox_x, bbox_y, bbox_w, bbox_h, status, \
-                title, subject, proves_chunk_id, ocr_text, formatted_body_md \
+                title, subject, proves_chunk_id, ocr_text, formatted_body_md, glossary_md \
          FROM chunks WHERE page_id = ? ORDER BY bbox_y, bbox_x",
     )
     .bind(page_id)
@@ -512,8 +514,29 @@ async fn get_chunks_for_page(
             proves_chunk_id: r.get("proves_chunk_id"),
             ocr_text: r.get("ocr_text"),
             formatted_body_md: r.get("formatted_body_md"),
+            glossary_md: r.get("glossary_md"),
         })
         .collect())
+}
+
+#[tauri::command]
+async fn save_chunk_glossary(
+    chunk_id: i64,
+    glossary_md: Option<String>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<(), String> {
+    let trimmed = glossary_md
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    sqlx::query("UPDATE chunks SET glossary_md = ? WHERE id = ?")
+        .bind(trimmed.as_deref())
+        .bind(chunk_id)
+        .execute(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -524,7 +547,8 @@ async fn get_chunk_for_transcription(
     let r = sqlx::query(
         "SELECT c.id, c.source_document_id, p.page_number, c.chunk_type, \
                 c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.status, \
-                c.title, c.subject, c.proves_chunk_id, c.ocr_text, c.formatted_body_md \
+                c.title, c.subject, c.proves_chunk_id, c.ocr_text, c.formatted_body_md, \
+                c.glossary_md \
          FROM chunks c \
          JOIN pages p ON p.id = c.page_id \
          WHERE c.id = ?",
@@ -550,6 +574,7 @@ async fn get_chunk_for_transcription(
         proves_chunk_id: r.get("proves_chunk_id"),
         ocr_text: r.get("ocr_text"),
         formatted_body_md: r.get("formatted_body_md"),
+        glossary_md: r.get("glossary_md"),
     })
 }
 
@@ -677,7 +702,9 @@ struct ChunkChatContext {
     body_markdown: String,
 }
 
-fn sanitize_chunk_chat_history(history: Vec<ChunkChatMessage>) -> Result<Vec<ChunkChatMessage>, String> {
+fn sanitize_chunk_chat_history(
+    history: Vec<ChunkChatMessage>,
+) -> Result<Vec<ChunkChatMessage>, String> {
     let mut cleaned = Vec::with_capacity(history.len());
     for message in history {
         let role = message.role.trim();
@@ -700,7 +727,10 @@ fn sanitize_chunk_chat_history(history: Vec<ChunkChatMessage>) -> Result<Vec<Chu
     Ok(cleaned)
 }
 
-async fn load_chunk_chat_context(pool: &SqlitePool, chunk_id: i64) -> Result<ChunkChatContext, String> {
+async fn load_chunk_chat_context(
+    pool: &SqlitePool,
+    chunk_id: i64,
+) -> Result<ChunkChatContext, String> {
     let row = sqlx::query(
         "SELECT sd.title AS book_title, c.chunk_type, c.title, c.subject, \
                 COALESCE(NULLIF(TRIM(c.formatted_body_md), ''), NULLIF(TRIM(c.ocr_text), '')) AS body_markdown \
@@ -1769,6 +1799,7 @@ pub fn run() {
             get_page_count,
             get_chunks_for_page,
             get_chunk_for_transcription,
+            save_chunk_glossary,
             get_ai_settings_state,
             save_ai_api_keys,
             generate_chunk_formatted_body,

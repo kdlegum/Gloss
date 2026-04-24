@@ -21,10 +21,6 @@ pub struct GeminiClient {
 }
 
 impl GeminiClient {
-    pub fn new() -> Self {
-        Self::with_api_key(None)
-    }
-
     pub fn with_api_key(api_key: Option<String>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
@@ -212,7 +208,9 @@ impl GeminiClient {
 
         let trimmed = output.trim().to_string();
         if trimmed.is_empty() {
-            return Err(LlmError::Parse("empty streamed gemini response".to_string()));
+            return Err(LlmError::Parse(
+                "empty streamed gemini response".to_string(),
+            ));
         }
         Ok(trimmed)
     }
@@ -250,7 +248,10 @@ impl GeminiClient {
     }
 
     fn stream_generate_content_url(&self) -> String {
-        format!("{}/{}:streamGenerateContent?alt=sse", self.base_url, self.model)
+        format!(
+            "{}/{}:streamGenerateContent?alt=sse",
+            self.base_url, self.model
+        )
     }
 }
 

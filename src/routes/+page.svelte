@@ -1454,6 +1454,29 @@
     }
   }
 
+  async function completeAiKeySetupWithoutSaving() {
+    aiSettingsSaving = true;
+    aiSettingsError = null;
+    try {
+      const state = await invoke<AiSettingsState>("save_ai_api_keys", {
+        openaiApiKey: null,
+        geminiApiKey: null,
+        clearOpenaiApiKey: false,
+        clearGeminiApiKey: false,
+        setupComplete: true,
+      });
+      applyAiSettingsState(state);
+      showAiKeySheet = false;
+      aiKeySheetFirstRun = false;
+      aiSettingsError = null;
+    } catch (err) {
+      aiSettingsError = formatLogError(err);
+      void appLogError(`[settings] failed to skip AI setup: ${formatLogError(err)}`);
+    } finally {
+      aiSettingsSaving = false;
+    }
+  }
+
   function saveAiKeyForm(event: SubmitEvent) {
     event.preventDefault();
     void saveAiKeySettings(true);
@@ -1461,7 +1484,7 @@
 
   function dismissAiKeySettings() {
     if (aiKeySheetFirstRun) {
-      void saveAiKeySettings(true);
+      void completeAiKeySetupWithoutSaving();
     } else {
       closeAiKeySettings();
     }
@@ -1754,6 +1777,7 @@
     proves_chunk_id: number | null;
     ocr_text: string | null;
     formatted_body_md: string | null;
+    glossary_md: string | null;
   }
 
   interface ChunkForTranscription extends ChunkInfo {
@@ -1792,6 +1816,61 @@
   const chunkBodyRequests = new Map<number, Promise<boolean>>();
   let chunkMode = $state<'draw' | 'erase'>('draw');
   let chunkTab = $state<'ink' | 'glossary' | 'ai'>('ink');
+
+  let glossaryDraft = $state("");
+  let glossaryMode = $state<'edit' | 'preview'>('edit');
+  let glossarySaving = $state(false);
+  let glossarySaveError = $state<string | null>(null);
+  let glossarySaveTimer: ReturnType<typeof setTimeout> | null = null;
+  let glossaryPendingChunkId: number | null = null;
+  let glossaryHtml = $derived(renderChunkBodyHtml(glossaryDraft));
+
+  async function flushGlossarySave() {
+    if (glossarySaveTimer) {
+      clearTimeout(glossarySaveTimer);
+      glossarySaveTimer = null;
+    }
+    if (glossaryPendingChunkId == null) return;
+    const chunkId = glossaryPendingChunkId;
+    const value = glossaryDraft;
+    glossaryPendingChunkId = null;
+    glossarySaving = true;
+    try {
+      await invoke("save_chunk_glossary", { chunkId, glossaryMd: value });
+      glossarySaveError = null;
+      const stored: string | null = value.trim() ? value : null;
+      currentChunks = currentChunks.map((c) =>
+        c.id === chunkId ? { ...c, glossary_md: stored } : c,
+      );
+      if (chunkView?.chunk.id === chunkId) {
+        chunkView = {
+          ...chunkView,
+          chunk: { ...chunkView.chunk, glossary_md: stored },
+        };
+      }
+    } catch (err) {
+      glossarySaveError = formatLogError(err);
+      await appLogWarn(`[glossary] save failed chunkId=${chunkId}: ${glossarySaveError}`);
+    } finally {
+      glossarySaving = false;
+    }
+  }
+
+  function scheduleGlossarySave() {
+    if (!chunkView) return;
+    glossaryPendingChunkId = chunkView.chunk.id;
+    if (glossarySaveTimer) clearTimeout(glossarySaveTimer);
+    glossarySaveTimer = setTimeout(() => {
+      glossarySaveTimer = null;
+      void flushGlossarySave();
+    }, 500);
+  }
+
+  function onGlossaryInput(event: Event) {
+    const target = event.target as HTMLTextAreaElement;
+    glossaryDraft = target.value;
+    scheduleGlossarySave();
+  }
 
   let chunkView = $state<{
     chunk: ChunkInfo;
@@ -2356,6 +2435,14 @@
       surfaceId: cache.surfaceId,
       strokes: [...cache.strokes],
     };
+    glossaryDraft = chunk.glossary_md ?? "";
+    glossaryMode = 'edit';
+    glossarySaveError = null;
+    glossaryPendingChunkId = null;
+    if (glossarySaveTimer) {
+      clearTimeout(glossarySaveTimer);
+      glossarySaveTimer = null;
+    }
     redoStack = [];
     markDirty();
     if (!chunkHasFormattedBody(chunk)) {
@@ -2365,6 +2452,7 @@
 
   function closeChunkView() {
     void cancelChunkChatForReset();
+    void flushGlossarySave();
     if (chunkView) {
       void appLogInfo(
         `[chunk] close chunkId=${chunkView.chunk.id} strokes=${chunkView.strokes.length}`,
@@ -2901,7 +2989,11 @@
                   </svg>
                   Ink
                 </button>
-                <button class="chunk-tab chunk-tab-todo" title="Coming soon">
+                <button
+                  class="chunk-tab"
+                  class:active={chunkTab === 'glossary'}
+                  onclick={() => chunkTab = 'glossary'}
+                >
                   <svg viewBox="0 0 16 16" fill="none" width="13" height="13">
                     <rect x="4" y="2" width="7" height="9" rx="0.8" stroke="currentColor" stroke-width="1.2"/>
                     <path d="M3 12.5h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
@@ -2955,8 +3047,50 @@
                   </div>
                 </div>
               {:else if chunkTab === 'glossary'}
-                <div class="chunk-tab-placeholder">
-                  <p>Glossary — coming soon</p>
+                <div class="chunk-glossary-pane">
+                  <div class="chunk-glossary-bar">
+                    <div class="chunk-glossary-mode">
+                      <button
+                        type="button"
+                        class="chunk-glossary-mode-btn"
+                        class:active={glossaryMode === 'edit'}
+                        onclick={() => glossaryMode = 'edit'}
+                      >Edit</button>
+                      <button
+                        type="button"
+                        class="chunk-glossary-mode-btn"
+                        class:active={glossaryMode === 'preview'}
+                        onclick={() => { void flushGlossarySave(); glossaryMode = 'preview'; }}
+                      >Preview</button>
+                    </div>
+                    <span class="chunk-glossary-status">
+                      {#if glossarySaveError}
+                        <span class="chunk-glossary-status-error">Save failed</span>
+                      {:else if glossarySaving}
+                        Saving…
+                      {:else if glossaryDraft.trim()}
+                        Saved
+                      {/if}
+                    </span>
+                  </div>
+                  {#if glossaryMode === 'edit'}
+                    <textarea
+                      class="chunk-glossary-editor"
+                      placeholder="Write your own explanation. Markdown works, and LaTeX via $…$ inline or $$…$$ block."
+                      value={glossaryDraft}
+                      oninput={onGlossaryInput}
+                      onblur={() => void flushGlossarySave()}
+                      spellcheck="true"
+                    ></textarea>
+                  {:else}
+                    <div class="chunk-glossary-preview">
+                      {#if glossaryDraft.trim()}
+                        {@html glossaryHtml}
+                      {:else}
+                        <p class="chunk-glossary-preview-empty">Nothing yet.</p>
+                      {/if}
+                    </div>
+                  {/if}
                 </div>
               {:else if chunkTab === 'ai'}
                 <div class="chunk-ai-pane">
@@ -3505,6 +3639,22 @@
     background: #888;
   }
 
+  .ai-settings-btn {
+    padding: 0.52rem 0.85rem;
+    background: #f6f7fa;
+    color: #243149;
+    border: 1px solid #d8dee9;
+    border-radius: 8px;
+    font-size: 0.88rem;
+    font-weight: 650;
+    transition: background 0.15s, border-color 0.15s;
+  }
+
+  .ai-settings-btn:hover:not(:disabled) {
+    background: #eceff5 !important;
+    border-color: #c9d2df;
+  }
+
   .error {
     color: #c00;
     font-size: 0.9em;
@@ -3552,6 +3702,182 @@
 
   .title { font-weight: 600; }
   .path  { font-size: 0.8em; color: #666; font-family: monospace; }
+
+  .ai-key-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 300;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    background: rgba(15, 23, 42, 0.38);
+    backdrop-filter: blur(5px);
+  }
+
+  .ai-key-sheet {
+    width: min(520px, 100%);
+    max-height: min(620px, 100%);
+    overflow: auto;
+    background: #fff;
+    border: 1px solid rgba(35, 46, 68, 0.16);
+    border-radius: 14px;
+    box-shadow: 0 24px 70px rgba(15, 23, 42, 0.28);
+    padding: 1.2rem;
+  }
+
+  .ai-key-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .ai-key-kicker {
+    margin: 0 0 0.15rem;
+    color: #667085;
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+
+  .ai-key-heading h2 {
+    margin: 0;
+    color: #111827;
+    font-size: 1.35rem;
+    letter-spacing: 0;
+  }
+
+  .ai-key-close {
+    width: 32px;
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    color: #475467;
+    background: #f4f6f8;
+    border: 1px solid #d9dee8;
+    border-radius: 8px;
+  }
+
+  .ai-key-close:hover:not(:disabled) {
+    background: #e9edf3 !important;
+  }
+
+  .ai-key-copy {
+    margin: 0.75rem 0 1rem;
+    color: #526071;
+    line-height: 1.45;
+  }
+
+  .ai-key-error {
+    margin: 0 0 0.9rem;
+    padding: 0.7rem 0.8rem;
+    color: #991b1b;
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 8px;
+    font-size: 0.88rem;
+  }
+
+  .ai-key-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.8rem;
+  }
+
+  .ai-key-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    color: #1f2937;
+    font-weight: 650;
+  }
+
+  .ai-key-field span {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+
+  .ai-key-field em {
+    color: #047857;
+    font-size: 0.76rem;
+    font-style: normal;
+    font-weight: 800;
+    text-transform: uppercase;
+  }
+
+  .ai-key-field input[type="password"] {
+    width: 100%;
+    min-height: 42px;
+    padding: 0.65rem 0.75rem;
+    color: #111827;
+    background: #fbfcfe;
+    border: 1px solid #cfd6e2;
+    border-radius: 8px;
+    font: inherit;
+  }
+
+  .ai-key-field input[type="password"]:focus {
+    outline: none;
+    border-color: #50688f;
+    box-shadow: 0 0 0 3px rgba(80, 104, 143, 0.14);
+  }
+
+  .ai-key-field input[type="password"]:disabled {
+    color: #7b8494;
+    background: #eef1f5;
+  }
+
+  .ai-key-clear {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: #4b5563;
+    font-size: 0.88rem;
+  }
+
+  .ai-key-clear input {
+    width: 16px;
+    height: 16px;
+  }
+
+  .ai-key-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.65rem;
+    margin-top: 0.35rem;
+  }
+
+  .ai-key-secondary,
+  .ai-key-primary {
+    min-height: 40px;
+    padding: 0.6rem 0.95rem;
+    border-radius: 8px;
+    font-weight: 700;
+  }
+
+  .ai-key-secondary {
+    color: #334155;
+    background: #f5f7fa;
+    border: 1px solid #d8dee9;
+  }
+
+  .ai-key-secondary:hover:not(:disabled) {
+    background: #e9edf3 !important;
+  }
+
+  .ai-key-primary {
+    color: #fff;
+    background: #1f2f49;
+  }
+
+  .ai-key-primary:hover:not(:disabled) {
+    background: #2d4265 !important;
+  }
 
   /* ── Viewer ── */
   .viewer {
@@ -4029,6 +4355,138 @@
     color: #9ca3af;
     font-size: 13px;
     font-style: italic;
+  }
+
+  .chunk-glossary-pane {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: #ffffff;
+  }
+
+  .chunk-glossary-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+    background: #fafafa;
+    flex-shrink: 0;
+  }
+
+  .chunk-glossary-mode {
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    background: #eef0f3;
+    border-radius: 6px;
+  }
+
+  .chunk-glossary-mode-btn {
+    height: 22px;
+    padding: 0 10px;
+    font-size: 11px;
+    font-weight: 500;
+    color: #6b7280;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+  }
+
+  .chunk-glossary-mode-btn:hover { color: #374151; }
+  .chunk-glossary-mode-btn.active {
+    background: #ffffff;
+    color: #111827;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+  }
+
+  .chunk-glossary-status {
+    font-size: 11px;
+    color: #9ca3af;
+  }
+  .chunk-glossary-status-error { color: #b91c1c; }
+
+  .chunk-glossary-editor {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    padding: 14px 16px;
+    border: none;
+    outline: none;
+    resize: none;
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 14px;
+    line-height: 1.55;
+    color: #1f2937;
+    background: #ffffff;
+    box-sizing: border-box;
+  }
+
+  .chunk-glossary-editor::placeholder {
+    color: #9ca3af;
+    font-style: italic;
+  }
+
+  .chunk-glossary-preview {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 14px 16px;
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 14px;
+    line-height: 1.55;
+    color: #1f2937;
+  }
+
+  .chunk-glossary-preview :global(p) { margin: 0 0 0.7em; }
+  .chunk-glossary-preview :global(p:last-child) { margin-bottom: 0; }
+  .chunk-glossary-preview :global(h1),
+  .chunk-glossary-preview :global(h2),
+  .chunk-glossary-preview :global(h3),
+  .chunk-glossary-preview :global(h4) {
+    font-family: Inter, system-ui, sans-serif;
+    margin: 0.9em 0 0.4em;
+    line-height: 1.25;
+  }
+  .chunk-glossary-preview :global(h1) { font-size: 18px; }
+  .chunk-glossary-preview :global(h2) { font-size: 16px; }
+  .chunk-glossary-preview :global(h3) { font-size: 14px; }
+  .chunk-glossary-preview :global(ul),
+  .chunk-glossary-preview :global(ol) {
+    margin: 0 0 0.7em;
+    padding-left: 1.4em;
+  }
+  .chunk-glossary-preview :global(code) {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.9em;
+    padding: 1px 4px;
+    background: #f3f4f6;
+    border-radius: 3px;
+  }
+  .chunk-glossary-preview :global(pre) {
+    margin: 0 0 0.7em;
+    padding: 10px 12px;
+    background: #f3f4f6;
+    border-radius: 6px;
+    overflow-x: auto;
+  }
+  .chunk-glossary-preview :global(pre code) {
+    padding: 0;
+    background: transparent;
+  }
+  .chunk-glossary-preview :global(.chunk-math-display) {
+    margin: 0.8em 0;
+    text-align: center;
+    overflow-x: auto;
+  }
+
+  .chunk-glossary-preview-empty {
+    color: #9ca3af;
+    font-style: italic;
+    margin: 0;
   }
 
   .chunk-ai-pane {

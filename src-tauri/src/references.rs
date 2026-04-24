@@ -656,7 +656,10 @@ mod tests {
     fn prefers_longest_name_match() {
         let refs = extract_references(
             "the fundamental theorem of calculus says",
-            &idx(&[], &["fundamental theorem", "fundamental theorem of calculus"]),
+            &idx(
+                &[],
+                &["fundamental theorem", "fundamental theorem of calculus"],
+            ),
         );
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].matched_text, "fundamental theorem of calculus");

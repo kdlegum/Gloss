@@ -3,6 +3,12 @@ node_modules
 /build
 /.svelte-kit
 /package
+
+# Temporary Cargo target dirs
+/target-codex*/
+/target_check*/
+/target_verify*/
+
 .env
 .env.*
 !.env.example

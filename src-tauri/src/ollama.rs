@@ -244,7 +244,9 @@ impl OllamaClient {
 
         let trimmed = output.trim().to_string();
         if trimmed.is_empty() {
-            return Err(LlmError::Parse("empty streamed ollama response".to_string()));
+            return Err(LlmError::Parse(
+                "empty streamed ollama response".to_string(),
+            ));
         }
         Ok(trimmed)
     }
