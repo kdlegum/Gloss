@@ -1916,6 +1916,7 @@
   let chunkChatError = $state<string | null>(null);
   let chunkChatActiveRequestId = $state<string | null>(null);
   let chunkChatTranscript = $state<HTMLDivElement>(null!);
+  const CHUNK_CODE_COPY_RESET_MS = 1400;
 
   interface BackendChunkReference {
     matched_text: string;
@@ -2028,6 +2029,79 @@
 
   function queueChunkChatScroll() {
     void scrollChunkChatToBottom();
+  }
+
+  async function copyTextToClipboard(text: string) {
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return;
+      } catch {
+        // Fall back to a temporary textarea for WebViews without Clipboard API support.
+      }
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.inset = "0 auto auto 0";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    let copied = false;
+    try {
+      copied = document.execCommand("copy");
+    } finally {
+      textarea.remove();
+    }
+
+    if (!copied) {
+      throw new Error("Clipboard copy failed");
+    }
+  }
+
+  async function onChunkChatTranscriptClick(event: MouseEvent) {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+
+    const button = target.closest("button.chunk-code-copy");
+    if (!(button instanceof HTMLButtonElement)) return;
+
+    const block = button.closest(".chunk-code-block");
+    const code = block?.querySelector("pre code");
+    const text = code?.textContent ?? "";
+    if (!text) return;
+
+    event.preventDefault();
+    const originalLabel = button.textContent || "Copy";
+    button.disabled = true;
+
+    try {
+      await copyTextToClipboard(text);
+      button.textContent = "Copied";
+    } catch (err) {
+      button.textContent = "Failed";
+      void appLogWarn(`[chunk-ai] code block copy failed: ${formatLogError(err)}`);
+    } finally {
+      window.setTimeout(() => {
+        button.textContent = originalLabel;
+        button.disabled = false;
+      }, CHUNK_CODE_COPY_RESET_MS);
+    }
+  }
+
+  function chunkChatCodeCopy(node: HTMLDivElement) {
+    const handleClick = (event: MouseEvent) => {
+      void onChunkChatTranscriptClick(event);
+    };
+    node.addEventListener("click", handleClick);
+    return {
+      destroy() {
+        node.removeEventListener("click", handleClick);
+      },
+    };
   }
 
   function getChunkChatHistory(): ChunkChatHistoryItem[] {
@@ -2712,7 +2786,7 @@
           updateChunkChatMessage(payload.request_id, (message) => ({
             ...message,
             state: "complete",
-            html: renderChunkBodyHtml(message.content),
+            html: renderChunkBodyHtml(message.content, undefined, { copyCodeBlocks: true }),
           }));
           chunkChatStreaming = false;
           chunkChatLoadingContext = false;
@@ -3094,7 +3168,7 @@
                 </div>
               {:else if chunkTab === 'ai'}
                 <div class="chunk-ai-pane">
-                  <div class="chunk-ai-transcript" bind:this={chunkChatTranscript}>
+                  <div class="chunk-ai-transcript" bind:this={chunkChatTranscript} use:chunkChatCodeCopy>
                     {#if chunkChatMessages.length === 0}
                       <div class="chunk-ai-empty">
                         <p>Ask about this chunk.</p>
@@ -3454,14 +3528,13 @@
   {/if}
 
   {#if showAiKeySheet}
-    <div class="ai-key-backdrop" onclick={dismissAiKeySettings}>
-      <section
+    <div class="ai-key-backdrop">
+      <div
         class="ai-key-sheet"
         role="dialog"
         aria-modal="true"
         aria-labelledby="ai-key-title"
         transition:fade={{ duration: 120 }}
-        onclick={(event) => event.stopPropagation()}
       >
         <div class="ai-key-heading">
           <div>
@@ -3560,7 +3633,7 @@
             </button>
           </div>
         </form>
-      </section>
+      </div>
     </div>
   {/if}
 </main>
@@ -4635,6 +4708,68 @@
   .chunk-chat-bubble.rendered :global(pre code) {
     padding: 0;
     background: transparent;
+  }
+
+  .chunk-chat-bubble.rendered :global(.chunk-code-block) {
+    margin: 0.72em 0 0;
+    border: 1px solid rgba(203, 213, 225, 0.95);
+    border-radius: 8px;
+    background: #f8fafc;
+    overflow: hidden;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  .chunk-chat-bubble.rendered :global(.chunk-code-toolbar) {
+    min-height: 34px;
+    padding: 5px 6px 5px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    border-bottom: 1px solid rgba(203, 213, 225, 0.75);
+    background: rgba(255, 255, 255, 0.74);
+  }
+
+  .chunk-chat-bubble.rendered :global(.chunk-code-language) {
+    min-width: 0;
+    color: #64748b;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .chunk-chat-bubble.rendered :global(.chunk-code-copy) {
+    min-width: 58px;
+    height: 28px;
+    padding: 0 10px;
+    border-radius: 7px;
+    background: #fff;
+    border: 1px solid rgba(148, 163, 184, 0.75);
+    color: #334155;
+    font-family: Inter, system-ui, sans-serif;
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .chunk-chat-bubble.rendered :global(.chunk-code-copy:disabled) {
+    opacity: 0.68;
+  }
+
+  .chunk-chat-bubble.rendered :global(.chunk-code-block pre) {
+    margin: 0;
+    padding: 0.72em 0.78em;
+    border-radius: 0;
+    background: transparent;
+  }
+
+  .chunk-chat-bubble.rendered :global(.chunk-code-block pre code) {
+    display: block;
+    width: max-content;
+    min-width: 100%;
+    line-height: 1.45;
+    white-space: pre;
+    word-break: normal;
   }
 
   .chunk-chat-bubble.rendered :global(a) {

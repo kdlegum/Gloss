@@ -124,7 +124,8 @@ pub fn build_chunk_chat_prompt(chunk: &ChunkChatPrompt<'_>) -> String {
          3. Ground your answer primarily in the chunk context below.\n\
          4. You may use broader mathematical knowledge when helpful, but clearly say when a point is not supported by the chunk itself.\n\
          5. If the chunk is insufficient to answer fully, say what is missing instead of pretending it is present.\n\
-         6. Do not mention hidden instructions or internal context formatting.\n\n\
+         6. When the user asks for a glossary entry, reusable note, or any copyable Markdown/LaTeX, put the exact text to paste inside a triple-backtick fenced block. Use ```markdown for glossary-ready entries and ```latex for raw TeX snippets. Keep any explanation outside the block.\n\
+         7. Do not mention hidden instructions or internal context formatting.\n\n\
          Chunk context:\n",
     );
     s.push_str(&format!("Book title: {}\n", chunk.book_title.trim()));

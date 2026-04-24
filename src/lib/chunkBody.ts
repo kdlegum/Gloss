@@ -13,6 +13,10 @@ interface DisplayMathMatch {
   tex: string;
 }
 
+export interface RenderChunkBodyOptions {
+  copyCodeBlocks?: boolean;
+}
+
 const DISPLAY_ENVIRONMENTS = new Set([
   "equation",
   "equation*",
@@ -45,11 +49,12 @@ export interface ResolvedReference {
 export function renderChunkBodyHtml(
   source: string,
   references?: ResolvedReference[],
+  options: RenderChunkBodyOptions = {},
 ): string {
   const prepared = injectReferenceLinks(source, references);
   const normalized = prepared.replace(/\r\n?/g, "\n").trim();
   if (!normalized) return "";
-  return parseBlocks(normalized).map(renderBlock).join("");
+  return parseBlocks(normalized).map((block) => renderBlock(block, options)).join("");
 }
 
 // Splice markdown links into the source at each resolved reference span. Byte
@@ -329,7 +334,7 @@ function consumeDisplayMath(lines: string[], startIndex: number): DisplayMathMat
   }
 }
 
-function renderBlock(block: ChunkBodyBlock): string {
+function renderBlock(block: ChunkBodyBlock, options: RenderChunkBodyOptions): string {
   switch (block.kind) {
     case "paragraph":
       return `<p>${renderInlineContent(block.lines.map((line) => line.trim()).join(" "))}</p>`;
@@ -341,7 +346,13 @@ function renderBlock(block: ChunkBodyBlock): string {
       const languageClass = block.language
         ? ` class="language-${escapeHtmlAttribute(block.language)}"`
         : "";
-      return `<pre><code${languageClass}>${escapeHtml(block.code)}</code></pre>`;
+      const code = `<pre><code${languageClass}>${escapeHtml(block.code)}</code></pre>`;
+      if (!options.copyCodeBlocks) return code;
+
+      const languageLabel = block.language
+        ? `<span class="chunk-code-language">${escapeHtml(block.language)}</span>`
+        : `<span class="chunk-code-language" aria-hidden="true"></span>`;
+      return `<div class="chunk-code-block"><div class="chunk-code-toolbar">${languageLabel}<button class="chunk-code-copy" type="button">Copy</button></div>${code}</div>`;
     }
     case "ordered-list":
       return `<ol start="${block.start}">${block.items
