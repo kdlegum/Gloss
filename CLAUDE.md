@@ -70,6 +70,33 @@ Future tables to add as migrations: glossary entries, self-explanations, chunks,
 - DB: `%APPDATA%/com.gloss.app/gloss.db` (Windows) — via `app.path().app_data_dir()`
 - PDFs: `%APPDATA%/com.gloss.app/pdfs/`
 
+## Design system
+
+The visual language comes from a Figma-style handoff (`Chunk selection and accessing UI-handoff.zip`). Key decisions to honour:
+
+**Chunk type colours** — each chunk type has an `accent` (oklch, saturated, mid-lightness) and a `tint` (oklch, desaturated, very light). Both are stored in `CHUNK_COLOURS` in `+page.svelte` and must stay in sync with the canvas overlay renderer.
+
+| Type        | Accent hue | Use |
+|-------------|-----------|-----|
+| definition  | 233 (blue)    | primary semantic unit |
+| theorem     | 290 (purple)  | proved result |
+| proof       | 180 (teal)    | derivation |
+| exercise    | 50 (orange)   | practice problem |
+| example     | 50 (orange)   | worked example |
+| explanation | 240 (grey-blue) | prose/connective tissue |
+
+**PDF overlay — marginal bar style** — chunk boundaries are shown as a 3 px coloured bar on the left edge of the chunk bbox, plus a very subtle tint fill over the full bbox. Do not use full-rect fills or bordered boxes; keep it non-intrusive.
+
+**Chunk note sheet — split panel (Layout A)** — when the user taps a chunk the note sheet opens as a side-by-side panel:
+- Left (240 px fixed): chunk badge, status dot, close button, title (italic serif), OCR body text. Background `#f9fafb`, bordered on the left with the chunk accent colour.
+- Right (flex): tab bar across the top with **Ink**, **Glossary**, **AI** tabs, then the tab content below.
+
+The Ink tab contains the drawing canvas with a floating toolbar at the bottom (pen/eraser). Glossary and AI are TODO — show placeholder text, disable via `pointer-events: none` and reduced opacity, do not wire up.
+
+**Typography** — UI chrome: Inter / system-ui. Chunk body text (OCR content, glossary): Georgia / serif.
+
+**Status dots** — `complete` = `oklch(0.62 0.14 145)` (green), `in_progress` = `oklch(0.72 0.13 65)` (amber), `incomplete` = hollow border circle.
+
 ## Key conventions
 
 - Rust errors are returned as `Result<T, String>` from commands — `map_err(|e| e.to_string())` is the pattern in use.

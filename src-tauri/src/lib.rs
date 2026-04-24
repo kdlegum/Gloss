@@ -1,15 +1,25 @@
 mod chunking;
+mod gemini;
 mod llm;
-mod openai;
 mod ollama;
+mod openai;
+mod references;
+mod settings;
 
-use crate::llm::LlmProvider;
+use crate::gemini::GeminiClient;
+use crate::llm::{
+    ChunkBodyPrompt, ChunkBodyResult, ChunkChatMessage, ChunkChatPrompt, LlmError, LlmProvider,
+};
+use crate::ollama::OllamaClient;
+use crate::openai::OpenAiClient;
 use log::info;
 use pdfium_render::prelude::*;
 use percent_encoding::percent_decode_str;
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tauri::Emitter;
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_fs::{FilePath, FsExt};
@@ -137,6 +147,13 @@ struct AppState {
     pdf_cache: Mutex<PdfCache>,
     pdfium: PdfiumWorker,
     chunking_jobs: Arc<Mutex<HashSet<(i64, i64)>>>,
+    chat_streams: Arc<Mutex<HashMap<String, ChatStreamHandle>>>,
+}
+
+#[derive(Clone)]
+struct ChatStreamHandle {
+    cancelled: Arc<AtomicBool>,
+    chunk_id: i64,
 }
 
 fn spawn_chunking_job(
@@ -189,6 +206,78 @@ fn finish_chunking_job(
     if let Ok(mut jobs) = chunking_jobs.lock() {
         jobs.remove(&(doc_id, page_number));
     }
+}
+
+fn begin_chat_stream(
+    state: &AppState,
+    request_id: &str,
+    chunk_id: i64,
+) -> Result<Arc<AtomicBool>, String> {
+    let mut streams = state.chat_streams.lock().map_err(|e| e.to_string())?;
+    if streams.contains_key(request_id) {
+        return Err(format!("chat stream {} already active", request_id));
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    streams.insert(
+        request_id.to_string(),
+        ChatStreamHandle {
+            cancelled: Arc::clone(&cancelled),
+            chunk_id,
+        },
+    );
+    Ok(cancelled)
+}
+
+fn finish_chat_stream(
+    chat_streams: &Arc<Mutex<HashMap<String, ChatStreamHandle>>>,
+    request_id: &str,
+) -> Option<ChatStreamHandle> {
+    chat_streams
+        .lock()
+        .ok()
+        .and_then(|mut streams| streams.remove(request_id))
+}
+
+fn cancel_chat_stream(
+    chat_streams: &Arc<Mutex<HashMap<String, ChatStreamHandle>>>,
+    request_id: &str,
+) -> Result<Option<ChatStreamHandle>, String> {
+    let mut streams = chat_streams.lock().map_err(|e| e.to_string())?;
+    let handle = streams.remove(request_id);
+    if let Some(active) = &handle {
+        active.cancelled.store(true, Ordering::Relaxed);
+    }
+    Ok(handle)
+}
+
+#[derive(serde::Serialize, Clone)]
+struct ChunkAiStreamEvent {
+    request_id: String,
+    chunk_id: i64,
+    phase: &'static str,
+    delta: Option<String>,
+    error: Option<String>,
+}
+
+fn emit_chunk_ai_stream(
+    app: &tauri::AppHandle,
+    request_id: &str,
+    chunk_id: i64,
+    phase: &'static str,
+    delta: Option<String>,
+    error: Option<String>,
+) {
+    let _ = app.emit(
+        "chunk_ai_stream",
+        ChunkAiStreamEvent {
+            request_id: request_id.to_string(),
+            chunk_id,
+            phase,
+            delta,
+            error,
+        },
+    );
 }
 
 #[derive(serde::Deserialize, serde::Serialize, bincode::Encode, bincode::Decode, Clone, Copy)]
@@ -371,6 +460,26 @@ struct ChunkInfo {
     title: Option<String>,
     subject: Option<String>,
     proves_chunk_id: Option<i64>,
+    ocr_text: Option<String>,
+    formatted_body_md: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ChunkForTranscription {
+    id: i64,
+    source_document_id: i64,
+    page_number: i64,
+    chunk_type: String,
+    bbox_x: f32,
+    bbox_y: f32,
+    bbox_w: f32,
+    bbox_h: f32,
+    status: String,
+    title: Option<String>,
+    subject: Option<String>,
+    proves_chunk_id: Option<i64>,
+    ocr_text: Option<String>,
+    formatted_body_md: Option<String>,
 }
 
 #[tauri::command]
@@ -380,7 +489,7 @@ async fn get_chunks_for_page(
 ) -> Result<Vec<ChunkInfo>, String> {
     let rows = sqlx::query(
         "SELECT id, chunk_type, bbox_x, bbox_y, bbox_w, bbox_h, status, \
-                title, subject, proves_chunk_id \
+                title, subject, proves_chunk_id, ocr_text, formatted_body_md \
          FROM chunks WHERE page_id = ? ORDER BY bbox_y, bbox_x",
     )
     .bind(page_id)
@@ -401,8 +510,638 @@ async fn get_chunks_for_page(
             title: r.get("title"),
             subject: r.get("subject"),
             proves_chunk_id: r.get("proves_chunk_id"),
+            ocr_text: r.get("ocr_text"),
+            formatted_body_md: r.get("formatted_body_md"),
         })
         .collect())
+}
+
+#[tauri::command]
+async fn get_chunk_for_transcription(
+    chunk_id: i64,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<ChunkForTranscription, String> {
+    let r = sqlx::query(
+        "SELECT c.id, c.source_document_id, p.page_number, c.chunk_type, \
+                c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.status, \
+                c.title, c.subject, c.proves_chunk_id, c.ocr_text, c.formatted_body_md \
+         FROM chunks c \
+         JOIN pages p ON p.id = c.page_id \
+         WHERE c.id = ?",
+    )
+    .bind(chunk_id)
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("chunk {} not found", chunk_id))?;
+
+    Ok(ChunkForTranscription {
+        id: r.get("id"),
+        source_document_id: r.get("source_document_id"),
+        page_number: r.get("page_number"),
+        chunk_type: r.get("chunk_type"),
+        bbox_x: r.get("bbox_x"),
+        bbox_y: r.get("bbox_y"),
+        bbox_w: r.get("bbox_w"),
+        bbox_h: r.get("bbox_h"),
+        status: r.get("status"),
+        title: r.get("title"),
+        subject: r.get("subject"),
+        proves_chunk_id: r.get("proves_chunk_id"),
+        ocr_text: r.get("ocr_text"),
+        formatted_body_md: r.get("formatted_body_md"),
+    })
+}
+
+#[tauri::command]
+async fn get_ai_settings_state(
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<settings::AiSettingsState, String> {
+    settings::state(pool.inner()).await
+}
+
+#[tauri::command]
+async fn save_ai_api_keys(
+    openai_api_key: Option<String>,
+    gemini_api_key: Option<String>,
+    clear_openai_api_key: Option<bool>,
+    clear_gemini_api_key: Option<bool>,
+    setup_complete: Option<bool>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<settings::AiSettingsState, String> {
+    settings::save_ai_api_keys(
+        pool.inner(),
+        openai_api_key,
+        gemini_api_key,
+        clear_openai_api_key.unwrap_or(false),
+        clear_gemini_api_key.unwrap_or(false),
+        setup_complete.unwrap_or(false),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn generate_chunk_formatted_body(
+    chunk_id: i64,
+    provider: String,
+    image_base64: String,
+    force: Option<bool>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<ChunkBodyResult, String> {
+    if image_base64.trim().is_empty() {
+        return Err("image payload was empty".into());
+    }
+    let provider = provider.parse::<LlmProvider>()?;
+    let force = force.unwrap_or(false);
+
+    let row = sqlx::query(
+        "SELECT chunk_type, title, subject, formatted_body_md \
+         FROM chunks WHERE id = ?",
+    )
+    .bind(chunk_id)
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("chunk {} not found", chunk_id))?;
+
+    let chunk_type: String = row.get("chunk_type");
+    let title: Option<String> = row.get("title");
+    let subject: Option<String> = row.get("subject");
+    let formatted_body_md: Option<String> = row.get("formatted_body_md");
+
+    if !force {
+        if let Some(existing) = formatted_body_md
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(ChunkBodyResult {
+                body_markdown: existing.to_string(),
+            });
+        }
+    }
+
+    info!(
+        target: "gloss_lib::llm",
+        "generate_chunk_formatted_body chunk_id={} provider={} force={} chunk_type={}",
+        chunk_id,
+        provider,
+        force,
+        chunk_type
+    );
+
+    let prompt = ChunkBodyPrompt {
+        chunk_type: &chunk_type,
+        title: title.as_deref(),
+        subject: subject.as_deref(),
+    };
+    let configured_api_key = settings::api_key_for_provider(pool.inner(), provider).await?;
+    let result = match provider {
+        LlmProvider::Ollama => OllamaClient::new()
+            .transcribe_chunk_body(&prompt, &image_base64)
+            .await
+            .map_err(|e| e.to_string())?,
+        LlmProvider::OpenAI => OpenAiClient::with_api_key(configured_api_key)
+            .transcribe_chunk_body(&prompt, &image_base64)
+            .await
+            .map_err(|e| e.to_string())?,
+        LlmProvider::Gemini => GeminiClient::with_api_key(configured_api_key)
+            .transcribe_chunk_body(&prompt, &image_base64)
+            .await
+            .map_err(|e| e.to_string())?,
+    };
+
+    sqlx::query("UPDATE chunks SET formatted_body_md = ? WHERE id = ?")
+        .bind(&result.body_markdown)
+        .bind(chunk_id)
+        .execute(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Err(e) = references::reindex_chunk_references(pool.inner(), chunk_id).await {
+        log::warn!(
+            target: "gloss_lib::references",
+            "failed to reindex references for chunk_id={}: {}",
+            chunk_id, e
+        );
+    }
+
+    Ok(result)
+}
+
+struct ChunkChatContext {
+    book_title: String,
+    chunk_type: String,
+    title: Option<String>,
+    subject: Option<String>,
+    body_markdown: String,
+}
+
+fn sanitize_chunk_chat_history(history: Vec<ChunkChatMessage>) -> Result<Vec<ChunkChatMessage>, String> {
+    let mut cleaned = Vec::with_capacity(history.len());
+    for message in history {
+        let role = message.role.trim();
+        if role != "user" && role != "assistant" {
+            return Err(format!("invalid chat role {:?}", message.role));
+        }
+        let content = message.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        cleaned.push(ChunkChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+        });
+    }
+
+    if cleaned.is_empty() {
+        return Err("chat history was empty".into());
+    }
+    Ok(cleaned)
+}
+
+async fn load_chunk_chat_context(pool: &SqlitePool, chunk_id: i64) -> Result<ChunkChatContext, String> {
+    let row = sqlx::query(
+        "SELECT sd.title AS book_title, c.chunk_type, c.title, c.subject, \
+                COALESCE(NULLIF(TRIM(c.formatted_body_md), ''), NULLIF(TRIM(c.ocr_text), '')) AS body_markdown \
+         FROM chunks c \
+         JOIN source_documents sd ON sd.id = c.source_document_id \
+         WHERE c.id = ?",
+    )
+    .bind(chunk_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("chunk {} not found", chunk_id))?;
+
+    let body_markdown: Option<String> = row.get("body_markdown");
+    let body_markdown = body_markdown
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "No chunk text is available for AI chat yet.".to_string())?;
+
+    Ok(ChunkChatContext {
+        book_title: row.get("book_title"),
+        chunk_type: row.get("chunk_type"),
+        title: row.get("title"),
+        subject: row.get("subject"),
+        body_markdown,
+    })
+}
+
+async fn run_chunk_ai_stream(
+    app: tauri::AppHandle,
+    pool: SqlitePool,
+    chat_streams: Arc<Mutex<HashMap<String, ChatStreamHandle>>>,
+    request_id: String,
+    chunk_id: i64,
+    provider: LlmProvider,
+    history: Vec<ChunkChatMessage>,
+    cancelled: Arc<AtomicBool>,
+) {
+    let result = async {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(LlmError::Cancelled);
+        }
+
+        let context = load_chunk_chat_context(&pool, chunk_id)
+            .await
+            .map_err(LlmError::Config)?;
+        let prompt = ChunkChatPrompt {
+            book_title: &context.book_title,
+            chunk_type: &context.chunk_type,
+            title: context.title.as_deref(),
+            subject: context.subject.as_deref(),
+            body_markdown: &context.body_markdown,
+        };
+        let configured_api_key = settings::api_key_for_provider(&pool, provider)
+            .await
+            .map_err(LlmError::Config)?;
+
+        let emit_delta = |delta: &str| -> Result<(), LlmError> {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(LlmError::Cancelled);
+            }
+            emit_chunk_ai_stream(
+                &app,
+                &request_id,
+                chunk_id,
+                "delta",
+                Some(delta.to_string()),
+                None,
+            );
+            Ok(())
+        };
+        let should_cancel = || cancelled.load(Ordering::Relaxed);
+
+        match provider {
+            LlmProvider::Ollama => {
+                OllamaClient::new()
+                    .stream_chunk_chat(&prompt, &history, emit_delta, should_cancel)
+                    .await
+            }
+            LlmProvider::OpenAI => {
+                OpenAiClient::with_api_key(configured_api_key)
+                    .stream_chunk_chat(&prompt, &history, emit_delta, should_cancel)
+                    .await
+            }
+            LlmProvider::Gemini => {
+                GeminiClient::with_api_key(configured_api_key)
+                    .stream_chunk_chat(&prompt, &history, emit_delta, should_cancel)
+                    .await
+            }
+        }
+    }
+    .await;
+
+    match result {
+        Ok(_) => {
+            if finish_chat_stream(&chat_streams, &request_id).is_some() {
+                emit_chunk_ai_stream(&app, &request_id, chunk_id, "completed", None, None);
+            }
+        }
+        Err(LlmError::Cancelled) => {
+            if finish_chat_stream(&chat_streams, &request_id).is_some() {
+                emit_chunk_ai_stream(&app, &request_id, chunk_id, "cancelled", None, None);
+            }
+        }
+        Err(err) => {
+            if finish_chat_stream(&chat_streams, &request_id).is_some() {
+                emit_chunk_ai_stream(
+                    &app,
+                    &request_id,
+                    chunk_id,
+                    "error",
+                    None,
+                    Some(err.to_string()),
+                );
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn start_chunk_ai_stream(
+    request_id: String,
+    chunk_id: i64,
+    provider: String,
+    history: Vec<ChunkChatMessage>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<(), String> {
+    let request_id = request_id.trim().to_string();
+    if request_id.is_empty() {
+        return Err("request_id was empty".into());
+    }
+    if chunk_id < 1 {
+        return Err(format!("invalid chunk_id {}", chunk_id));
+    }
+
+    let provider = provider.parse::<LlmProvider>()?;
+    let history = sanitize_chunk_chat_history(history)?;
+    let cancelled = begin_chat_stream(state.inner(), &request_id, chunk_id)?;
+    let chat_streams = Arc::clone(&state.chat_streams);
+    let pool = pool.inner().clone();
+
+    tokio::spawn(run_chunk_ai_stream(
+        app,
+        pool,
+        chat_streams,
+        request_id,
+        chunk_id,
+        provider,
+        history,
+        cancelled,
+    ));
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_chunk_ai_stream(
+    request_id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let request_id = request_id.trim().to_string();
+    if request_id.is_empty() {
+        return Err("request_id was empty".into());
+    }
+
+    if let Some(handle) = cancel_chat_stream(&state.chat_streams, &request_id)? {
+        emit_chunk_ai_stream(&app, &request_id, handle.chunk_id, "cancelled", None, None);
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct ChunkReferenceView {
+    matched_text: String,
+    span_start: i64,
+    span_end: i64,
+    ref_kind: String,
+    target_id: Option<i64>,
+    target_title: Option<String>,
+    target_type: Option<String>,
+}
+
+#[tauri::command]
+async fn get_chunk_references(
+    chunk_id: i64,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<Vec<ChunkReferenceView>, String> {
+    let rows = sqlx::query(
+        "SELECT r.matched_text, r.span_start, r.span_end, r.ref_kind, \
+                c.id AS target_id, c.title AS target_title, c.chunk_type AS target_type \
+         FROM chunk_references r \
+         LEFT JOIN chunk_aliases a ON a.alias = r.matched_text \
+         LEFT JOIN chunks c ON c.id = a.chunk_id \
+             AND c.source_document_id = (SELECT source_document_id FROM chunks WHERE id = r.source_chunk_id) \
+             AND c.id != r.source_chunk_id \
+         WHERE r.source_chunk_id = ? \
+         ORDER BY r.span_start",
+    )
+    .bind(chunk_id)
+    .fetch_all(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // The LEFT JOIN may produce multiple rows per reference if an alias happens
+    // to be shared by more than one chunk (shouldn't happen within a document
+    // in practice, but be defensive). Collapse by (span_start, span_end):
+    // prefer the first resolved match, else the first unresolved row.
+    let mut seen: std::collections::HashMap<(i64, i64), ChunkReferenceView> =
+        std::collections::HashMap::new();
+    for r in rows {
+        let span_start: i64 = r.get("span_start");
+        let span_end: i64 = r.get("span_end");
+        let target_id: Option<i64> = r.get("target_id");
+        let key = (span_start, span_end);
+        let view = ChunkReferenceView {
+            matched_text: r.get("matched_text"),
+            span_start,
+            span_end,
+            ref_kind: r.get("ref_kind"),
+            target_id,
+            target_title: r.get("target_title"),
+            target_type: r.get("target_type"),
+        };
+        match seen.get(&key) {
+            None => {
+                seen.insert(key, view);
+            }
+            Some(existing) => {
+                if existing.target_id.is_none() && view.target_id.is_some() {
+                    seen.insert(key, view);
+                }
+            }
+        }
+    }
+    let mut out: Vec<ChunkReferenceView> = seen.into_values().collect();
+    out.sort_by_key(|v| v.span_start);
+    Ok(out)
+}
+
+#[derive(serde::Serialize)]
+struct ChunkPreview {
+    id: i64,
+    chunk_type: String,
+    title: Option<String>,
+    subject: Option<String>,
+    status: String,
+    body_preview: Option<String>,
+    has_formatted_body: bool,
+    has_self_explanation: bool,
+}
+
+#[tauri::command]
+async fn get_chunk_preview(
+    chunk_id: i64,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<ChunkPreview, String> {
+    let row = sqlx::query(
+        "SELECT id, chunk_type, title, subject, status, formatted_body_md, ocr_text \
+         FROM chunks WHERE id = ?",
+    )
+    .bind(chunk_id)
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("chunk {} not found", chunk_id))?;
+
+    let formatted: Option<String> = row.get("formatted_body_md");
+    let ocr: Option<String> = row.get("ocr_text");
+    let has_formatted_body = formatted
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let body_source = formatted
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .or_else(|| ocr.as_deref().map(str::trim).filter(|v| !v.is_empty()));
+    let body_preview = body_source.map(truncate_markdown_preview);
+
+    Ok(ChunkPreview {
+        id: row.get("id"),
+        chunk_type: row.get("chunk_type"),
+        title: row.get("title"),
+        subject: row.get("subject"),
+        status: row.get("status"),
+        body_preview,
+        has_formatted_body,
+        // Stub — flips to a real EXISTS lookup once the glossary table ships.
+        has_self_explanation: false,
+    })
+}
+
+/// Truncate a markdown body at a block boundary (paragraph / display-math /
+/// code-fence) near ≈400 chars. Keeps math environments balanced so the
+/// preview can be rendered by the same pipeline as the main chunk body.
+fn truncate_markdown_preview(body: &str) -> String {
+    const TARGET: usize = 400;
+    let normalized = body.replace("\r\n", "\n");
+    if normalized.len() <= TARGET {
+        return normalized.trim_end().to_string();
+    }
+    // Split on blank-line block boundaries; accumulate blocks up to target.
+    let mut out = String::new();
+    let mut remaining = normalized.as_str();
+    while !remaining.is_empty() {
+        let block_end = remaining
+            .find("\n\n")
+            .map(|i| i + 2)
+            .unwrap_or(remaining.len());
+        let block = &remaining[..block_end];
+        if !out.is_empty() && out.len() + block.len() > TARGET {
+            break;
+        }
+        out.push_str(block);
+        remaining = &remaining[block_end..];
+        if out.len() >= TARGET {
+            break;
+        }
+    }
+    if out.is_empty() {
+        // Single huge block — take the first line to keep it small and safe.
+        out = normalized
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(TARGET)
+            .collect();
+    }
+    out.trim_end().to_string()
+}
+
+#[tauri::command]
+async fn reindex_document_references(
+    source_document_id: i64,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<(), String> {
+    references::reindex_document_references(pool.inner(), source_document_id).await
+}
+
+#[derive(serde::Serialize)]
+struct DebugAlias {
+    chunk_id: i64,
+    chunk_type: String,
+    title: Option<String>,
+    alias: Option<String>,
+    alias_kind: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct DebugReference {
+    source_chunk_id: i64,
+    matched_text: String,
+    span_start: i64,
+    span_end: i64,
+    ref_kind: String,
+    target_id: Option<i64>,
+    target_title: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct DebugReferencesResult {
+    document_id: i64,
+    chunk_count: i64,
+    alias_rows: Vec<DebugAlias>,
+    reference_rows: Vec<DebugReference>,
+}
+
+#[tauri::command]
+async fn debug_references(
+    source_document_id: i64,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<DebugReferencesResult, String> {
+    let chunk_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE source_document_id = ?")
+            .bind(source_document_id)
+            .fetch_one(pool.inner())
+            .await
+            .map_err(|e| e.to_string())?;
+
+    let alias_rows_raw = sqlx::query(
+        "SELECT c.id AS chunk_id, c.chunk_type, c.title, a.alias, a.alias_kind \
+         FROM chunks c LEFT JOIN chunk_aliases a ON a.chunk_id = c.id \
+         WHERE c.source_document_id = ? \
+         ORDER BY c.id, a.alias",
+    )
+    .bind(source_document_id)
+    .fetch_all(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let alias_rows: Vec<DebugAlias> = alias_rows_raw
+        .into_iter()
+        .map(|r| DebugAlias {
+            chunk_id: r.get("chunk_id"),
+            chunk_type: r.get("chunk_type"),
+            title: r.get("title"),
+            alias: r.get("alias"),
+            alias_kind: r.get("alias_kind"),
+        })
+        .collect();
+
+    let ref_rows_raw = sqlx::query(
+        "SELECT r.source_chunk_id, r.matched_text, r.span_start, r.span_end, r.ref_kind, \
+                c.id AS target_id, c.title AS target_title \
+         FROM chunk_references r \
+         JOIN chunks src ON src.id = r.source_chunk_id \
+         LEFT JOIN chunk_aliases a ON a.alias = r.matched_text \
+         LEFT JOIN chunks c ON c.id = a.chunk_id \
+             AND c.source_document_id = src.source_document_id \
+             AND c.id != r.source_chunk_id \
+         WHERE src.source_document_id = ? \
+         ORDER BY r.source_chunk_id, r.span_start",
+    )
+    .bind(source_document_id)
+    .fetch_all(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let reference_rows: Vec<DebugReference> = ref_rows_raw
+        .into_iter()
+        .map(|r| DebugReference {
+            source_chunk_id: r.get("source_chunk_id"),
+            matched_text: r.get("matched_text"),
+            span_start: r.get("span_start"),
+            span_end: r.get("span_end"),
+            ref_kind: r.get("ref_kind"),
+            target_id: r.get("target_id"),
+            target_title: r.get("target_title"),
+        })
+        .collect();
+
+    Ok(DebugReferencesResult {
+        document_id: source_document_id,
+        chunk_count,
+        alias_rows,
+        reference_rows,
+    })
 }
 
 #[tauri::command]
@@ -970,6 +1709,7 @@ pub fn run() {
                 .level(log::LevelFilter::Info)
                 .level_for("gloss_lib::chunking", log::LevelFilter::Debug)
                 .level_for("gloss_lib::llm", log::LevelFilter::Debug)
+                .level_for("gloss_lib::gemini", log::LevelFilter::Debug)
                 .level_for("gloss_lib::openai", log::LevelFilter::Debug)
                 .level_for("gloss_lib::ollama", log::LevelFilter::Debug)
                 .timezone_strategy(TimezoneStrategy::UseLocal)
@@ -1007,6 +1747,7 @@ pub fn run() {
                 pdf_cache: Mutex::new(PdfCache::new()),
                 pdfium,
                 chunking_jobs: Arc::new(Mutex::new(HashSet::new())),
+                chat_streams: Arc::new(Mutex::new(HashMap::new())),
             });
             info!(target: "gloss_lib::startup", "gloss startup complete");
             Ok(())
@@ -1027,6 +1768,16 @@ pub fn run() {
             render_pdf_page,
             get_page_count,
             get_chunks_for_page,
+            get_chunk_for_transcription,
+            get_ai_settings_state,
+            save_ai_api_keys,
+            generate_chunk_formatted_body,
+            start_chunk_ai_stream,
+            cancel_chunk_ai_stream,
+            get_chunk_references,
+            get_chunk_preview,
+            reindex_document_references,
+            debug_references,
             get_chunking_status,
             is_chunking_page_active,
             ensure_chunking_for_page,

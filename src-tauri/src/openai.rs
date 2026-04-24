@@ -1,7 +1,11 @@
-use crate::llm::{build_prompt, parse_chunks, BlockForPrompt, GroupedChunk, LlmError};
+use crate::llm::{
+    build_chunk_body_prompt, build_chunk_chat_prompt, build_prompt, chunk_body_schema,
+    chunk_groups_schema, map_reqwest_error, merge_stream_text, parse_chunk_body, parse_chunks,
+    stream_sse_events, BlockForPrompt, ChunkBodyPrompt, ChunkBodyResult, ChunkChatMessage,
+    ChunkChatPrompt, GroupedChunk, LlmError,
+};
 use log::{debug, info};
-use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::time::Duration;
 
 const LOG_TARGET: &str = "gloss_lib::openai";
@@ -18,12 +22,16 @@ pub struct OpenAiClient {
 
 impl OpenAiClient {
     pub fn new() -> Self {
+        Self::with_api_key(None)
+    }
+
+    pub fn with_api_key(api_key: Option<String>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
             .expect("failed to build reqwest client");
         Self {
-            api_key: std::env::var("OPENAI_API_KEY").ok(),
+            api_key: normalize_api_key(api_key).or_else(|| std::env::var("OPENAI_API_KEY").ok()),
             base_url: DEFAULT_BASE_URL.to_string(),
             model: DEFAULT_MODEL.to_string(),
             client,
@@ -48,11 +56,6 @@ impl OpenAiClient {
         if blocks.is_empty() {
             return Ok(Vec::new());
         }
-        let api_key = self
-            .api_key
-            .as_deref()
-            .filter(|key| !key.trim().is_empty())
-            .ok_or_else(|| LlmError::Config("OPENAI_API_KEY not set".to_string()))?;
 
         info!(
             target: LOG_TARGET,
@@ -62,67 +65,251 @@ impl OpenAiClient {
         );
 
         let prompt = build_prompt(blocks);
-        let req = ResponseCreateRequest {
-            model: &self.model,
-            input: &prompt,
-            store: false,
-            temperature: 0.1,
-            text: ResponseTextConfig {
-                format: ResponseTextFormat { kind: "text" },
-            },
-        };
-
-        let resp = self
-            .client
-            .post(&self.base_url)
-            .bearer_auth(api_key)
-            .json(&req)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_connect() || e.is_timeout() {
-                    LlmError::Unavailable
-                } else {
-                    LlmError::Http(e.to_string())
+        let value = self
+            .send_request(json!({
+                "model": self.model,
+                "store": false,
+                "input": prompt,
+                "temperature": 0.1,
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "chunk_groups",
+                        "schema": chunk_groups_schema(),
+                        "strict": true
+                    }
                 }
-            })?;
-
-        let status = resp.status();
-        let body = resp.text().await.map_err(|e| LlmError::Http(e.to_string()))?;
-        if !status.is_success() {
-            return Err(LlmError::Http(format!("status {}: {}", status, body)));
-        }
-
-        let value: Value = serde_json::from_str(&body).map_err(|e| LlmError::Parse(e.to_string()))?;
-        let output_text = extract_output_text(&value).ok_or_else(|| LlmError::Parse(body.clone()))?;
+            }))
+            .await?;
+        let output_text =
+            extract_output_text(&value).ok_or_else(|| LlmError::Parse(value.to_string()))?;
         debug!(
             target: LOG_TARGET,
-            "received {} response chars from openai",
+            "received {} response chars from openai chunking",
             output_text.len()
         );
 
         parse_chunks(&output_text, LOG_TARGET)
     }
+
+    pub async fn transcribe_chunk_body(
+        &self,
+        chunk: &ChunkBodyPrompt<'_>,
+        image_base64: &str,
+    ) -> Result<ChunkBodyResult, LlmError> {
+        let prompt = build_chunk_body_prompt(chunk);
+        info!(
+            target: LOG_TARGET,
+            "transcribe_chunk_body model={} chunk_type={} title_present={} subject_present={}",
+            self.model,
+            chunk.chunk_type,
+            chunk.title.is_some(),
+            chunk.subject.is_some()
+        );
+
+        let data_url = format!("data:image/png;base64,{image_base64}");
+        let value = self
+            .send_request(json!({
+                "model": self.model,
+                "store": false,
+                "input": [
+                    {
+                        "role": "developer",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": prompt
+                            }
+                        ]
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "Transcribe this cropped mathematics chunk."
+                            },
+                            {
+                                "type": "input_image",
+                                "image_url": data_url,
+                                "detail": "high"
+                            }
+                        ]
+                    }
+                ],
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "chunk_body",
+                        "schema": chunk_body_schema(),
+                        "strict": true
+                    }
+                }
+            }))
+            .await?;
+        let output_text =
+            extract_output_text(&value).ok_or_else(|| LlmError::Parse(value.to_string()))?;
+        debug!(
+            target: LOG_TARGET,
+            "received {} response chars from openai chunk transcription",
+            output_text.len()
+        );
+
+        parse_chunk_body(&output_text, LOG_TARGET)
+    }
+
+    pub async fn stream_chunk_chat<F, C>(
+        &self,
+        chunk: &ChunkChatPrompt<'_>,
+        history: &[ChunkChatMessage],
+        mut on_delta: F,
+        should_cancel: C,
+    ) -> Result<String, LlmError>
+    where
+        F: FnMut(&str) -> Result<(), LlmError>,
+        C: Fn() -> bool,
+    {
+        let prompt = build_chunk_chat_prompt(chunk);
+        info!(
+            target: LOG_TARGET,
+            "stream_chunk_chat model={} chunk_type={} history_len={}",
+            self.model,
+            chunk.chunk_type,
+            history.len()
+        );
+
+        let api_key = self
+            .api_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+            .ok_or_else(|| LlmError::Config("OPENAI_API_KEY not set".to_string()))?;
+
+        let resp = self
+            .client
+            .post(&self.base_url)
+            .bearer_auth(api_key)
+            .json(&json!({
+                "model": self.model,
+                "store": false,
+                "stream": true,
+                "input": build_chat_input(&prompt, history),
+            }))
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| LlmError::Http(e.to_string()))?;
+            return Err(LlmError::Http(format!("status {}: {}", status, body)));
+        }
+
+        let mut output = String::new();
+        stream_sse_events(
+            resp,
+            |data| {
+                if data == "[DONE]" {
+                    return Ok(());
+                }
+
+                let value: Value =
+                    serde_json::from_str(data).map_err(|e| LlmError::Parse(e.to_string()))?;
+                let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+
+                if event_type == "response.output_text.delta" {
+                    if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                        if let Some(renderable) = merge_stream_text(&mut output, delta) {
+                            on_delta(&renderable)?;
+                        }
+                    }
+                    return Ok(());
+                }
+
+                if event_type == "response.completed" && output.trim().is_empty() {
+                    let response_value = value.get("response").unwrap_or(&value);
+                    if let Some(text) = extract_output_text(response_value) {
+                        if let Some(renderable) = merge_stream_text(&mut output, &text) {
+                            on_delta(&renderable)?;
+                        }
+                    }
+                }
+
+                Ok(())
+            },
+            should_cancel,
+        )
+        .await?;
+
+        let trimmed = output.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(LlmError::Parse("empty streamed openai response".to_string()));
+        }
+        Ok(trimmed)
+    }
+
+    async fn send_request(&self, request: Value) -> Result<Value, LlmError> {
+        let api_key = self
+            .api_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+            .ok_or_else(|| LlmError::Config("OPENAI_API_KEY not set".to_string()))?;
+
+        let resp = self
+            .client
+            .post(&self.base_url)
+            .bearer_auth(api_key)
+            .json(&request)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| LlmError::Http(e.to_string()))?;
+        if !status.is_success() {
+            return Err(LlmError::Http(format!("status {}: {}", status, body)));
+        }
+
+        serde_json::from_str(&body).map_err(|e| LlmError::Parse(e.to_string()))
+    }
 }
 
-#[derive(Serialize)]
-struct ResponseCreateRequest<'a> {
-    model: &'a str,
-    input: &'a str,
-    store: bool,
-    temperature: f32,
-    text: ResponseTextConfig<'a>,
+fn normalize_api_key(api_key: Option<String>) -> Option<String> {
+    api_key
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
-#[derive(Serialize)]
-struct ResponseTextConfig<'a> {
-    format: ResponseTextFormat<'a>,
-}
+fn build_chat_input(prompt: &str, history: &[ChunkChatMessage]) -> Value {
+    let mut messages = vec![json!({
+        "role": "developer",
+        "content": [{
+            "type": "input_text",
+            "text": prompt
+        }]
+    })];
 
-#[derive(Serialize)]
-struct ResponseTextFormat<'a> {
-    #[serde(rename = "type")]
-    kind: &'a str,
+    for message in history {
+        let role = if message.role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        };
+        messages.push(json!({
+            "role": role,
+            "content": [{
+                "type": "input_text",
+                "text": message.content
+            }]
+        }));
+    }
+
+    Value::Array(messages)
 }
 
 fn extract_output_text(value: &Value) -> Option<String> {

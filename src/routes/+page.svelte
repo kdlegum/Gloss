@@ -1,4 +1,5 @@
 <script lang="ts">
+  import "katex/dist/katex.min.css";
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import {
@@ -7,13 +8,22 @@
     info as pluginInfo,
     warn as pluginWarn,
   } from "@tauri-apps/plugin-log";
-  import { onMount, onDestroy } from "svelte";
+  import { renderChunkBodyHtml, type ResolvedReference } from "$lib/chunkBody";
+  import ChunkPeek from "$lib/ChunkPeek.svelte";
+  import { onMount, onDestroy, tick } from "svelte";
   import { fade } from "svelte/transition";
 
   interface SourceDocument {
     id: number;
     title: string;
     file_path: string;
+  }
+
+  interface AiSettingsState {
+    running_on_android: boolean;
+    setup_complete: boolean;
+    openai_api_key_set: boolean;
+    gemini_api_key_set: boolean;
   }
 
   interface RenderedPdfBitmap {
@@ -24,11 +34,22 @@
     pageHeightPoints: number;
   }
 
-  type ChunkingProvider = "ollama" | "openai";
+  type ChunkingProvider = "ollama" | "openai" | "gemini";
 
   const CHUNKING_PROVIDER_STORAGE_KEY = "gloss_chunking_provider";
   function isChunkingProvider(value: string | null): value is ChunkingProvider {
-    return value === "ollama" || value === "openai";
+    return value === "ollama" || value === "openai" || value === "gemini";
+  }
+
+  function getChunkingProviderLabel(provider: ChunkingProvider) {
+    switch (provider) {
+      case "ollama":
+        return "Ollama";
+      case "openai":
+        return "OpenAI";
+      case "gemini":
+        return "Gemini";
+    }
   }
 
   let sourceDocuments = $state<SourceDocument[]>([]);
@@ -39,6 +60,15 @@
   let currentChunkingStatus = $state("pending");
   let currentPageChunkingActive = $state(false);
   let reChunkingPage = $state(false);
+  let aiSettings = $state<AiSettingsState | null>(null);
+  let showAiKeySheet = $state(false);
+  let aiKeySheetFirstRun = $state(false);
+  let aiSettingsSaving = $state(false);
+  let aiSettingsError = $state<string | null>(null);
+  let openaiApiKeyInput = $state("");
+  let geminiApiKeyInput = $state("");
+  let clearOpenaiApiKey = $state(false);
+  let clearGeminiApiKey = $state(false);
 
   function formatLogError(err: unknown): string {
     if (err instanceof Error) return err.message;
@@ -1030,16 +1060,16 @@
       const w  = c.bbox_w * pageSize.w;
       const h  = c.bbox_h * pageSize.h;
       const isActive = chunkView?.chunk.id === c.id;
+      const barW = 3 / camera.scale;
       ctx.save();
-      ctx.globalAlpha = isActive ? 0.24 : 0.15;
-      ctx.fillStyle = colour;
+      // Subtle tint over the full bbox
+      ctx.globalAlpha = isActive ? 0.14 : 0.06;
+      ctx.fillStyle = colour.accent;
       ctx.fillRect(tl.x, tl.y, w, h);
-      if (isActive) {
-        ctx.globalAlpha = 0.9;
-        ctx.strokeStyle = colour;
-        ctx.lineWidth = 1.5 / camera.scale;
-        ctx.strokeRect(tl.x, tl.y, w, h);
-      }
+      // Marginal bar on the left edge
+      ctx.globalAlpha = isActive ? 0.95 : 0.65;
+      ctx.fillStyle = colour.accent;
+      ctx.fillRect(tl.x, tl.y, barW, h);
       ctx.restore();
     }
   }
@@ -1352,6 +1382,91 @@
     void appLogInfo(`[chunking] provider switched to ${provider}`);
   }
 
+  function openAiKeySettings(firstRun = false) {
+    aiKeySheetFirstRun = firstRun;
+    aiSettingsError = null;
+    openaiApiKeyInput = "";
+    geminiApiKeyInput = "";
+    clearOpenaiApiKey = false;
+    clearGeminiApiKey = false;
+    showAiKeySheet = true;
+  }
+
+  function closeAiKeySettings() {
+    if (aiSettingsSaving) return;
+    showAiKeySheet = false;
+    aiKeySheetFirstRun = false;
+    aiSettingsError = null;
+  }
+
+  function applyAiSettingsState(state: AiSettingsState) {
+    aiSettings = state;
+    if (!state.running_on_android) return;
+
+    if (chunkingProvider === "ollama") {
+      setChunkingProvider(
+        state.openai_api_key_set ? "openai" : state.gemini_api_key_set ? "gemini" : "openai",
+      );
+    } else if (chunkingProvider === "openai" && !state.openai_api_key_set && state.gemini_api_key_set) {
+      setChunkingProvider("gemini");
+    } else if (chunkingProvider === "gemini" && !state.gemini_api_key_set && state.openai_api_key_set) {
+      setChunkingProvider("openai");
+    }
+  }
+
+  async function loadAiSettings() {
+    try {
+      const state = await invoke<AiSettingsState>("get_ai_settings_state");
+      applyAiSettingsState(state);
+      if (state.running_on_android && !state.setup_complete) {
+        openAiKeySettings(true);
+      }
+    } catch (err) {
+      void appLogWarn(`[settings] failed to load AI settings: ${formatLogError(err)}`);
+    }
+  }
+
+  async function saveAiKeySettings(setupComplete: boolean) {
+    aiSettingsSaving = true;
+    aiSettingsError = null;
+    try {
+      const openaiKey = openaiApiKeyInput.trim();
+      const geminiKey = geminiApiKeyInput.trim();
+      const state = await invoke<AiSettingsState>("save_ai_api_keys", {
+        openaiApiKey: openaiKey.length > 0 ? openaiKey : null,
+        geminiApiKey: geminiKey.length > 0 ? geminiKey : null,
+        clearOpenaiApiKey,
+        clearGeminiApiKey,
+        setupComplete,
+      });
+      applyAiSettingsState(state);
+      showAiKeySheet = false;
+      aiKeySheetFirstRun = false;
+      aiSettingsError = null;
+      void appLogInfo(
+        `[settings] AI keys updated openai=${state.openai_api_key_set} gemini=${state.gemini_api_key_set}`,
+      );
+    } catch (err) {
+      aiSettingsError = formatLogError(err);
+      void appLogError(`[settings] failed to save AI keys: ${formatLogError(err)}`);
+    } finally {
+      aiSettingsSaving = false;
+    }
+  }
+
+  function saveAiKeyForm(event: SubmitEvent) {
+    event.preventDefault();
+    void saveAiKeySettings(true);
+  }
+
+  function dismissAiKeySettings() {
+    if (aiKeySheetFirstRun) {
+      void saveAiKeySettings(true);
+    } else {
+      closeAiKeySettings();
+    }
+  }
+
   function savedPageKey(bookId: number) { return `gloss_page_${bookId}`; }
   function saveCurrentPage(bookId: number, page: number) {
     localStorage.setItem(savedPageKey(bookId), String(page));
@@ -1553,6 +1668,21 @@
   // ── AI rasterisation ──
   let aiWorking = $state(false);
   let aiDebugImage = $state<string | null>(null);
+  const CHUNK_TRANSCRIPTION_TARGET_WIDTH = 1400;
+  const CHUNK_TRANSCRIPTION_MAX_PAGE_WIDTH = 4096;
+
+  interface ChunkFormattedBodyOutput {
+    body_markdown: string;
+  }
+
+  function blobToBase64(blob: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve((reader.result as string).split(",")[1]);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
 
   async function rasteriseSelection(): Promise<string> {
     if (!selection || !currentPdfBitmap) throw new Error("Nothing selected");
@@ -1594,12 +1724,7 @@
     }
 
     const blob = await offscreen.convertToBlob({ type: "image/png" });
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve((reader.result as string).split(",")[1]);
-      reader.onerror = reject;
-      reader.readAsDataURL(blob);
-    });
+    return blobToBase64(blob);
   }
 
   async function onAiClick() {
@@ -1627,6 +1752,13 @@
     title: string | null;
     subject: string | null;
     proves_chunk_id: number | null;
+    ocr_text: string | null;
+    formatted_body_md: string | null;
+  }
+
+  interface ChunkForTranscription extends ChunkInfo {
+    source_document_id: number;
+    page_number: number;
   }
 
   interface SurfaceStrokeOutput {
@@ -1645,25 +1777,313 @@
     strokes: Stroke[];
   }
 
-  const CHUNK_COLOURS: Record<string, string> = {
-    definition:  "#efcf5a",
-    theorem:     "#4f8fe2",
-    example:     "#5ec779",
-    proof:       "#a78bd9",
-    exercise:    "#e69a4c",
-    explanation: "#b8b8b8",
+  const CHUNK_COLOURS: Record<string, { accent: string; tint: string; label: string; short: string }> = {
+    definition:  { accent: 'oklch(0.50 0.17 233)', tint: 'oklch(0.965 0.032 233)', label: 'Definition',  short: 'Def'  },
+    theorem:     { accent: 'oklch(0.47 0.17 290)', tint: 'oklch(0.965 0.032 290)', label: 'Theorem',     short: 'Thm'  },
+    proof:       { accent: 'oklch(0.50 0.10 180)', tint: 'oklch(0.975 0.020 180)', label: 'Proof',       short: 'Prf'  },
+    exercise:    { accent: 'oklch(0.58 0.16 50)',  tint: 'oklch(0.970 0.032 50)',  label: 'Exercise',     short: 'Ex'   },
+    example:     { accent: 'oklch(0.58 0.16 50)',  tint: 'oklch(0.970 0.032 50)',  label: 'Example',      short: 'Eg'   },
+    explanation: { accent: 'oklch(0.52 0.03 240)', tint: 'oklch(0.975 0.008 240)', label: 'Explanation',  short: 'Exp'  },
   };
 
   let currentChunks = $state<ChunkInfo[]>([]);
   const chunkSurfaceCache = new Map<number, ChunkSurfaceCache>();
   const chunkSurfaceRequests = new Map<number, Promise<ChunkSurfaceCache>>();
+  const chunkBodyRequests = new Map<number, Promise<boolean>>();
   let chunkMode = $state<'draw' | 'erase'>('draw');
+  let chunkTab = $state<'ink' | 'glossary' | 'ai'>('ink');
 
   let chunkView = $state<{
     chunk: ChunkInfo;
     surfaceId: number;
     strokes: Stroke[];
   } | null>(null);
+  let chunkViewRefs = $state<ResolvedReference[]>([]);
+  let chunkViewBodyHtml = $derived(
+    chunkView ? renderChunkBodyHtml(getChunkDisplayBody(chunkView.chunk), chunkViewRefs) : "",
+  );
+  let chunkPeek = $state<{
+    chunkId: number;
+    anchorRect: DOMRect;
+  } | null>(null);
+
+  type ChunkChatMessageState = "complete" | "streaming" | "stopped" | "error";
+
+  interface ChunkChatMessage {
+    id: string;
+    role: "user" | "assistant";
+    content: string;
+    state: ChunkChatMessageState;
+    html?: string;
+  }
+
+  interface ChunkChatHistoryItem {
+    role: "user" | "assistant";
+    content: string;
+  }
+
+  interface ChunkAiStreamEventPayload {
+    request_id: string;
+    chunk_id: number;
+    phase: "delta" | "completed" | "error" | "cancelled";
+    delta?: string | null;
+    error?: string | null;
+  }
+
+  let chunkChatMessages = $state<ChunkChatMessage[]>([]);
+  let chunkChatDraft = $state("");
+  let chunkChatLoadingContext = $state(false);
+  let chunkChatStreaming = $state(false);
+  let chunkChatError = $state<string | null>(null);
+  let chunkChatActiveRequestId = $state<string | null>(null);
+  let chunkChatTranscript = $state<HTMLDivElement>(null!);
+
+  interface BackendChunkReference {
+    matched_text: string;
+    span_start: number;
+    span_end: number;
+    ref_kind: string;
+    target_id: number | null;
+    target_title: string | null;
+    target_type: string | null;
+  }
+
+  async function loadChunkReferences(chunkId: number) {
+    try {
+      const rows = await invoke<BackendChunkReference[]>("get_chunk_references", { chunkId });
+      if (chunkView?.chunk.id !== chunkId) return;
+      chunkViewRefs = rows
+        .filter((r): r is BackendChunkReference & { target_id: number } => r.target_id != null)
+        .map((r) => ({
+          matched_text: r.matched_text,
+          span_start: r.span_start,
+          span_end: r.span_end,
+          target_id: r.target_id,
+        }));
+    } catch (err) {
+      await appLogWarn(`[chunk] load references failed chunkId=${chunkId}: ${formatLogError(err)}`);
+    }
+  }
+
+  function onChunkBodyClick(event: MouseEvent) {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const anchor = target.closest("a.chunk-xref");
+    if (!(anchor instanceof HTMLElement)) return;
+    event.preventDefault();
+    const raw = anchor.getAttribute("data-chunk-id");
+    const targetId = raw ? Number(raw) : NaN;
+    if (!Number.isInteger(targetId)) return;
+    chunkPeek = {
+      chunkId: targetId,
+      anchorRect: anchor.getBoundingClientRect(),
+    };
+  }
+
+  async function onPeekOpen(chunkId: number) {
+    chunkPeek = null;
+    const cached = currentChunks.find((c) => c.id === chunkId);
+    if (cached) {
+      void openChunkView(cached);
+      return;
+    }
+    try {
+      const chunk = await invoke<ChunkInfo>("get_chunk_preview", { chunkId });
+      // `get_chunk_preview` returns a preview shape; pull full chunk if needed.
+      // For now, navigate only when the chunk is on the current page.
+      void appLogInfo(`[chunk] peek open requested for chunkId=${chunkId} (not on current page)`);
+      // Fallback: close peek without navigation. Cross-page navigation can be added later.
+      void chunk;
+    } catch (err) {
+      await appLogWarn(`[chunk] peek open failed chunkId=${chunkId}: ${formatLogError(err)}`);
+    }
+  }
+
+  function onPeekClose() {
+    chunkPeek = null;
+  }
+
+  $effect(() => {
+    const id = chunkView?.chunk.id;
+    if (id == null) {
+      chunkViewRefs = [];
+      return;
+    }
+    void loadChunkReferences(id);
+  });
+
+  $effect(() => {
+    // Re-run when the formatted body changes (references may now hit different spans).
+    const body = chunkView ? getChunkDisplayBody(chunkView.chunk) : "";
+    if (chunkView && body) void loadChunkReferences(chunkView.chunk.id);
+  });
+
+  function makeChunkChatRequestId() {
+    return `chunk-chat-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  function resetChunkChatState() {
+    chunkChatMessages = [];
+    chunkChatDraft = "";
+    chunkChatLoadingContext = false;
+    chunkChatStreaming = false;
+    chunkChatError = null;
+    chunkChatActiveRequestId = null;
+  }
+
+  function updateChunkChatMessage(
+    messageId: string,
+    updater: (message: ChunkChatMessage) => ChunkChatMessage,
+  ) {
+    chunkChatMessages = chunkChatMessages.map((message) =>
+      message.id === messageId ? updater(message) : message,
+    );
+  }
+
+  async function scrollChunkChatToBottom() {
+    await tick();
+    if (chunkChatTranscript) {
+      chunkChatTranscript.scrollTop = chunkChatTranscript.scrollHeight;
+    }
+  }
+
+  function queueChunkChatScroll() {
+    void scrollChunkChatToBottom();
+  }
+
+  function getChunkChatHistory(): ChunkChatHistoryItem[] {
+    return chunkChatMessages
+      .filter((message) => message.state === "complete")
+      .map((message) => ({
+        role: message.role,
+        content: message.content,
+      }));
+  }
+
+  async function ensureChunkChatContext(chunkId: number) {
+    const chunk = currentChunks.find((entry) => entry.id === chunkId)
+      ?? (chunkView?.chunk.id === chunkId ? chunkView.chunk : null);
+    if (!chunk) throw new Error(`Chunk ${chunkId} is no longer available`);
+
+    if (!chunkHasFormattedBody(chunk)) {
+      chunkChatLoadingContext = true;
+      try {
+        await ensureChunkFormattedBody(chunkId);
+      } finally {
+        if (chunkView?.chunk.id === chunkId) {
+          chunkChatLoadingContext = false;
+        }
+      }
+    }
+
+    const refreshed = currentChunks.find((entry) => entry.id === chunkId)
+      ?? (chunkView?.chunk.id === chunkId ? chunkView.chunk : chunk);
+    if (!getChunkDisplayBody(refreshed).trim()) {
+      throw new Error("No chunk text is available for AI chat yet.");
+    }
+  }
+
+  async function cancelChunkChatForReset() {
+    const requestId = chunkChatActiveRequestId;
+    resetChunkChatState();
+    if (!requestId) return;
+    try {
+      await invoke("cancel_chunk_ai_stream", { requestId });
+    } catch (err) {
+      await appLogWarn(`[chunk-ai] cancel on reset failed requestId=${requestId}: ${formatLogError(err)}`);
+    }
+  }
+
+  async function stopChunkChat() {
+    const requestId = chunkChatActiveRequestId;
+    if (!requestId) return;
+
+    updateChunkChatMessage(requestId, (message) => ({
+      ...message,
+      state: "stopped",
+      content: message.content || "Stopped.",
+    }));
+    chunkChatActiveRequestId = null;
+    chunkChatStreaming = false;
+    chunkChatLoadingContext = false;
+    chunkChatError = null;
+    queueChunkChatScroll();
+
+    try {
+      await invoke("cancel_chunk_ai_stream", { requestId });
+    } catch (err) {
+      await appLogWarn(`[chunk-ai] stop failed requestId=${requestId}: ${formatLogError(err)}`);
+    }
+  }
+
+  async function sendChunkChatMessage() {
+    const view = chunkView;
+    const content = chunkChatDraft.trim();
+    if (!view || !content || chunkChatStreaming || chunkChatLoadingContext) return;
+
+    const requestId = makeChunkChatRequestId();
+    chunkChatDraft = "";
+    chunkChatError = null;
+    chunkChatMessages = [
+      ...chunkChatMessages,
+      {
+        id: `${requestId}-user`,
+        role: "user",
+        content,
+        state: "complete",
+      },
+      {
+        id: requestId,
+        role: "assistant",
+        content: "",
+        state: "streaming",
+      },
+    ];
+    chunkChatStreaming = true;
+    chunkChatActiveRequestId = requestId;
+    queueChunkChatScroll();
+
+    try {
+      await ensureChunkChatContext(view.chunk.id);
+      if (chunkView?.chunk.id !== view.chunk.id || chunkChatActiveRequestId !== requestId) {
+        return;
+      }
+
+      const history = getChunkChatHistory();
+      await invoke("start_chunk_ai_stream", {
+        requestId,
+        chunkId: view.chunk.id,
+        provider: chunkingProvider,
+        history,
+      });
+      await appLogInfo(
+        `[chunk-ai] started requestId=${requestId} chunkId=${view.chunk.id} provider=${chunkingProvider} history=${history.length}`,
+      );
+    } catch (err) {
+      const message = formatLogError(err);
+      chunkChatError = message;
+      if (chunkChatActiveRequestId === requestId) {
+        chunkChatActiveRequestId = null;
+        chunkChatStreaming = false;
+        chunkChatLoadingContext = false;
+      }
+      updateChunkChatMessage(requestId, (assistant) => ({
+        ...assistant,
+        state: "error",
+        content: assistant.content || "Unable to reply.",
+      }));
+      queueChunkChatScroll();
+      await appLogWarn(
+        `[chunk-ai] failed to start requestId=${requestId} chunkId=${view.chunk.id}: ${message}`,
+      );
+    }
+  }
+
+  function onChunkChatKeydown(event: KeyboardEvent) {
+    if (event.key !== "Enter" || event.shiftKey) return;
+    event.preventDefault();
+    void sendChunkChatMessage();
+  }
 
   let chunkingBusy = $derived(
     reChunkingPage || currentPageChunkingActive,
@@ -1675,7 +2095,7 @@
   async function reChunkCurrentPage() {
     if (!selectedBook || !canRechunkPage) return;
 
-    const providerLabel = chunkingProvider === "openai" ? "OpenAI" : "Ollama";
+    const providerLabel = getChunkingProviderLabel(chunkingProvider);
     const confirmed = window.confirm(
       `Re-chunk this page with ${providerLabel}?\n\nChunk-attached notes on this page will be deleted when the new chunks are saved. Page notes will stay.`,
     );
@@ -1768,12 +2188,169 @@
     return null;
   }
 
+  function chunkHasFormattedBody(chunk: ChunkInfo): boolean {
+    return !!chunk.formatted_body_md?.trim();
+  }
+
+  function getChunkDisplayBody(chunk: ChunkInfo): string {
+    if (chunkHasFormattedBody(chunk)) return chunk.formatted_body_md ?? '';
+    return chunk.ocr_text ?? '';
+  }
+
+  function currentRenderedPdfBitmap(): RenderedPdfBitmap | null {
+    if (!currentPdfBitmap) return null;
+    return {
+      bitmap: currentPdfBitmap,
+      bitmapWidth: currentPdfBitmap.width,
+      bitmapHeight: currentPdfBitmap.height,
+      pageWidthPoints: currentPdfPagePoints.w,
+      pageHeightPoints: currentPdfPagePoints.h,
+    };
+  }
+
+  async function rasteriseChunkForTranscription(
+    chunk: Pick<ChunkInfo, "id" | "bbox_x" | "bbox_y" | "bbox_w" | "bbox_h">,
+    pageNumber = currentPage,
+  ): Promise<string> {
+    if (!selectedBook) throw new Error("No selected book");
+    if (chunk.bbox_w <= 0 || chunk.bbox_h <= 0) {
+      throw new Error(`Invalid chunk bounds for chunk ${chunk.id}`);
+    }
+
+    const desiredPageWidth = Math.min(
+      CHUNK_TRANSCRIPTION_MAX_PAGE_WIDTH,
+      Math.max(
+        getPreviewPdfPixelWidth(),
+        quantizePdfPixelWidth(CHUNK_TRANSCRIPTION_TARGET_WIDTH / Math.max(chunk.bbox_w, 0.001)),
+      ),
+    );
+
+    let rendered = pageNumber === currentPage ? currentRenderedPdfBitmap() : null;
+    if (!rendered || !hasEnoughPdfResolution(rendered.bitmap, desiredPageWidth)) {
+      const fetched = await fetchPdfBitmap(pageNumber, desiredPageWidth);
+      rendered = fetched.rendered;
+    }
+
+    const sx = Math.min(
+      rendered.bitmapWidth - 1,
+      Math.max(0, Math.floor(chunk.bbox_x * rendered.bitmapWidth)),
+    );
+    const sy = Math.min(
+      rendered.bitmapHeight - 1,
+      Math.max(0, Math.floor(chunk.bbox_y * rendered.bitmapHeight)),
+    );
+    const sw = Math.max(
+      1,
+      Math.min(
+        rendered.bitmapWidth - sx,
+        Math.ceil(chunk.bbox_w * rendered.bitmapWidth),
+      ),
+    );
+    const sh = Math.max(
+      1,
+      Math.min(
+        rendered.bitmapHeight - sy,
+        Math.ceil(chunk.bbox_h * rendered.bitmapHeight),
+      ),
+    );
+
+    const offscreen = new OffscreenCanvas(sw, sh);
+    const ctx = offscreen.getContext("2d");
+    if (!ctx) throw new Error("Failed to create chunk transcription canvas");
+    ctx.drawImage(rendered.bitmap, sx, sy, sw, sh, 0, 0, sw, sh);
+
+    const blob = await offscreen.convertToBlob({ type: "image/png" });
+    return blobToBase64(blob);
+  }
+
+  function applyChunkFormattedBody(chunkId: number, bodyMarkdown: string) {
+    currentChunks = currentChunks.map((chunk) =>
+      chunk.id === chunkId
+        ? { ...chunk, formatted_body_md: bodyMarkdown }
+        : chunk,
+    );
+    const view = chunkView;
+    if (view?.chunk.id === chunkId) {
+      chunkView = {
+        ...view,
+        chunk: {
+          ...view.chunk,
+          formatted_body_md: bodyMarkdown,
+        },
+      };
+    }
+  }
+
+  async function loadChunkForTranscription(chunkId: number): Promise<ChunkForTranscription | null> {
+    if (!selectedBook) return null;
+    const local = currentChunks.find((entry) => entry.id === chunkId)
+      ?? (chunkView?.chunk.id === chunkId ? chunkView.chunk : null);
+    if (local) {
+      return {
+        ...local,
+        source_document_id: selectedBook.id,
+        page_number: currentPage,
+      };
+    }
+
+    const fetched = await invoke<ChunkForTranscription>("get_chunk_for_transcription", { chunkId });
+    if (fetched.source_document_id !== selectedBook.id) {
+      throw new Error(`Chunk ${chunkId} belongs to a different document`);
+    }
+    return fetched;
+  }
+
+  async function ensureChunkFormattedBody(chunkId: number, force = false): Promise<boolean> {
+    const existing = chunkBodyRequests.get(chunkId);
+    if (existing) return existing;
+
+    const localChunk = currentChunks.find((entry) => entry.id === chunkId)
+      ?? (chunkView?.chunk.id === chunkId ? chunkView.chunk : null);
+    if (!force && localChunk && chunkHasFormattedBody(localChunk)) return true;
+
+    const request = (async (): Promise<boolean> => {
+      try {
+        const chunk = await loadChunkForTranscription(chunkId);
+        if (!chunk) return false;
+        if (!force && chunkHasFormattedBody(chunk)) {
+          applyChunkFormattedBody(chunkId, chunk.formatted_body_md ?? "");
+          return true;
+        }
+
+        const imageBase64 = await rasteriseChunkForTranscription(chunk, chunk.page_number);
+        const result = await invoke<ChunkFormattedBodyOutput>("generate_chunk_formatted_body", {
+          chunkId,
+          provider: chunkingProvider,
+          imageBase64,
+          force,
+        });
+        applyChunkFormattedBody(chunkId, result.body_markdown);
+        await appLogInfo(
+          `[chunk] formatted body ready chunkId=${chunkId} provider=${chunkingProvider} chars=${result.body_markdown.length}`,
+        );
+        return true;
+      } catch (err) {
+        await appLogWarn(
+          `[chunk] formatted body failed chunkId=${chunkId} provider=${chunkingProvider}: ${formatLogError(err)}`,
+        );
+        return false;
+      } finally {
+        chunkBodyRequests.delete(chunkId);
+      }
+    })();
+
+    chunkBodyRequests.set(chunkId, request);
+    return request;
+  }
+
   async function openChunkView(chunk: ChunkInfo) {
+    void cancelChunkChatForReset();
     const cache = await ensureChunkSurface(chunk.id);
     void appLogInfo(
       `[chunk] open chunkId=${chunk.id} type=${chunk.chunk_type} cachedStrokes=${cache.strokes.length}`,
     );
     chunkMode = 'draw';
+    chunkTab = 'ink';
     chunkView = {
       chunk,
       surfaceId: cache.surfaceId,
@@ -1781,9 +2358,13 @@
     };
     redoStack = [];
     markDirty();
+    if (!chunkHasFormattedBody(chunk)) {
+      void ensureChunkFormattedBody(chunk.id);
+    }
   }
 
   function closeChunkView() {
+    void cancelChunkChatForReset();
     if (chunkView) {
       void appLogInfo(
         `[chunk] close chunkId=${chunkView.chunk.id} strokes=${chunkView.strokes.length}`,
@@ -1804,9 +2385,6 @@
     markDirty();
   }
 
-  function formatChunkType(chunkType: string) {
-    return chunkType.charAt(0).toUpperCase() + chunkType.slice(1);
-  }
 
   // ── Chunk view canvases ──
   let chunkWetCanvas = $state<HTMLCanvasElement>(null!);
@@ -2000,6 +2578,7 @@
 
   // ── Chunking progress events ──
   let chunkingUnlisten: UnlistenFn | null = null;
+  let chunkAiUnlisten: UnlistenFn | null = null;
   async function setupChunkingListener() {
     chunkingUnlisten = await listen<{ source_document_id: number; page_number: number; phase: string }>(
       "chunking_progress",
@@ -2017,6 +2596,70 @@
         if (e.payload.page_number !== currentPage) return;
         if (e.payload.phase !== "grouped") return;
         if (currentPageId !== null) void loadChunksForPage(currentPageId);
+      },
+    );
+  }
+
+  async function setupChunkAiListener() {
+    chunkAiUnlisten = await listen<ChunkAiStreamEventPayload>(
+      "chunk_ai_stream",
+      (event) => {
+        const payload = event.payload;
+        const activeRequestId = chunkChatActiveRequestId;
+        const activeChunkId = chunkView?.chunk.id;
+        if (!activeRequestId || !activeChunkId) return;
+        if (payload.request_id !== activeRequestId || payload.chunk_id !== activeChunkId) return;
+
+        if (payload.phase === "delta") {
+          if (!payload.delta) return;
+          updateChunkChatMessage(payload.request_id, (message) => ({
+            ...message,
+            content: message.content + payload.delta,
+          }));
+          queueChunkChatScroll();
+          return;
+        }
+
+        if (payload.phase === "completed") {
+          updateChunkChatMessage(payload.request_id, (message) => ({
+            ...message,
+            state: "complete",
+            html: renderChunkBodyHtml(message.content),
+          }));
+          chunkChatStreaming = false;
+          chunkChatLoadingContext = false;
+          chunkChatError = null;
+          chunkChatActiveRequestId = null;
+          queueChunkChatScroll();
+          return;
+        }
+
+        if (payload.phase === "cancelled") {
+          updateChunkChatMessage(payload.request_id, (message) => ({
+            ...message,
+            state: "stopped",
+            content: message.content || "Stopped.",
+          }));
+          chunkChatStreaming = false;
+          chunkChatLoadingContext = false;
+          chunkChatError = null;
+          chunkChatActiveRequestId = null;
+          queueChunkChatScroll();
+          return;
+        }
+
+        if (payload.phase === "error") {
+          updateChunkChatMessage(payload.request_id, (message) => ({
+            ...message,
+            state: "error",
+            content: message.content || payload.error || "Unable to reply.",
+          }));
+          chunkChatStreaming = false;
+          chunkChatLoadingContext = false;
+          chunkChatError = payload.error ?? "AI chat failed.";
+          chunkChatActiveRequestId = null;
+          queueChunkChatScroll();
+        }
       },
     );
   }
@@ -2040,6 +2683,13 @@
   // ── Keyboard ──
 
   async function handleKeydown(e: KeyboardEvent) {
+    if (showAiKeySheet) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        dismissAiKeySettings();
+      }
+      return;
+    }
     if (!selectedBook) return;
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 
@@ -2080,6 +2730,9 @@
 
   onMount(() => {
     chunkingProvider = loadChunkingProvider();
+    void loadAiSettings();
+    // Dev-only: expose invoke on window for ad-hoc debugging from devtools.
+    (window as unknown as { glossInvoke?: typeof invoke }).glossInvoke = invoke;
     void (async () => {
       try {
         detachLogConsole = await attachConsole();
@@ -2092,13 +2745,16 @@
     window.addEventListener("keydown", handleKeydown);
     window.addEventListener("wheel", handleWheel, { passive: false });
     void setupChunkingListener();
+    void setupChunkAiListener();
   });
 
   onDestroy(() => {
+    void cancelChunkChatForReset();
     window.removeEventListener("keydown", handleKeydown);
     window.removeEventListener("wheel", handleWheel);
     containerResizeObserver?.disconnect();
     chunkingUnlisten?.();
+    chunkAiUnlisten?.();
     detachLogConsole?.();
   });
 
@@ -2124,17 +2780,19 @@
         <span class="viewer-title">{selectedBook.title}</span>
         <div class="viewer-header-actions">
           <div class="chunking-provider-group">
-            <span class="chunking-provider-label">Chunking AI</span>
-            <div class="chunking-provider-toggle" role="group" aria-label="Chunking AI provider">
-              <button
-                class="chunking-provider-btn"
-                class:active={chunkingProvider === "ollama"}
-                onclick={() => setChunkingProvider("ollama")}
-                aria-pressed={chunkingProvider === "ollama"}
-                type="button"
-              >
-                Ollama
-              </button>
+            <span class="chunking-provider-label">AI provider</span>
+            <div class="chunking-provider-toggle" role="group" aria-label="AI provider">
+              {#if !aiSettings?.running_on_android}
+                <button
+                  class="chunking-provider-btn"
+                  class:active={chunkingProvider === "ollama"}
+                  onclick={() => setChunkingProvider("ollama")}
+                  aria-pressed={chunkingProvider === "ollama"}
+                  type="button"
+                >
+                  Ollama
+                </button>
+              {/if}
               <button
                 class="chunking-provider-btn"
                 class:active={chunkingProvider === "openai"}
@@ -2144,8 +2802,24 @@
               >
                 OpenAI
               </button>
+              <button
+                class="chunking-provider-btn"
+                class:active={chunkingProvider === "gemini"}
+                onclick={() => setChunkingProvider("gemini")}
+                aria-pressed={chunkingProvider === "gemini"}
+                type="button"
+              >
+                Gemini
+              </button>
             </div>
           </div>
+          <button
+            class="ai-settings-btn"
+            onclick={() => openAiKeySettings(false)}
+            type="button"
+          >
+            AI keys
+          </button>
           <button
             class="rechunk-btn"
             onclick={reChunkCurrentPage}
@@ -2184,77 +2858,199 @@
       </div>
 
       {#if chunkView}
+        {@const cc = CHUNK_COLOURS[chunkView.chunk.chunk_type] ?? { accent: 'oklch(0.52 0.03 240)', tint: 'oklch(0.975 0.008 240)', label: 'Chunk', short: '?' }}
         <div class="chunk-sheet-backdrop">
           <div
             class="chunk-sheet"
             role="dialog"
             aria-modal="true"
-            aria-label={`${formatChunkType(chunkView.chunk.chunk_type)} notes`}
+            aria-label={`${cc.label} notes`}
             transition:fade={{ duration: 140 }}
           >
-            <div class="chunk-sheet-header">
-              <div class="chunk-sheet-copy">
-                <span
-                  class="chunk-type-pill"
-                  style={`--chunk-accent: ${CHUNK_COLOURS[chunkView.chunk.chunk_type] ?? '#b8b8b8'};`}
-                >
-                  {formatChunkType(chunkView.chunk.chunk_type)}
-                </span>
-                {#if chunkView.chunk.title}
-                  <h2>{chunkView.chunk.title}</h2>
-                {:else if chunkView.chunk.subject}
-                  <h2>Proof of {chunkView.chunk.subject}</h2>
-                {:else}
-                  <h2>Chunk notes</h2>
-                {/if}
-                <p>These notes stay attached to this chunk instead of the whole page.</p>
-              </div>
-              <div class="chunk-sheet-actions">
-                <button
-                  class="tool-btn"
-                  class:active={chunkMode === 'draw'}
-                  onclick={() => chunkMode = 'draw'}
-                  aria-label="Draw in chunk note"
-                  aria-pressed={chunkMode === 'draw'}
-                >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M12 19l7-7 3 3-7 7-3-3z"/>
-                    <path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/>
-                    <path d="M2 2l7.586 7.586"/>
-                    <circle cx="11" cy="11" r="2"/>
-                  </svg>
-                </button>
-                <button
-                  class="tool-btn"
-                  class:active={chunkMode === 'erase'}
-                  onclick={() => chunkMode = 'erase'}
-                  aria-label="Erase in chunk note"
-                  aria-pressed={chunkMode === 'erase'}
-                >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M20 20H7L3 16l10-10 7 7-2.5 2.5"/>
-                    <path d="M6.5 17.5l5-5"/>
-                  </svg>
-                </button>
+
+            <!-- Left panel: chunk content -->
+            <div class="chunk-panel-left" style={`--chunk-accent: ${cc.accent}; --chunk-tint: ${cc.tint};`}>
+              <div class="cpl-meta">
+                <span class="chunk-badge">{cc.short}</span>
+                <span class="chunk-status-dot status-{chunkView.chunk.status}"></span>
                 <button class="chunk-close-btn" type="button" onclick={closeChunkView} aria-label="Close chunk notes">
-                  Close
+                  <svg viewBox="0 0 16 16" fill="none" width="14" height="14">
+                    <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+                  </svg>
                 </button>
               </div>
+              {#if chunkView.chunk.title}
+                <h2 class="cpl-title">{chunkView.chunk.title}</h2>
+              {:else if chunkView.chunk.subject}
+                <h2 class="cpl-title">Proof of {chunkView.chunk.subject}</h2>
+              {/if}
+              <div class="cpl-body" role="presentation" onclick={onChunkBodyClick}>{@html chunkViewBodyHtml}</div>
             </div>
 
-            <div class="chunk-sheet-surface" class:mode-erase={chunkMode === 'erase'} use:setupChunkCanvases>
-              <canvas bind:this={chunkDryCanvas} class="chunk-layer chunk-layer-dry"></canvas>
-              <canvas
-                bind:this={chunkWetCanvas}
-                class="chunk-layer chunk-layer-wet"
-                onpointerdown={onChunkPointerDown}
-                onpointermove={onChunkPointerMove}
-                onpointerup={onChunkPointerUp}
-                onpointercancel={onChunkPointerCancel}
-              ></canvas>
+            <!-- Right panel: tabs + content -->
+            <div class="chunk-panel-right" style={`--chunk-accent: ${cc.accent};`}>
+              <div class="chunk-tab-bar">
+                <button
+                  class="chunk-tab"
+                  class:active={chunkTab === 'ink'}
+                  onclick={() => chunkTab = 'ink'}
+                >
+                  <svg viewBox="0 0 16 16" fill="none" width="13" height="13">
+                    <path d="M3 13l1.8-0.7 7-7-1.1-1.1-7 7z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+                    <circle cx="3" cy="13" r="0.7" fill="currentColor"/>
+                  </svg>
+                  Ink
+                </button>
+                <button class="chunk-tab chunk-tab-todo" title="Coming soon">
+                  <svg viewBox="0 0 16 16" fill="none" width="13" height="13">
+                    <rect x="4" y="2" width="7" height="9" rx="0.8" stroke="currentColor" stroke-width="1.2"/>
+                    <path d="M3 12.5h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+                  </svg>
+                  Glossary
+                </button>
+                <button
+                  class="chunk-tab"
+                  class:active={chunkTab === 'ai'}
+                  onclick={() => chunkTab = 'ai'}
+                >
+                  AI
+                </button>
+              </div>
+
+              {#if chunkTab === 'ink'}
+                <div class="chunk-sheet-surface" class:mode-erase={chunkMode === 'erase'} use:setupChunkCanvases>
+                  <canvas bind:this={chunkDryCanvas} class="chunk-layer chunk-layer-dry"></canvas>
+                  <canvas
+                    bind:this={chunkWetCanvas}
+                    class="chunk-layer chunk-layer-wet"
+                    onpointerdown={onChunkPointerDown}
+                    onpointermove={onChunkPointerMove}
+                    onpointerup={onChunkPointerUp}
+                    onpointercancel={onChunkPointerCancel}
+                  ></canvas>
+                  <div class="chunk-ink-bar">
+                    <button
+                      class="chunk-tool-btn"
+                      class:active={chunkMode === 'draw'}
+                      onclick={() => chunkMode = 'draw'}
+                      aria-label="Draw"
+                      aria-pressed={chunkMode === 'draw'}
+                    >
+                      <svg viewBox="0 0 18 18" fill="none" width="16" height="16">
+                        <path d="M3.5 14.5l2.2-0.9 8-8-1.3-1.3-8 8z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+                        <circle cx="3.5" cy="14.5" r="0.8" fill="currentColor"/>
+                      </svg>
+                    </button>
+                    <button
+                      class="chunk-tool-btn"
+                      class:active={chunkMode === 'erase'}
+                      onclick={() => chunkMode = 'erase'}
+                      aria-label="Erase"
+                      aria-pressed={chunkMode === 'erase'}
+                    >
+                      <svg viewBox="0 0 18 18" fill="none" width="16" height="16">
+                        <path d="M12 4L7.5 8.5l-2.5 2.5H3v-2.5l4.5-4.5z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+              {:else if chunkTab === 'glossary'}
+                <div class="chunk-tab-placeholder">
+                  <p>Glossary — coming soon</p>
+                </div>
+              {:else if chunkTab === 'ai'}
+                <div class="chunk-ai-pane">
+                  <div class="chunk-ai-transcript" bind:this={chunkChatTranscript}>
+                    {#if chunkChatMessages.length === 0}
+                      <div class="chunk-ai-empty">
+                        <p>Ask about this chunk.</p>
+                        <p>The AI sees the book title and this chunk&apos;s processed body text.</p>
+                      </div>
+                    {:else}
+                      {#each chunkChatMessages as message (message.id)}
+                        <article
+                          class="chunk-chat-message"
+                          class:user={message.role === "user"}
+                          class:assistant={message.role === "assistant"}
+                        >
+                          <div class="chunk-chat-meta">
+                            <span>{message.role === "user" ? "You" : "AI"}</span>
+                            {#if message.role === "assistant" && message.state === "streaming"}
+                              <span>Streaming...</span>
+                            {:else if message.role === "assistant" && message.state === "stopped"}
+                              <span>Stopped</span>
+                            {:else if message.role === "assistant" && message.state === "error"}
+                              <span>Error</span>
+                            {/if}
+                          </div>
+                          {#if message.role === "assistant" && message.state === "complete" && message.html}
+                            <div class="chunk-chat-bubble assistant-bubble rendered">{@html message.html}</div>
+                          {:else}
+                            <div
+                              class="chunk-chat-bubble"
+                              class:user-bubble={message.role === "user"}
+                              class:assistant-bubble={message.role === "assistant"}
+                              class:is-error={message.role === "assistant" && message.state === "error"}
+                            >
+                              {message.content || (message.role === "assistant" && message.state === "streaming" ? "Thinking..." : "")}
+                            </div>
+                          {/if}
+                        </article>
+                      {/each}
+                    {/if}
+                  </div>
+
+                  <div class="chunk-ai-status-row">
+                    {#if chunkChatLoadingContext}
+                      <span class="chunk-ai-status">Preparing context...</span>
+                    {/if}
+                    {#if chunkChatError}
+                      <span class="chunk-ai-error">{chunkChatError}</span>
+                    {/if}
+                  </div>
+
+                  <div class="chunk-ai-composer">
+                    <textarea
+                      bind:value={chunkChatDraft}
+                      class="chunk-ai-input"
+                      rows="3"
+                      placeholder="Ask about this chunk..."
+                      onkeydown={onChunkChatKeydown}
+                      disabled={chunkChatStreaming || chunkChatLoadingContext}
+                    ></textarea>
+                    <div class="chunk-ai-actions">
+                      {#if chunkChatStreaming}
+                        <button class="chunk-ai-action chunk-ai-stop" type="button" onclick={stopChunkChat}>
+                          Stop
+                        </button>
+                      {/if}
+                      <button
+                        class="chunk-ai-action chunk-ai-send"
+                        type="button"
+                        onclick={sendChunkChatMessage}
+                        disabled={chunkChatStreaming || chunkChatLoadingContext || !chunkChatDraft.trim()}
+                      >
+                        Send
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              {/if}
             </div>
+
           </div>
         </div>
+      {/if}
+
+      {#if chunkPeek}
+        <ChunkPeek
+          chunkId={chunkPeek.chunkId}
+          anchorRect={chunkPeek.anchorRect}
+          colours={CHUNK_COLOURS}
+          onEnsureBody={ensureChunkFormattedBody}
+          onOpen={onPeekOpen}
+          onClose={onPeekClose}
+        />
       {/if}
 
       {#if aiDebugImage}
@@ -2488,9 +3284,18 @@
     <div class="library">
       <div class="library-header">
         <h1>Gloss</h1>
-        <button onclick={importPdf} disabled={importing} class="import-btn">
-          {importing ? "Importing…" : "Import PDF"}
-        </button>
+        <div class="library-actions">
+          <button
+            class="ai-settings-btn"
+            onclick={() => openAiKeySettings(false)}
+            type="button"
+          >
+            AI keys
+          </button>
+          <button onclick={importPdf} disabled={importing} class="import-btn">
+            {importing ? "Importing…" : "Import PDF"}
+          </button>
+        </div>
       </div>
 
       {#if error}
@@ -2511,6 +3316,117 @@
           {/each}
         </ul>
       {/if}
+    </div>
+  {/if}
+
+  {#if showAiKeySheet}
+    <div class="ai-key-backdrop" onclick={dismissAiKeySettings}>
+      <section
+        class="ai-key-sheet"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="ai-key-title"
+        transition:fade={{ duration: 120 }}
+        onclick={(event) => event.stopPropagation()}
+      >
+        <div class="ai-key-heading">
+          <div>
+            <p class="ai-key-kicker">{aiKeySheetFirstRun ? "First run" : "Settings"}</p>
+            <h2 id="ai-key-title">AI keys</h2>
+          </div>
+          <button
+            class="ai-key-close"
+            type="button"
+            onclick={dismissAiKeySettings}
+            disabled={aiSettingsSaving}
+            aria-label="Close AI keys"
+          >
+            <svg viewBox="0 0 16 16" fill="none" width="14" height="14">
+              <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+
+        <p class="ai-key-copy">
+          Optional. Add an OpenAI or Gemini key for AI chunking and chat.
+        </p>
+
+        {#if aiSettingsError}
+          <p class="ai-key-error">{aiSettingsError}</p>
+        {/if}
+
+        <form class="ai-key-form" onsubmit={saveAiKeyForm}>
+          <label class="ai-key-field">
+            <span>
+              OpenAI API key
+              {#if aiSettings?.openai_api_key_set}
+                <em>Saved</em>
+              {/if}
+            </span>
+            <input
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder={aiSettings?.openai_api_key_set ? "Leave blank to keep saved key" : "sk-..."}
+              bind:value={openaiApiKeyInput}
+              disabled={clearOpenaiApiKey || aiSettingsSaving}
+            />
+          </label>
+
+          {#if aiSettings?.openai_api_key_set}
+            <label class="ai-key-clear">
+              <input
+                type="checkbox"
+                bind:checked={clearOpenaiApiKey}
+                disabled={aiSettingsSaving}
+              />
+              Clear OpenAI key
+            </label>
+          {/if}
+
+          <label class="ai-key-field">
+            <span>
+              Gemini API key
+              {#if aiSettings?.gemini_api_key_set}
+                <em>Saved</em>
+              {/if}
+            </span>
+            <input
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder={aiSettings?.gemini_api_key_set ? "Leave blank to keep saved key" : "AIza..."}
+              bind:value={geminiApiKeyInput}
+              disabled={clearGeminiApiKey || aiSettingsSaving}
+            />
+          </label>
+
+          {#if aiSettings?.gemini_api_key_set}
+            <label class="ai-key-clear">
+              <input
+                type="checkbox"
+                bind:checked={clearGeminiApiKey}
+                disabled={aiSettingsSaving}
+              />
+              Clear Gemini key
+            </label>
+          {/if}
+
+          <div class="ai-key-actions">
+            <button
+              class="ai-key-secondary"
+              type="button"
+              onclick={dismissAiKeySettings}
+              disabled={aiSettingsSaving}
+            >
+              {aiKeySheetFirstRun ? "Skip" : "Cancel"}
+            </button>
+            <button class="ai-key-primary" type="submit" disabled={aiSettingsSaving}>
+              {aiSettingsSaving ? "Saving..." : "Save"}
+            </button>
+          </div>
+        </form>
+      </section>
     </div>
   {/if}
 </main>
@@ -2553,7 +3469,16 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 1rem;
     margin-bottom: 0.5rem;
+  }
+
+  .library-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
 
   h1 {
@@ -2788,7 +3713,7 @@
   .layer-dry  { pointer-events: none; }
   /* .layer-wet receives all pointer events — no overrides needed */
 
-  /* ── Controls bar ── */
+  /* ── Chunk note sheet ── */
   .chunk-sheet-backdrop {
     position: absolute;
     inset: 0;
@@ -2803,84 +3728,259 @@
 
   .chunk-sheet {
     width: min(920px, 100%);
-    height: min(720px, 100%);
+    height: min(680px, 100%);
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
     overflow: hidden;
-    background: rgba(255, 255, 255, 0.97);
-    border: 1px solid rgba(41, 52, 76, 0.14);
-    border-radius: 18px;
+    background: #fff;
+    border: 1px solid rgba(41, 52, 76, 0.12);
+    border-radius: 16px;
     box-shadow: 0 24px 60px rgba(17, 25, 40, 0.24);
   }
 
-  .chunk-sheet-header {
+  /* Left panel */
+  .chunk-panel-left {
+    width: 240px;
+    flex-shrink: 0;
+    border-right: 1px solid rgba(0, 0, 0, 0.07);
     display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 1rem;
-    padding: 1rem 1rem 0.85rem;
-    border-bottom: 1px solid rgba(41, 52, 76, 0.1);
+    flex-direction: column;
+    overflow: hidden;
+    background: #f9fafb;
+    border-left: 3px solid var(--chunk-accent);
   }
 
-  .chunk-sheet-copy h2 {
-    margin: 0.45rem 0 0.2rem;
-    font-size: 1.05rem;
-    font-weight: 700;
-    color: #213047;
-  }
-
-  .chunk-sheet-copy p {
-    margin: 0;
-    color: #627089;
-    font-size: 0.9rem;
-  }
-
-  .chunk-type-pill {
-    display: inline-flex;
-    align-items: center;
-    padding: 0.32rem 0.65rem;
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--chunk-accent) 20%, white);
-    color: #243041;
-    font-size: 0.78rem;
-    font-weight: 700;
-    letter-spacing: 0.02em;
-    text-transform: uppercase;
-  }
-
-  .chunk-sheet-actions {
+  .cpl-meta {
     display: flex;
     align-items: center;
-    gap: 0.35rem;
+    gap: 7px;
+    padding: 10px 12px 10px 10px;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.06);
     flex-shrink: 0;
   }
 
-  .chunk-close-btn {
-    padding: 0.55rem 0.85rem;
-    border-radius: 10px;
-    background: #1f2f49;
-    color: #fff;
-    font-size: 0.88rem;
-    font-weight: 600;
+  .chunk-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    background: var(--chunk-tint);
+    color: var(--chunk-accent);
+    line-height: 15px;
   }
 
-  .chunk-close-btn:hover {
-    background: #152238 !important;
+  .chunk-status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .chunk-status-dot.status-complete      { background: oklch(0.62 0.14 145); }
+  .chunk-status-dot.status-in_progress   { background: oklch(0.72 0.13 65); }
+  .chunk-status-dot.status-incomplete    { border: 1.5px solid #9ca3af; }
+
+  .chunk-close-btn {
+    margin-left: auto;
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    color: #6b7280;
+    flex-shrink: 0;
+  }
+
+  .chunk-close-btn:hover { background: #f3f4f6; color: #374151; }
+
+  .cpl-title {
+    padding: 9px 12px 2px 10px;
+    font-size: 13.5px;
+    font-style: italic;
+    font-weight: 400;
+    color: #111827;
+    font-family: Georgia, 'Times New Roman', serif;
+    flex-shrink: 0;
+  }
+
+  .cpl-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 7px 12px 14px 10px;
+    font-size: 12px;
+    line-height: 1.65;
+    color: #4b5563;
+    font-family: Georgia, 'Times New Roman', serif;
+  }
+
+  .cpl-body:empty::after {
+    content: 'No text extracted yet.';
+    color: #9ca3af;
+    font-style: italic;
+  }
+
+  .cpl-body :global(p) {
+    margin: 0;
+  }
+
+  .cpl-body :global(a.chunk-xref) {
+    color: var(--chunk-accent);
+    text-decoration: none;
+    border-bottom: 1px dashed color-mix(in oklch, var(--chunk-accent) 55%, transparent);
+    cursor: pointer;
+    padding: 0 1px;
+    border-radius: 2px;
+  }
+
+  .cpl-body :global(a.chunk-xref:hover),
+  .cpl-body :global(a.chunk-xref:focus-visible) {
+    background: var(--chunk-tint);
+    outline: none;
+    border-bottom-style: solid;
+  }
+
+  .cpl-body :global(p + p) {
+    margin-top: 0.72em;
+  }
+
+  .cpl-body :global(h1),
+  .cpl-body :global(h2),
+  .cpl-body :global(h3),
+  .cpl-body :global(h4),
+  .cpl-body :global(h5),
+  .cpl-body :global(h6) {
+    margin: 0.9em 0 0;
+    color: #111827;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+
+  .cpl-body :global(h1:first-child),
+  .cpl-body :global(h2:first-child),
+  .cpl-body :global(h3:first-child),
+  .cpl-body :global(h4:first-child),
+  .cpl-body :global(h5:first-child),
+  .cpl-body :global(h6:first-child) {
+    margin-top: 0;
+  }
+
+  .cpl-body :global(h1) { font-size: 1.28em; }
+  .cpl-body :global(h2) { font-size: 1.18em; }
+  .cpl-body :global(h3) { font-size: 1.1em; }
+  .cpl-body :global(h4),
+  .cpl-body :global(h5),
+  .cpl-body :global(h6) { font-size: 1em; }
+
+  .cpl-body :global(ol),
+  .cpl-body :global(ul) {
+    margin: 0.55em 0 0;
+    padding-left: 1.15rem;
+  }
+
+  .cpl-body :global(li + li) {
+    margin-top: 0.22rem;
+  }
+
+  .cpl-body :global(.chunk-math-display) {
+    margin: 0.6em 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .cpl-body :global(.chunk-math-display + .chunk-math-display) {
+    margin-top: 0.2em;
+  }
+
+  .cpl-body :global(.katex-display) {
+    margin: 0;
+  }
+
+  .cpl-body :global(code) {
+    padding: 0.05em 0.32em;
+    border-radius: 4px;
+    background: rgba(15, 23, 42, 0.06);
+    font-size: 0.92em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  .cpl-body :global(pre) {
+    margin: 0.65em 0 0;
+    padding: 0.65em 0.75em;
+    border-radius: 8px;
+    background: rgba(15, 23, 42, 0.05);
+    overflow-x: auto;
+  }
+
+  .cpl-body :global(pre code) {
+    padding: 0;
+    background: transparent;
+  }
+
+  .cpl-body :global(a) {
+    color: var(--chunk-accent);
+    text-decoration-thickness: 0.08em;
+    text-underline-offset: 0.12em;
+  }
+
+  /* Right panel */
+  .chunk-panel-right {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .chunk-tab-bar {
+    display: flex;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.07);
+    background: #fff;
+    flex-shrink: 0;
+  }
+
+  .chunk-tab {
+    height: 36px;
+    padding: 0 14px;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    font-weight: 400;
+    color: #6b7280;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    cursor: pointer;
+    transition: color 0.12s;
+    user-select: none;
+  }
+
+  .chunk-tab.active {
+    font-weight: 600;
+    color: var(--chunk-accent);
+    border-bottom-color: var(--chunk-accent);
+  }
+
+  .chunk-tab-todo {
+    opacity: 0.4;
+    cursor: default;
+    pointer-events: none;
   }
 
   .chunk-sheet-surface {
     position: relative;
     flex: 1;
     min-height: 0;
-    background:
-      radial-gradient(circle at top left, rgba(239, 207, 90, 0.16), transparent 28%),
-      linear-gradient(180deg, #fbfcfe 0%, #f2f5fa 100%);
+    background: linear-gradient(180deg, #fbfcfe 0%, #f2f5fa 100%);
     touch-action: none;
   }
 
-  .chunk-sheet-surface.mode-erase {
-    cursor: cell;
-  }
+  .chunk-sheet-surface.mode-erase { cursor: cell; }
 
   .chunk-layer {
     position: absolute;
@@ -2889,28 +3989,291 @@
     height: 100%;
   }
 
-  .chunk-layer-dry {
-    pointer-events: none;
+  .chunk-layer-dry { pointer-events: none; }
+
+  .chunk-ink-bar {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    padding: 0 8px;
+    gap: 2px;
+    background: rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(6px);
+    border-top: 1px solid rgba(0, 0, 0, 0.07);
+  }
+
+  .chunk-tool-btn {
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    color: #6b7280;
+    cursor: pointer;
+    transition: background 0.1s, color 0.1s;
+  }
+
+  .chunk-tool-btn:hover  { background: #f3f4f6; color: #374151; }
+  .chunk-tool-btn.active { background: #f3f4f6; color: #111827; }
+
+  .chunk-tab-placeholder {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #9ca3af;
+    font-size: 13px;
+    font-style: italic;
+  }
+
+  .chunk-ai-pane {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: linear-gradient(180deg, #fbfcfe 0%, #f4f7fb 100%);
+  }
+
+  .chunk-ai-transcript {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 14px 16px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .chunk-ai-empty {
+    margin: auto 0;
+    padding: 18px 16px;
+    border-radius: 14px;
+    border: 1px dashed rgba(148, 163, 184, 0.7);
+    background: rgba(255, 255, 255, 0.78);
+    color: #64748b;
+    font-size: 13px;
+    line-height: 1.55;
+  }
+
+  .chunk-ai-empty p {
+    margin: 0;
+  }
+
+  .chunk-ai-empty p + p {
+    margin-top: 0.45rem;
+  }
+
+  .chunk-chat-message {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .chunk-chat-message.user {
+    align-items: flex-end;
+  }
+
+  .chunk-chat-message.assistant {
+    align-items: flex-start;
+  }
+
+  .chunk-chat-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #7b8798;
+  }
+
+  .chunk-chat-bubble {
+    width: fit-content;
+    max-width: min(100%, 540px);
+    padding: 12px 14px;
+    border-radius: 14px;
+    border: 1px solid rgba(203, 213, 225, 0.9);
+    background: #fff;
+    color: #1f2937;
+    font-size: 13px;
+    line-height: 1.58;
+    white-space: pre-wrap;
+    word-break: break-word;
+    box-shadow: 0 6px 18px rgba(15, 23, 42, 0.05);
+  }
+
+  .chunk-chat-bubble.user-bubble {
+    background: color-mix(in oklch, var(--chunk-accent) 11%, white);
+    border-color: color-mix(in oklch, var(--chunk-accent) 28%, white);
+    color: #142033;
+  }
+
+  .chunk-chat-bubble.assistant-bubble {
+    background: rgba(255, 255, 255, 0.94);
+  }
+
+  .chunk-chat-bubble.is-error {
+    background: #fff5f5;
+    border-color: #f1b7b7;
+    color: #991b1b;
+  }
+
+  .chunk-chat-bubble.rendered {
+    white-space: normal;
+    font-family: Georgia, 'Times New Roman', serif;
+  }
+
+  .chunk-chat-bubble.rendered :global(p) {
+    margin: 0;
+  }
+
+  .chunk-chat-bubble.rendered :global(p + p) {
+    margin-top: 0.72em;
+  }
+
+  .chunk-chat-bubble.rendered :global(ol),
+  .chunk-chat-bubble.rendered :global(ul) {
+    margin: 0.55em 0 0;
+    padding-left: 1.15rem;
+  }
+
+  .chunk-chat-bubble.rendered :global(li + li) {
+    margin-top: 0.22rem;
+  }
+
+  .chunk-chat-bubble.rendered :global(.chunk-math-display) {
+    margin: 0.6em 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .chunk-chat-bubble.rendered :global(.katex-display) {
+    margin: 0;
+  }
+
+  .chunk-chat-bubble.rendered :global(code) {
+    padding: 0.05em 0.32em;
+    border-radius: 4px;
+    background: rgba(15, 23, 42, 0.06);
+    font-size: 0.92em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  .chunk-chat-bubble.rendered :global(pre) {
+    margin: 0.65em 0 0;
+    padding: 0.65em 0.75em;
+    border-radius: 8px;
+    background: rgba(15, 23, 42, 0.05);
+    overflow-x: auto;
+  }
+
+  .chunk-chat-bubble.rendered :global(pre code) {
+    padding: 0;
+    background: transparent;
+  }
+
+  .chunk-chat-bubble.rendered :global(a) {
+    color: var(--chunk-accent);
+    text-decoration-thickness: 0.08em;
+    text-underline-offset: 0.12em;
+  }
+
+  .chunk-ai-status-row {
+    min-height: 18px;
+    padding: 0 16px 8px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .chunk-ai-status {
+    font-size: 12px;
+    color: #64748b;
+  }
+
+  .chunk-ai-error {
+    font-size: 12px;
+    color: #b42318;
+  }
+
+  .chunk-ai-composer {
+    padding: 0 16px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .chunk-ai-input {
+    width: 100%;
+    min-height: 86px;
+    resize: vertical;
+    padding: 12px 14px;
+    border: 1px solid rgba(203, 213, 225, 0.95);
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.96);
+    color: #1f2937;
+    font: inherit;
+    line-height: 1.5;
+  }
+
+  .chunk-ai-input:focus {
+    outline: none;
+    border-color: color-mix(in oklch, var(--chunk-accent) 55%, white);
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--chunk-accent) 16%, transparent);
+  }
+
+  .chunk-ai-input:disabled {
+    background: #f8fafc;
+    color: #94a3b8;
+  }
+
+  .chunk-ai-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .chunk-ai-action {
+    min-width: 88px;
+    height: 36px;
+    padding: 0 14px;
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 600;
+    transition: transform 0.12s, opacity 0.12s, background 0.12s;
+  }
+
+  .chunk-ai-action:hover:not(:disabled) {
+    transform: translateY(-1px);
+  }
+
+  .chunk-ai-action:disabled {
+    opacity: 0.5;
+  }
+
+  .chunk-ai-send {
+    background: var(--chunk-accent);
+    color: #fff;
+  }
+
+  .chunk-ai-stop {
+    background: #eef2f7;
+    color: #334155;
+    border: 1px solid rgba(148, 163, 184, 0.45);
   }
 
   @media (max-width: 720px) {
-    .chunk-sheet-backdrop {
-      padding: 0.65rem;
-    }
-
-    .chunk-sheet {
-      width: 100%;
-      height: 100%;
-    }
-
-    .chunk-sheet-header {
-      flex-direction: column;
-      align-items: stretch;
-    }
-
-    .chunk-sheet-actions {
-      justify-content: flex-end;
-    }
+    .chunk-sheet-backdrop { padding: 0.5rem; }
+    .chunk-sheet { width: 100%; height: 100%; border-radius: 12px; flex-direction: column; }
+    .chunk-panel-left { width: 100%; max-height: 180px; border-right: none; border-bottom: 1px solid rgba(0,0,0,0.07); border-left: none; border-top: 3px solid var(--chunk-accent); }
   }
 
   .controls {

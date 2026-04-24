@@ -1,0 +1,11 @@
+C:\Users\kdleg\OneDrive\Desktop\Gloss\src-tauri\target-codex-gemini\debug\deps\utf16string-e334ef0d0a26bdcd.d: C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\lib.rs C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\error.rs C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\iters.rs C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\slicing.rs C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\utf16.rs C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\wstr.rs C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\wstring.rs
+
+C:\Users\kdleg\OneDrive\Desktop\Gloss\src-tauri\target-codex-gemini\debug\deps\libutf16string-e334ef0d0a26bdcd.rmeta: C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\lib.rs C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\error.rs C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\iters.rs C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\slicing.rs C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\utf16.rs C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\wstr.rs C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\wstring.rs
+
+C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\lib.rs:
+C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\error.rs:
+C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\iters.rs:
+C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\slicing.rs:
+C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\utf16.rs:
+C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\wstr.rs:
+C:\Users\kdleg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\utf16string-0.2.0\src\wstring.rs:

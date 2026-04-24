@@ -9,9 +9,12 @@
 // Progress is reported via Tauri events (`chunking_progress`) so the frontend can
 // re-render the overlay as chunks land.
 
+use crate::gemini::GeminiClient;
 use crate::llm::{BlockForPrompt, GroupedChunk, LlmProvider};
 use crate::ollama::OllamaClient;
 use crate::openai::OpenAiClient;
+use crate::references;
+use crate::settings;
 use crate::PdfiumWorker;
 use log::{debug, error, info, warn};
 use pdfium_render::prelude::*;
@@ -200,7 +203,7 @@ async fn run_inner(
         return Ok(());
     }
 
-    let use_llm = provider_health_check(provider).await;
+    let use_llm = provider_health_check(pool, provider).await;
     info!(
         target: "gloss_lib::chunking",
         "doc_id={} page={} provider={} available={}",
@@ -230,10 +233,17 @@ async fn run_inner(
     );
 
     let used_llm = if use_llm {
-        match try_llm_chunking(provider, &blocks).await {
+        match try_llm_chunking(pool, provider, &blocks).await {
             Ok(groups) if validate_groups(&groups, &blocks) => {
                 persist_chunks(pool, doc_id, page_id, &blocks, &groups, true).await?;
                 link_proofs_to_theorems(pool, page_id).await?;
+                if let Err(e) = references::reindex_document_references(pool, doc_id).await {
+                    warn!(
+                        target: "gloss_lib::chunking",
+                        "doc_id={} page={} reference reindex failed: {}",
+                        doc_id, page_number, e
+                    );
+                }
                 info!(
                     target: "gloss_lib::chunking",
                     "doc_id={} page={} provider={} persisted {} LLM chunk groups",
@@ -346,7 +356,7 @@ async fn rechunk_inner(
     }
 
     set_status(pool, doc_id, "grouping").await?;
-    let groups = try_llm_chunking(provider, &blocks).await?;
+    let groups = try_llm_chunking(pool, provider, &blocks).await?;
     if !validate_groups(&groups, &blocks) {
         return Err(format!(
             "received invalid {} grouping with {} groups",
@@ -357,19 +367,29 @@ async fn rechunk_inner(
 
     replace_chunks(pool, doc_id, page_id, &blocks, &groups, true).await?;
     link_proofs_to_theorems(pool, page_id).await?;
+    if let Err(e) = references::reindex_document_references(pool, doc_id).await {
+        warn!(
+            target: "gloss_lib::chunking",
+            "doc_id={} page={} reference reindex failed: {}",
+            doc_id, page_number, e
+        );
+    }
     emit_progress(app, doc_id, page_number, "grouped");
     set_status(pool, doc_id, "done").await?;
     Ok(())
 }
 
-async fn provider_health_check(provider: LlmProvider) -> bool {
+async fn provider_health_check(pool: &SqlitePool, provider: LlmProvider) -> bool {
+    let api_key = configured_api_key(pool, provider).await;
     match provider {
         LlmProvider::Ollama => OllamaClient::new().health_check().await,
-        LlmProvider::OpenAI => OpenAiClient::new().health_check().await,
+        LlmProvider::OpenAI => OpenAiClient::with_api_key(api_key).health_check().await,
+        LlmProvider::Gemini => GeminiClient::with_api_key(api_key).health_check().await,
     }
 }
 
 async fn try_llm_chunking(
+    pool: &SqlitePool,
     provider: LlmProvider,
     blocks: &[PersistedBlock],
 ) -> Result<Vec<GroupedChunk>, String> {
@@ -381,15 +401,35 @@ async fn try_llm_chunking(
         })
         .collect();
 
+    let api_key = configured_api_key(pool, provider).await;
     match provider {
         LlmProvider::Ollama => OllamaClient::new()
             .chunk_blocks(&prompt_blocks)
             .await
             .map_err(|e| e.to_string()),
-        LlmProvider::OpenAI => OpenAiClient::new()
+        LlmProvider::OpenAI => OpenAiClient::with_api_key(api_key)
             .chunk_blocks(&prompt_blocks)
             .await
             .map_err(|e| e.to_string()),
+        LlmProvider::Gemini => GeminiClient::with_api_key(api_key)
+            .chunk_blocks(&prompt_blocks)
+            .await
+            .map_err(|e| e.to_string()),
+    }
+}
+
+async fn configured_api_key(pool: &SqlitePool, provider: LlmProvider) -> Option<String> {
+    match settings::api_key_for_provider(pool, provider).await {
+        Ok(api_key) => api_key,
+        Err(err) => {
+            warn!(
+                target: "gloss_lib::chunking",
+                "failed to load API key for provider={}: {}",
+                provider,
+                err
+            );
+            None
+        }
     }
 }
 
@@ -506,7 +546,10 @@ async fn load_unchunked_blocks(
         .collect())
 }
 
-async fn load_blocks_for_page(pool: &SqlitePool, page_id: i64) -> Result<Vec<PersistedBlock>, String> {
+async fn load_blocks_for_page(
+    pool: &SqlitePool,
+    page_id: i64,
+) -> Result<Vec<PersistedBlock>, String> {
     let rows = sqlx::query(
         "SELECT id, text, bbox_x, bbox_y, bbox_w, bbox_h \
          FROM text_blocks WHERE page_id = ? ORDER BY order_idx",
@@ -557,15 +600,7 @@ async fn replace_chunks(
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
-    persist_chunks_in_tx(
-        &mut tx,
-        doc_id,
-        page_id,
-        blocks,
-        groups,
-        ai_suggested,
-    )
-    .await?;
+    persist_chunks_in_tx(&mut tx, doc_id, page_id, blocks, groups, ai_suggested).await?;
     tx.commit().await.map_err(|e| e.to_string())?;
     debug!(
         target: "gloss_lib::chunking",
@@ -625,6 +660,40 @@ async fn persist_chunks_in_tx(
         .await
         .map_err(|e| e.to_string())?;
         let chunk_id: i64 = row.get("id");
+
+        info!(
+            target: "gloss_lib::chunking",
+            "persisted chunk_id={} type={} title={:?} alias_count={}",
+            chunk_id, chunk_type, g.title, g.aliases.len()
+        );
+
+        for alias in &g.aliases {
+            let text = alias.text.trim();
+            let kind = alias.kind.trim();
+            if text.is_empty() || (kind != "numeric_label" && kind != "canonical_name") {
+                debug!(
+                    target: "gloss_lib::chunking",
+                    "dropping alias text={:?} kind={:?} for chunk_id={}",
+                    text, kind, chunk_id
+                );
+                continue;
+            }
+            debug!(
+                target: "gloss_lib::chunking",
+                "alias chunk_id={} kind={} text={:?}",
+                chunk_id, kind, text
+            );
+            sqlx::query(
+                "INSERT OR IGNORE INTO chunk_aliases (chunk_id, alias, alias_kind) \
+                 VALUES (?, ?, ?)",
+            )
+            .bind(chunk_id)
+            .bind(text)
+            .bind(kind)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
 
         for id in &g.block_ids {
             sqlx::query("UPDATE text_blocks SET chunk_id = ? WHERE id = ?")
