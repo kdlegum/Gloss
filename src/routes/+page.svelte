@@ -24,6 +24,8 @@
     setup_complete: boolean;
     openai_api_key_set: boolean;
     gemini_api_key_set: boolean;
+    deepseek_api_key_set: boolean;
+    zai_api_key_set: boolean;
   }
 
   interface RenderedPdfBitmap {
@@ -34,14 +36,127 @@
     pageHeightPoints: number;
   }
 
-  type ChunkingProvider = "ollama" | "openai" | "gemini";
+  type ChunkingProvider = "ollama" | "openai" | "gemini" | "deepseek";
+  type ChatProvider = "ollama" | "openai" | "gemini" | "deepseek";
+  type VisionProvider = "ollama" | "openai" | "gemini" | "zai";
+  type AnyProvider = ChunkingProvider | VisionProvider;
+  type AiTask = "chunking" | "chat" | "vision";
 
-  const CHUNKING_PROVIDER_STORAGE_KEY = "gloss_chunking_provider";
-  function isChunkingProvider(value: string | null): value is ChunkingProvider {
-    return value === "ollama" || value === "openai" || value === "gemini";
+  interface AiTaskSettings {
+    chunking: { provider: ChunkingProvider; model: string };
+    chat: { provider: ChatProvider; model: string };
+    vision: { provider: VisionProvider; model: string };
   }
 
-  function getChunkingProviderLabel(provider: ChunkingProvider) {
+  interface ModelOption {
+    value: string;
+    label: string;
+    legacy?: boolean;
+  }
+
+  interface EnsureChunkingRangeResult {
+    requested_start_page: number;
+    requested_end_page: number;
+    started_pages: number;
+    skipped_pages: number;
+  }
+
+  const LEGACY_CHUNKING_PROVIDER_STORAGE_KEY = "gloss_chunking_provider";
+  const AI_TASK_SETTINGS_STORAGE_KEY = "gloss_ai_task_settings_v1";
+  const CUSTOM_MODEL_VALUE = "__custom__";
+
+  const CHUNKING_PROVIDER_OPTIONS: Array<{ value: ChunkingProvider; label: string; short: string }> = [
+    { value: "ollama", label: "Ollama", short: "OL" },
+    { value: "openai", label: "OpenAI", short: "OA" },
+    { value: "gemini", label: "Gemini", short: "GM" },
+    { value: "deepseek", label: "DeepSeek", short: "DS" },
+  ];
+
+  const CHAT_PROVIDER_OPTIONS: Array<{ value: ChatProvider; label: string; short: string }> = [
+    { value: "ollama", label: "Ollama", short: "OL" },
+    { value: "openai", label: "OpenAI", short: "OA" },
+    { value: "gemini", label: "Gemini", short: "GM" },
+    { value: "deepseek", label: "DeepSeek", short: "DS" },
+  ];
+
+  const VISION_PROVIDER_OPTIONS: Array<{ value: VisionProvider; label: string; short: string }> = [
+    { value: "ollama", label: "Ollama", short: "OL" },
+    { value: "openai", label: "OpenAI", short: "OA" },
+    { value: "gemini", label: "Gemini", short: "GM" },
+    { value: "zai", label: "Z.AI", short: "ZA" },
+  ];
+
+  const CHUNKING_MODEL_OPTIONS: Record<ChunkingProvider, ModelOption[]> = {
+    ollama: [
+      { value: "", label: "Auto (server default)" },
+    ],
+    openai: [
+      { value: "gpt-5.4-mini", label: "gpt-5.4-mini" },
+      { value: "gpt-5.4", label: "gpt-5.4" },
+      { value: "gpt-5-nano", label: "gpt-5-nano" },
+    ],
+    gemini: [
+      { value: "gemini-2.5-flash", label: "gemini-2.5-flash" },
+      { value: "gemini-2.5-flash-lite", label: "gemini-2.5-flash-lite" },
+    ],
+    deepseek: [
+      { value: "deepseek-v4-flash", label: "deepseek-v4-flash" },
+      { value: "deepseek-v4-pro", label: "deepseek-v4-pro" },
+      { value: "deepseek-reasoner", label: "deepseek-reasoner", legacy: true },
+    ],
+  };
+
+  const CHAT_MODEL_OPTIONS: Record<ChatProvider, ModelOption[]> = {
+    ollama: [
+      { value: "", label: "Auto (server default)" },
+    ],
+    openai: [
+      { value: "gpt-5.4-mini", label: "gpt-5.4-mini" },
+      { value: "gpt-5.4", label: "gpt-5.4" },
+      { value: "gpt-5-nano", label: "gpt-5-nano" },
+    ],
+    gemini: [
+      { value: "gemini-2.5-flash", label: "gemini-2.5-flash" },
+      { value: "gemini-2.5-flash-lite", label: "gemini-2.5-flash-lite" },
+    ],
+    deepseek: [
+      { value: "deepseek-v4-flash", label: "deepseek-v4-flash" },
+      { value: "deepseek-v4-pro", label: "deepseek-v4-pro" },
+      { value: "deepseek-reasoner", label: "deepseek-reasoner", legacy: true },
+    ],
+  };
+
+  const VISION_MODEL_OPTIONS: Record<VisionProvider, ModelOption[]> = {
+    ollama: [
+      { value: "", label: "Auto (server default)" },
+    ],
+    openai: [
+      { value: "gpt-5.4-mini", label: "gpt-5.4-mini" },
+      { value: "gpt-5.4", label: "gpt-5.4" },
+      { value: "gpt-5-nano", label: "gpt-5-nano" },
+    ],
+    gemini: [
+      { value: "gemini-2.5-flash", label: "gemini-2.5-flash" },
+      { value: "gemini-2.5-flash-lite", label: "gemini-2.5-flash-lite" },
+    ],
+    zai: [
+      { value: "glm-ocr", label: "glm-ocr" },
+    ],
+  };
+
+  function isChunkingProvider(value: string | null): value is ChunkingProvider {
+    return value === "ollama" || value === "openai" || value === "gemini" || value === "deepseek";
+  }
+
+  function isChatProvider(value: string | null): value is ChatProvider {
+    return value === "ollama" || value === "openai" || value === "gemini" || value === "deepseek";
+  }
+
+  function isVisionProvider(value: string | null): value is VisionProvider {
+    return value === "ollama" || value === "openai" || value === "gemini" || value === "zai";
+  }
+
+  function getProviderLabel(provider: AnyProvider): string {
     switch (provider) {
       case "ollama":
         return "Ollama";
@@ -49,14 +164,43 @@
         return "OpenAI";
       case "gemini":
         return "Gemini";
+      case "deepseek":
+        return "DeepSeek";
+      case "zai":
+        return "Z.AI";
     }
+  }
+
+  function getChunkingProviderLabel(provider: ChunkingProvider) {
+    return getProviderLabel(provider);
+  }
+
+  function getDefaultModelForTask(task: AiTask, provider: AnyProvider): string {
+    if (task === "chunking") {
+      const model = CHUNKING_MODEL_OPTIONS[provider as ChunkingProvider]?.[0]?.value;
+      return model ?? "";
+    }
+    if (task === "chat") {
+      const model = CHAT_MODEL_OPTIONS[provider as ChatProvider]?.[0]?.value;
+      return model ?? "";
+    }
+    const model = VISION_MODEL_OPTIONS[provider as VisionProvider]?.[0]?.value;
+    return model ?? "";
+  }
+
+  function defaultAiTaskSettings(): AiTaskSettings {
+    return {
+      chunking: { provider: "deepseek", model: "deepseek-v4-flash" },
+      chat: { provider: "gemini", model: "gemini-2.5-flash" },
+      vision: { provider: "zai", model: "glm-ocr" },
+    };
   }
 
   let sourceDocuments = $state<SourceDocument[]>([]);
   let importing = $state(false);
   let error = $state<string | null>(null);
   let detachLogConsole: (() => void) | null = null;
-  let chunkingProvider = $state<ChunkingProvider>("ollama");
+  let aiTaskSettings = $state<AiTaskSettings>(defaultAiTaskSettings());
   let currentChunkingStatus = $state("pending");
   let currentPageChunkingActive = $state(false);
   let reChunkingPage = $state(false);
@@ -65,10 +209,24 @@
   let aiKeySheetFirstRun = $state(false);
   let aiSettingsSaving = $state(false);
   let aiSettingsError = $state<string | null>(null);
+  let batchChunkStartInput = $state("1");
+  let batchChunkEndInput = $state("1");
+  let batchChunkStarting = $state(false);
+  let batchChunkError = $state<string | null>(null);
+  let batchChunkFeedback = $state<string | null>(null);
+  let customModelMode = $state<{ chunking: boolean; chat: boolean; vision: boolean }>({
+    chunking: false,
+    chat: false,
+    vision: false,
+  });
   let openaiApiKeyInput = $state("");
   let geminiApiKeyInput = $state("");
+  let deepseekApiKeyInput = $state("");
+  let zaiApiKeyInput = $state("");
   let clearOpenaiApiKey = $state(false);
   let clearGeminiApiKey = $state(false);
+  let clearDeepseekApiKey = $state(false);
+  let clearZaiApiKey = $state(false);
 
   function formatLogError(err: unknown): string {
     if (err instanceof Error) return err.message;
@@ -116,17 +274,20 @@
   }
 
   async function ensureChunkingForPage(sourceDocumentId: number, pageNumber: number, context: string) {
+    const provider = aiTaskSettings.chunking.provider;
+    const model = aiTaskSettings.chunking.model.trim();
     try {
       const started = await invoke<boolean>("ensure_chunking_for_page", {
         sourceDocumentId,
         pageNumber,
-        provider: chunkingProvider,
+        provider,
+        model: model.length > 0 ? model : null,
       });
       if (started && selectedBook?.id === sourceDocumentId) {
         currentChunkingStatus = "extracting";
       }
       await appLogInfo(
-        `[chunking] ${context}: doc=${sourceDocumentId} page=${pageNumber} provider=${chunkingProvider} ${started ? "started page chunking" : "page chunking already active or complete"}`,
+        `[chunking] ${context}: doc=${sourceDocumentId} page=${pageNumber} provider=${provider} model=${model || "auto"} ${started ? "started page chunking" : "page chunking already active or complete"}`,
       );
       void logChunkingStatus(sourceDocumentId, `${context} status`);
       void refreshCurrentPageChunkingActive(sourceDocumentId, pageNumber);
@@ -1369,31 +1530,219 @@
 
   // ── Page navigation ──
 
-  function loadChunkingProvider(): ChunkingProvider {
-    if (typeof localStorage === "undefined") return "ollama";
-    const stored = localStorage.getItem(CHUNKING_PROVIDER_STORAGE_KEY);
-    return isChunkingProvider(stored) ? stored : "ollama";
+  function getModelOptions(task: AiTask, provider: AnyProvider): ModelOption[] {
+    if (task === "chunking") return CHUNKING_MODEL_OPTIONS[provider as ChunkingProvider] ?? [];
+    if (task === "chat") return CHAT_MODEL_OPTIONS[provider as ChatProvider] ?? [];
+    return VISION_MODEL_OPTIONS[provider as VisionProvider] ?? [];
   }
 
-  function setChunkingProvider(provider: ChunkingProvider) {
-    if (chunkingProvider === provider) return;
-    chunkingProvider = provider;
-    localStorage.setItem(CHUNKING_PROVIDER_STORAGE_KEY, provider);
-    void appLogInfo(`[chunking] provider switched to ${provider}`);
+  function isModelInOptions(task: AiTask, provider: AnyProvider, model: string): boolean {
+    return getModelOptions(task, provider).some((option) => option.value === model);
+  }
+
+  function refreshCustomModelMode(settings: AiTaskSettings = aiTaskSettings) {
+    customModelMode = {
+      chunking: !isModelInOptions("chunking", settings.chunking.provider, settings.chunking.model),
+      chat: !isModelInOptions("chat", settings.chat.provider, settings.chat.model),
+      vision: !isModelInOptions("vision", settings.vision.provider, settings.vision.model),
+    };
+  }
+
+  function setCustomModelMode(task: AiTask, enabled: boolean) {
+    if (task === "chunking") {
+      customModelMode = { ...customModelMode, chunking: enabled };
+      return;
+    }
+    if (task === "chat") {
+      customModelMode = { ...customModelMode, chat: enabled };
+      return;
+    }
+    customModelMode = { ...customModelMode, vision: enabled };
+  }
+
+  function loadAiTaskSettings(): AiTaskSettings {
+    const defaults = defaultAiTaskSettings();
+    if (typeof localStorage === "undefined") return defaults;
+
+    let loaded = defaults;
+    const stored = localStorage.getItem(AI_TASK_SETTINGS_STORAGE_KEY);
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored) as Partial<AiTaskSettings>;
+        const chunkingProvider = isChunkingProvider(parsed?.chunking?.provider ?? null)
+          ? parsed.chunking!.provider
+          : defaults.chunking.provider;
+        const chunkingModel = typeof parsed?.chunking?.model === "string"
+          ? parsed.chunking.model.trim()
+          : "";
+
+        const chatProvider = isChatProvider(parsed?.chat?.provider ?? null)
+          ? parsed.chat!.provider
+          : defaults.chat.provider;
+        const chatModel = typeof parsed?.chat?.model === "string"
+          ? parsed.chat.model.trim()
+          : "";
+
+        const visionProvider = isVisionProvider(parsed?.vision?.provider ?? null)
+          ? parsed.vision!.provider
+          : defaults.vision.provider;
+        const visionModel = typeof parsed?.vision?.model === "string"
+          ? parsed.vision.model.trim()
+          : "";
+
+        loaded = {
+          chunking: {
+            provider: chunkingProvider,
+            model: chunkingModel || getDefaultModelForTask("chunking", chunkingProvider),
+          },
+          chat: {
+            provider: chatProvider,
+            model: chatModel || getDefaultModelForTask("chat", chatProvider),
+          },
+          vision: {
+            provider: visionProvider,
+            model: visionModel || getDefaultModelForTask("vision", visionProvider),
+          },
+        };
+      } catch {
+        loaded = defaults;
+      }
+    }
+
+    if (!stored) {
+      const legacy = localStorage.getItem(LEGACY_CHUNKING_PROVIDER_STORAGE_KEY);
+      if (isChunkingProvider(legacy)) {
+        loaded = {
+          ...loaded,
+          chunking: {
+            provider: legacy,
+            model: getDefaultModelForTask("chunking", legacy),
+          },
+        };
+      }
+    }
+
+    localStorage.setItem(AI_TASK_SETTINGS_STORAGE_KEY, JSON.stringify(loaded));
+    localStorage.removeItem(LEGACY_CHUNKING_PROVIDER_STORAGE_KEY);
+    return loaded;
+  }
+
+  function persistAiTaskSettings() {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(AI_TASK_SETTINGS_STORAGE_KEY, JSON.stringify(aiTaskSettings));
+  }
+
+  function updateAiTaskSetting(task: AiTask, next: { provider: AnyProvider; model: string }) {
+    if (task === "chunking") {
+      aiTaskSettings = {
+        ...aiTaskSettings,
+        chunking: {
+          provider: next.provider as ChunkingProvider,
+          model: next.model,
+        },
+      };
+    } else if (task === "chat") {
+      aiTaskSettings = {
+        ...aiTaskSettings,
+        chat: {
+          provider: next.provider as ChatProvider,
+          model: next.model,
+        },
+      };
+    } else {
+      aiTaskSettings = {
+        ...aiTaskSettings,
+        vision: {
+          provider: next.provider as VisionProvider,
+          model: next.model,
+        },
+      };
+    }
+    persistAiTaskSettings();
+  }
+
+  function setTaskProvider(task: AiTask, provider: AnyProvider) {
+    const defaultModel = getDefaultModelForTask(task, provider);
+    updateAiTaskSetting(task, { provider, model: defaultModel });
+    setCustomModelMode(task, false);
+    void appLogInfo(`[settings] ${task} provider switched to ${provider} model=${defaultModel || "auto"}`);
+  }
+
+  function setTaskModel(task: AiTask, model: string) {
+    if (task === "chunking") {
+      updateAiTaskSetting(task, {
+        provider: aiTaskSettings.chunking.provider,
+        model,
+      });
+      return;
+    }
+    if (task === "chat") {
+      updateAiTaskSetting(task, {
+        provider: aiTaskSettings.chat.provider,
+        model,
+      });
+      return;
+    }
+    updateAiTaskSetting(task, {
+      provider: aiTaskSettings.vision.provider,
+      model,
+    });
+  }
+
+  function modelSelectValue(task: AiTask): string {
+    const isCustom = task === "chunking"
+      ? customModelMode.chunking
+      : task === "chat"
+        ? customModelMode.chat
+        : customModelMode.vision;
+    if (isCustom) return CUSTOM_MODEL_VALUE;
+
+    const provider = task === "chunking"
+      ? aiTaskSettings.chunking.provider
+      : task === "chat"
+        ? aiTaskSettings.chat.provider
+        : aiTaskSettings.vision.provider;
+    const model = task === "chunking"
+      ? aiTaskSettings.chunking.model
+      : task === "chat"
+        ? aiTaskSettings.chat.model
+        : aiTaskSettings.vision.model;
+    const options = getModelOptions(task, provider);
+    return options.some((option) => option.value === model) ? model : CUSTOM_MODEL_VALUE;
+  }
+
+  function setModelFromSelect(task: AiTask, value: string) {
+    if (value === CUSTOM_MODEL_VALUE) {
+      setCustomModelMode(task, true);
+      return;
+    }
+    setCustomModelMode(task, false);
+    setTaskModel(task, value);
   }
 
   function openAiKeySettings(firstRun = false) {
     aiKeySheetFirstRun = firstRun;
     aiSettingsError = null;
+    batchChunkError = null;
+    batchChunkFeedback = null;
     openaiApiKeyInput = "";
     geminiApiKeyInput = "";
+    deepseekApiKeyInput = "";
+    zaiApiKeyInput = "";
     clearOpenaiApiKey = false;
     clearGeminiApiKey = false;
+    clearDeepseekApiKey = false;
+    clearZaiApiKey = false;
+    const defaultChunkPage = selectedBook
+      ? Math.max(1, Math.min(totalPages > 0 ? totalPages : currentPage, currentPage))
+      : 1;
+    batchChunkStartInput = String(defaultChunkPage);
+    batchChunkEndInput = String(defaultChunkPage);
     showAiKeySheet = true;
   }
 
   function closeAiKeySettings() {
-    if (aiSettingsSaving) return;
+    if (aiSettingsSaving || batchChunkStarting) return;
     showAiKeySheet = false;
     aiKeySheetFirstRun = false;
     aiSettingsError = null;
@@ -1403,14 +1752,42 @@
     aiSettings = state;
     if (!state.running_on_android) return;
 
-    if (chunkingProvider === "ollama") {
-      setChunkingProvider(
-        state.openai_api_key_set ? "openai" : state.gemini_api_key_set ? "gemini" : "openai",
-      );
-    } else if (chunkingProvider === "openai" && !state.openai_api_key_set && state.gemini_api_key_set) {
-      setChunkingProvider("gemini");
-    } else if (chunkingProvider === "gemini" && !state.gemini_api_key_set && state.openai_api_key_set) {
-      setChunkingProvider("openai");
+    let next = aiTaskSettings;
+    let changed = false;
+    if (next.chunking.provider === "ollama") {
+      next = {
+        ...next,
+        chunking: {
+          provider: "deepseek",
+          model: getDefaultModelForTask("chunking", "deepseek"),
+        },
+      };
+      changed = true;
+    }
+    if (next.chat.provider === "ollama") {
+      next = {
+        ...next,
+        chat: {
+          provider: "gemini",
+          model: getDefaultModelForTask("chat", "gemini"),
+        },
+      };
+      changed = true;
+    }
+    if (next.vision.provider === "ollama") {
+      next = {
+        ...next,
+        vision: {
+          provider: "zai",
+          model: getDefaultModelForTask("vision", "zai"),
+        },
+      };
+      changed = true;
+    }
+    if (changed) {
+      aiTaskSettings = next;
+      persistAiTaskSettings();
+      refreshCustomModelMode(next);
     }
   }
 
@@ -1432,11 +1809,17 @@
     try {
       const openaiKey = openaiApiKeyInput.trim();
       const geminiKey = geminiApiKeyInput.trim();
+      const deepseekKey = deepseekApiKeyInput.trim();
+      const zaiKey = zaiApiKeyInput.trim();
       const state = await invoke<AiSettingsState>("save_ai_api_keys", {
         openaiApiKey: openaiKey.length > 0 ? openaiKey : null,
         geminiApiKey: geminiKey.length > 0 ? geminiKey : null,
+        deepseekApiKey: deepseekKey.length > 0 ? deepseekKey : null,
+        zaiApiKey: zaiKey.length > 0 ? zaiKey : null,
         clearOpenaiApiKey,
         clearGeminiApiKey,
+        clearDeepseekApiKey,
+        clearZaiApiKey,
         setupComplete,
       });
       applyAiSettingsState(state);
@@ -1444,7 +1827,7 @@
       aiKeySheetFirstRun = false;
       aiSettingsError = null;
       void appLogInfo(
-        `[settings] AI keys updated openai=${state.openai_api_key_set} gemini=${state.gemini_api_key_set}`,
+        `[settings] AI keys updated openai=${state.openai_api_key_set} gemini=${state.gemini_api_key_set} deepseek=${state.deepseek_api_key_set} zai=${state.zai_api_key_set}`,
       );
     } catch (err) {
       aiSettingsError = formatLogError(err);
@@ -1461,8 +1844,12 @@
       const state = await invoke<AiSettingsState>("save_ai_api_keys", {
         openaiApiKey: null,
         geminiApiKey: null,
+        deepseekApiKey: null,
+        zaiApiKey: null,
         clearOpenaiApiKey: false,
         clearGeminiApiKey: false,
+        clearDeepseekApiKey: false,
+        clearZaiApiKey: false,
         setupComplete: true,
       });
       applyAiSettingsState(state);
@@ -1483,6 +1870,7 @@
   }
 
   function dismissAiKeySettings() {
+    if (aiSettingsSaving || batchChunkStarting) return;
     if (aiKeySheetFirstRun) {
       void completeAiKeySetupWithoutSaving();
     } else {
@@ -2203,14 +2591,17 @@
       }
 
       const history = getChunkChatHistory();
+      const chatProvider = aiTaskSettings.chat.provider;
+      const chatModel = aiTaskSettings.chat.model.trim();
       await invoke("start_chunk_ai_stream", {
         requestId,
         chunkId: view.chunk.id,
-        provider: chunkingProvider,
+        provider: chatProvider,
+        model: chatModel.length > 0 ? chatModel : null,
         history,
       });
       await appLogInfo(
-        `[chunk-ai] started requestId=${requestId} chunkId=${view.chunk.id} provider=${chunkingProvider} history=${history.length}`,
+        `[chunk-ai] started requestId=${requestId} chunkId=${view.chunk.id} provider=${chatProvider} model=${chatModel || "auto"} history=${history.length}`,
       );
     } catch (err) {
       const message = formatLogError(err);
@@ -2244,10 +2635,23 @@
   let canRechunkPage = $derived(
     !!selectedBook && currentChunks.length > 0 && !chunkingBusy,
   );
+  let canBatchChunkDocument = $derived(
+    !!selectedBook && totalPages > 0 && !aiSettingsSaving && !batchChunkStarting,
+  );
+
+  function parseBatchChunkPageInput(rawValue: string): number | null {
+    const trimmed = rawValue.trim();
+    if (!/^\d+$/.test(trimmed)) return null;
+    const parsed = Number(trimmed);
+    if (!Number.isSafeInteger(parsed) || parsed < 1) return null;
+    return parsed;
+  }
 
   async function reChunkCurrentPage() {
     if (!selectedBook || !canRechunkPage) return;
 
+    const chunkingProvider = aiTaskSettings.chunking.provider;
+    const chunkingModel = aiTaskSettings.chunking.model.trim();
     const providerLabel = getChunkingProviderLabel(chunkingProvider);
     const confirmed = window.confirm(
       `Re-chunk this page with ${providerLabel}?\n\nChunk-attached notes on this page will be deleted when the new chunks are saved. Page notes will stay.`,
@@ -2264,9 +2668,10 @@
         sourceDocumentId: selectedBook.id,
         pageNumber: currentPage,
         provider: chunkingProvider,
+        model: chunkingModel.length > 0 ? chunkingModel : null,
       });
       await appLogInfo(
-        `[chunking] manual re-chunk complete: doc=${selectedBook.id} page=${currentPage} provider=${chunkingProvider}`,
+        `[chunking] manual re-chunk complete: doc=${selectedBook.id} page=${currentPage} provider=${chunkingProvider} model=${chunkingModel || "auto"}`,
       );
       if (currentPageId !== null) {
         await loadChunksForPage(currentPageId);
@@ -2276,7 +2681,7 @@
       currentChunkingStatus = "failed";
       error = String(err);
       await appLogError(
-        `[chunking] manual re-chunk failed: doc=${selectedBook.id} page=${currentPage} provider=${chunkingProvider}: ${formatLogError(err)}`,
+        `[chunking] manual re-chunk failed: doc=${selectedBook.id} page=${currentPage} provider=${chunkingProvider} model=${chunkingModel || "auto"}: ${formatLogError(err)}`,
       );
     } finally {
       reChunkingPage = false;
@@ -2285,6 +2690,108 @@
         void refreshCurrentPageChunkingActive(selectedBook.id, currentPage);
       }
     }
+  }
+
+  async function startBatchChunking(startPage: number, endPage: number, mode: "range" | "all") {
+    const activeBook = selectedBook;
+    if (!activeBook || !canBatchChunkDocument) return;
+
+    const chunkingProvider = aiTaskSettings.chunking.provider;
+    const chunkingModel = aiTaskSettings.chunking.model.trim();
+    const providerLabel = getChunkingProviderLabel(chunkingProvider);
+    const pageLabel = mode === "all"
+      ? `all pages (${startPage}-${endPage})`
+      : startPage === endPage ? `page ${startPage}` : `pages ${startPage}-${endPage}`;
+    const confirmed = window.confirm(
+      `Chunk ${pageLabel} with ${providerLabel}?\n\nAlready chunked pages are skipped.`,
+    );
+    if (!confirmed) return;
+
+    batchChunkError = null;
+    batchChunkFeedback = null;
+    batchChunkStarting = true;
+
+    try {
+      const result = await invoke<EnsureChunkingRangeResult>("ensure_chunking_for_page_range", {
+        sourceDocumentId: activeBook.id,
+        startPage,
+        endPage,
+        provider: chunkingProvider,
+        model: chunkingModel.length > 0 ? chunkingModel : null,
+      });
+      const started = result.started_pages;
+      const skipped = result.skipped_pages;
+      const startedLabel = started === 1 ? "page" : "pages";
+      batchChunkFeedback = started > 0
+        ? `Started chunking ${started} ${startedLabel}; skipped ${skipped}.`
+        : `No pages started; skipped ${skipped}.`;
+      if (selectedBook?.id === activeBook.id && currentPage >= startPage && currentPage <= endPage && started > 0) {
+        currentChunkingStatus = "extracting";
+        void refreshCurrentPageChunkingActive(activeBook.id, currentPage);
+      }
+      await appLogInfo(
+        `[chunking] batch start: doc=${activeBook.id} pages=${startPage}-${endPage} provider=${chunkingProvider} model=${chunkingModel || "auto"} started=${started} skipped=${skipped}`,
+      );
+      void logChunkingStatus(activeBook.id, "after batch chunk start");
+    } catch (err) {
+      batchChunkError = formatLogError(err);
+      await appLogError(
+        `[chunking] batch start failed: doc=${activeBook.id} pages=${startPage}-${endPage} provider=${chunkingProvider} model=${chunkingModel || "auto"}: ${formatLogError(err)}`,
+      );
+    } finally {
+      batchChunkStarting = false;
+    }
+  }
+
+  async function chunkPageRangeFromInputs() {
+    batchChunkError = null;
+    batchChunkFeedback = null;
+
+    if (!selectedBook) {
+      batchChunkError = "Open a PDF to use batch chunking.";
+      return;
+    }
+    if (totalPages < 1) {
+      batchChunkError = "This PDF has no pages to chunk.";
+      return;
+    }
+
+    const startPage = parseBatchChunkPageInput(batchChunkStartInput);
+    const endPage = parseBatchChunkPageInput(batchChunkEndInput);
+    if (startPage === null || endPage === null) {
+      batchChunkError = `Enter valid page numbers between 1 and ${totalPages}.`;
+      return;
+    }
+    if (startPage > totalPages || endPage > totalPages) {
+      batchChunkError = `Page range must be within 1-${totalPages}.`;
+      return;
+    }
+    if (startPage > endPage) {
+      batchChunkError = "Start page must be less than or equal to end page.";
+      return;
+    }
+
+    batchChunkStartInput = String(startPage);
+    batchChunkEndInput = String(endPage);
+    await startBatchChunking(startPage, endPage, "range");
+  }
+
+  async function chunkWholePdf() {
+    batchChunkError = null;
+    batchChunkFeedback = null;
+
+    if (!selectedBook) {
+      batchChunkError = "Open a PDF to use batch chunking.";
+      return;
+    }
+    if (totalPages < 1) {
+      batchChunkError = "This PDF has no pages to chunk.";
+      return;
+    }
+
+    batchChunkStartInput = "1";
+    batchChunkEndInput = String(totalPages);
+    await startBatchChunking(1, totalPages, "all");
   }
 
   async function loadChunksForPage(pageId: number) {
@@ -2471,20 +2978,23 @@
         }
 
         const imageBase64 = await rasteriseChunkForTranscription(chunk, chunk.page_number);
+        const visionProvider = aiTaskSettings.vision.provider;
+        const visionModel = aiTaskSettings.vision.model.trim();
         const result = await invoke<ChunkFormattedBodyOutput>("generate_chunk_formatted_body", {
           chunkId,
-          provider: chunkingProvider,
+          provider: visionProvider,
+          model: visionModel.length > 0 ? visionModel : null,
           imageBase64,
           force,
         });
         applyChunkFormattedBody(chunkId, result.body_markdown);
         await appLogInfo(
-          `[chunk] formatted body ready chunkId=${chunkId} provider=${chunkingProvider} chars=${result.body_markdown.length}`,
+          `[chunk] formatted body ready chunkId=${chunkId} provider=${visionProvider} model=${visionModel || "auto"} chars=${result.body_markdown.length}`,
         );
         return true;
       } catch (err) {
         await appLogWarn(
-          `[chunk] formatted body failed chunkId=${chunkId} provider=${chunkingProvider}: ${formatLogError(err)}`,
+          `[chunk] formatted body failed chunkId=${chunkId} provider=${aiTaskSettings.vision.provider} model=${aiTaskSettings.vision.model.trim() || "auto"}: ${formatLogError(err)}`,
         );
         return false;
       } finally {
@@ -2750,14 +3260,18 @@
         );
         if (!selectedBook) return;
         if (e.payload.source_document_id !== selectedBook.id) return;
-        if (e.payload.phase === "extracted") currentChunkingStatus = "grouping";
-        if (e.payload.phase === "grouped") {
-          currentChunkingStatus = "done";
-          currentPageChunkingActive = false;
+        if (e.payload.page_number === currentPage) {
+          if (e.payload.phase === "extracted") currentChunkingStatus = "grouping";
+          if (e.payload.phase === "grouped") {
+            currentChunkingStatus = "done";
+            currentPageChunkingActive = false;
+            if (currentPageId !== null) void loadChunksForPage(currentPageId);
+          }
+          return;
         }
-        if (e.payload.page_number !== currentPage) return;
-        if (e.payload.phase !== "grouped") return;
-        if (currentPageId !== null) void loadChunksForPage(currentPageId);
+        if (e.payload.phase === "grouped") {
+          void refreshCurrentPageChunkingActive(selectedBook.id, currentPage);
+        }
       },
     );
   }
@@ -2891,7 +3405,8 @@
   }
 
   onMount(() => {
-    chunkingProvider = loadChunkingProvider();
+    aiTaskSettings = loadAiTaskSettings();
+    refreshCustomModelMode(aiTaskSettings);
     void loadAiSettings();
     // Dev-only: expose invoke on window for ad-hoc debugging from devtools.
     (window as unknown as { glossInvoke?: typeof invoke }).glossInvoke = invoke;
@@ -2941,46 +3456,40 @@
         </button>
         <span class="viewer-title">{selectedBook.title}</span>
         <div class="viewer-header-actions">
-          <div class="chunking-provider-group">
-            <span class="chunking-provider-label">AI provider</span>
-            <div class="chunking-provider-toggle" role="group" aria-label="AI provider">
-              {#if !aiSettings?.running_on_android}
-                <button
-                  class="chunking-provider-btn"
-                  class:active={chunkingProvider === "ollama"}
-                  onclick={() => setChunkingProvider("ollama")}
-                  aria-pressed={chunkingProvider === "ollama"}
-                  type="button"
-                >
-                  Ollama
-                </button>
-              {/if}
-              <button
-                class="chunking-provider-btn"
-                class:active={chunkingProvider === "openai"}
-                onclick={() => setChunkingProvider("openai")}
-                aria-pressed={chunkingProvider === "openai"}
-                type="button"
+          <div class="provider-shortcuts">
+            <label class="provider-shortcut">
+              <span>CK</span>
+              <select
+                value={aiTaskSettings.chunking.provider}
+                onchange={(event) => setTaskProvider("chunking", (event.currentTarget as HTMLSelectElement).value as ChunkingProvider)}
               >
-                OpenAI
-              </button>
-              <button
-                class="chunking-provider-btn"
-                class:active={chunkingProvider === "gemini"}
-                onclick={() => setChunkingProvider("gemini")}
-                aria-pressed={chunkingProvider === "gemini"}
-                type="button"
+                {#each CHUNKING_PROVIDER_OPTIONS as option}
+                  {#if !aiSettings?.running_on_android || option.value !== "ollama"}
+                    <option value={option.value}>{option.short}</option>
+                  {/if}
+                {/each}
+              </select>
+            </label>
+            <label class="provider-shortcut">
+              <span>AI</span>
+              <select
+                value={aiTaskSettings.chat.provider}
+                onchange={(event) => setTaskProvider("chat", (event.currentTarget as HTMLSelectElement).value as ChatProvider)}
               >
-                Gemini
-              </button>
-            </div>
+                {#each CHAT_PROVIDER_OPTIONS as option}
+                  {#if !aiSettings?.running_on_android || option.value !== "ollama"}
+                    <option value={option.value}>{option.short}</option>
+                  {/if}
+                {/each}
+              </select>
+            </label>
           </div>
           <button
             class="ai-settings-btn"
             onclick={() => openAiKeySettings(false)}
             type="button"
           >
-            AI keys
+            AI settings
           </button>
           <button
             class="rechunk-btn"
@@ -3498,7 +4007,7 @@
             onclick={() => openAiKeySettings(false)}
             type="button"
           >
-            AI keys
+            AI settings
           </button>
           <button onclick={importPdf} disabled={importing} class="import-btn">
             {importing ? "Importing…" : "Import PDF"}
@@ -3539,14 +4048,14 @@
         <div class="ai-key-heading">
           <div>
             <p class="ai-key-kicker">{aiKeySheetFirstRun ? "First run" : "Settings"}</p>
-            <h2 id="ai-key-title">AI keys</h2>
+            <h2 id="ai-key-title">AI settings</h2>
           </div>
           <button
             class="ai-key-close"
             type="button"
             onclick={dismissAiKeySettings}
-            disabled={aiSettingsSaving}
-            aria-label="Close AI keys"
+            disabled={aiSettingsSaving || batchChunkStarting}
+            aria-label="Close AI settings"
           >
             <svg viewBox="0 0 16 16" fill="none" width="14" height="14">
               <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
@@ -3555,7 +4064,7 @@
         </div>
 
         <p class="ai-key-copy">
-          Optional. Add an OpenAI or Gemini key for AI chunking and chat.
+          Choose provider + model defaults for chunking, chat, and vision transcription. Keys are optional and can also be provided via environment variables.
         </p>
 
         {#if aiSettingsError}
@@ -3563,6 +4072,199 @@
         {/if}
 
         <form class="ai-key-form" onsubmit={saveAiKeyForm}>
+          <section class="ai-task-section">
+            <h3>Task defaults</h3>
+
+            <div class="ai-task-row">
+              <p>Chunking</p>
+              <label class="ai-task-control">
+                <span>Provider</span>
+                <select
+                  value={aiTaskSettings.chunking.provider}
+                  onchange={(event) => setTaskProvider("chunking", (event.currentTarget as HTMLSelectElement).value as ChunkingProvider)}
+                  disabled={aiSettingsSaving}
+                >
+                  {#each CHUNKING_PROVIDER_OPTIONS as option}
+                    {#if !aiSettings?.running_on_android || option.value !== "ollama"}
+                      <option value={option.value}>{option.label}</option>
+                    {/if}
+                  {/each}
+                </select>
+              </label>
+              <label class="ai-task-control">
+                <span>Model</span>
+                <select
+                  value={modelSelectValue("chunking")}
+                  onchange={(event) => setModelFromSelect("chunking", (event.currentTarget as HTMLSelectElement).value)}
+                  disabled={aiSettingsSaving}
+                >
+                  {#each getModelOptions("chunking", aiTaskSettings.chunking.provider) as option}
+                    <option value={option.value}>{option.label}{option.legacy ? " (legacy)" : ""}</option>
+                  {/each}
+                  <option value={CUSTOM_MODEL_VALUE}>Custom...</option>
+                </select>
+              </label>
+              {#if modelSelectValue("chunking") === CUSTOM_MODEL_VALUE}
+                <input
+                  class="ai-custom-model-input"
+                  type="text"
+                  spellcheck="false"
+                  value={aiTaskSettings.chunking.model}
+                  oninput={(event) => setTaskModel("chunking", (event.currentTarget as HTMLInputElement).value)}
+                  disabled={aiSettingsSaving}
+                  placeholder="Enter model ID"
+                />
+              {/if}
+            </div>
+
+            <div class="ai-task-row">
+              <p>Chat</p>
+              <label class="ai-task-control">
+                <span>Provider</span>
+                <select
+                  value={aiTaskSettings.chat.provider}
+                  onchange={(event) => setTaskProvider("chat", (event.currentTarget as HTMLSelectElement).value as ChatProvider)}
+                  disabled={aiSettingsSaving}
+                >
+                  {#each CHAT_PROVIDER_OPTIONS as option}
+                    {#if !aiSettings?.running_on_android || option.value !== "ollama"}
+                      <option value={option.value}>{option.label}</option>
+                    {/if}
+                  {/each}
+                </select>
+              </label>
+              <label class="ai-task-control">
+                <span>Model</span>
+                <select
+                  value={modelSelectValue("chat")}
+                  onchange={(event) => setModelFromSelect("chat", (event.currentTarget as HTMLSelectElement).value)}
+                  disabled={aiSettingsSaving}
+                >
+                  {#each getModelOptions("chat", aiTaskSettings.chat.provider) as option}
+                    <option value={option.value}>{option.label}{option.legacy ? " (legacy)" : ""}</option>
+                  {/each}
+                  <option value={CUSTOM_MODEL_VALUE}>Custom...</option>
+                </select>
+              </label>
+              {#if modelSelectValue("chat") === CUSTOM_MODEL_VALUE}
+                <input
+                  class="ai-custom-model-input"
+                  type="text"
+                  spellcheck="false"
+                  value={aiTaskSettings.chat.model}
+                  oninput={(event) => setTaskModel("chat", (event.currentTarget as HTMLInputElement).value)}
+                  disabled={aiSettingsSaving}
+                  placeholder="Enter model ID"
+                />
+              {/if}
+            </div>
+
+            <div class="ai-task-row">
+              <p>Vision OCR</p>
+              <label class="ai-task-control">
+                <span>Provider</span>
+                <select
+                  value={aiTaskSettings.vision.provider}
+                  onchange={(event) => setTaskProvider("vision", (event.currentTarget as HTMLSelectElement).value as VisionProvider)}
+                  disabled={aiSettingsSaving}
+                >
+                  {#each VISION_PROVIDER_OPTIONS as option}
+                    {#if !aiSettings?.running_on_android || option.value !== "ollama"}
+                      <option value={option.value}>{option.label}</option>
+                    {/if}
+                  {/each}
+                </select>
+              </label>
+              <label class="ai-task-control">
+                <span>Model</span>
+                <select
+                  value={modelSelectValue("vision")}
+                  onchange={(event) => setModelFromSelect("vision", (event.currentTarget as HTMLSelectElement).value)}
+                  disabled={aiSettingsSaving}
+                >
+                  {#each getModelOptions("vision", aiTaskSettings.vision.provider) as option}
+                    <option value={option.value}>{option.label}{option.legacy ? " (legacy)" : ""}</option>
+                  {/each}
+                  <option value={CUSTOM_MODEL_VALUE}>Custom...</option>
+                </select>
+              </label>
+              {#if modelSelectValue("vision") === CUSTOM_MODEL_VALUE}
+                <input
+                  class="ai-custom-model-input"
+                  type="text"
+                  spellcheck="false"
+                  value={aiTaskSettings.vision.model}
+                  oninput={(event) => setTaskModel("vision", (event.currentTarget as HTMLInputElement).value)}
+                  disabled={aiSettingsSaving}
+                  placeholder="Enter model ID"
+                />
+              {/if}
+            </div>
+
+            <p class="ai-model-note">
+              `deepseek-reasoner` is legacy and scheduled for deprecation on July 24, 2026.
+            </p>
+          </section>
+
+          <section class="ai-batch-section">
+            <h3>Batch chunking</h3>
+            {#if selectedBook && totalPages > 0}
+              <p class="ai-batch-copy">
+                Run chunking over a page range for <strong>{selectedBook.title}</strong>. Already chunked pages are skipped.
+              </p>
+              <div class="ai-batch-grid">
+                <label class="ai-batch-field">
+                  <span>From</span>
+                  <input
+                    type="text"
+                    inputmode="numeric"
+                    pattern="[0-9]*"
+                    bind:value={batchChunkStartInput}
+                    disabled={!canBatchChunkDocument}
+                  />
+                </label>
+                <label class="ai-batch-field">
+                  <span>To</span>
+                  <input
+                    type="text"
+                    inputmode="numeric"
+                    pattern="[0-9]*"
+                    bind:value={batchChunkEndInput}
+                    disabled={!canBatchChunkDocument}
+                  />
+                </label>
+                <button
+                  class="ai-batch-btn ai-batch-btn-primary"
+                  type="button"
+                  onclick={chunkPageRangeFromInputs}
+                  disabled={!canBatchChunkDocument}
+                >
+                  {batchChunkStarting ? "Starting..." : "Chunk range"}
+                </button>
+                <button
+                  class="ai-batch-btn ai-batch-btn-secondary"
+                  type="button"
+                  onclick={chunkWholePdf}
+                  disabled={!canBatchChunkDocument}
+                >
+                  Chunk whole PDF
+                </button>
+              </div>
+              <p class="ai-batch-hint">Range must be between 1 and {totalPages}.</p>
+            {:else}
+              <p class="ai-batch-copy">Open a PDF in the viewer to enable batch chunking.</p>
+            {/if}
+            {#if batchChunkError}
+              <p class="ai-batch-error">{batchChunkError}</p>
+            {/if}
+            {#if batchChunkFeedback}
+              <p class="ai-batch-feedback">{batchChunkFeedback}</p>
+            {/if}
+          </section>
+
+          <section class="ai-keys-section">
+            <h3>API keys</h3>
+
           <label class="ai-key-field">
             <span>
               OpenAI API key
@@ -3619,16 +4321,73 @@
             </label>
           {/if}
 
+          <label class="ai-key-field">
+            <span>
+              DeepSeek API key
+              {#if aiSettings?.deepseek_api_key_set}
+                <em>Saved</em>
+              {/if}
+            </span>
+            <input
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder={aiSettings?.deepseek_api_key_set ? "Leave blank to keep saved key" : "sk-..."}
+              bind:value={deepseekApiKeyInput}
+              disabled={clearDeepseekApiKey || aiSettingsSaving}
+            />
+          </label>
+
+          {#if aiSettings?.deepseek_api_key_set}
+            <label class="ai-key-clear">
+              <input
+                type="checkbox"
+                bind:checked={clearDeepseekApiKey}
+                disabled={aiSettingsSaving}
+              />
+              Clear DeepSeek key
+            </label>
+          {/if}
+
+          <label class="ai-key-field">
+            <span>
+              Z.AI API key
+              {#if aiSettings?.zai_api_key_set}
+                <em>Saved</em>
+              {/if}
+            </span>
+            <input
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder={aiSettings?.zai_api_key_set ? "Leave blank to keep saved key" : "zai_..."}
+              bind:value={zaiApiKeyInput}
+              disabled={clearZaiApiKey || aiSettingsSaving}
+            />
+          </label>
+
+          {#if aiSettings?.zai_api_key_set}
+            <label class="ai-key-clear">
+              <input
+                type="checkbox"
+                bind:checked={clearZaiApiKey}
+                disabled={aiSettingsSaving}
+              />
+              Clear Z.AI key
+            </label>
+          {/if}
+          </section>
+
           <div class="ai-key-actions">
             <button
               class="ai-key-secondary"
               type="button"
               onclick={dismissAiKeySettings}
-              disabled={aiSettingsSaving}
+              disabled={aiSettingsSaving || batchChunkStarting}
             >
               {aiKeySheetFirstRun ? "Skip" : "Cancel"}
             </button>
-            <button class="ai-key-primary" type="submit" disabled={aiSettingsSaving}>
+            <button class="ai-key-primary" type="submit" disabled={aiSettingsSaving || batchChunkStarting}>
               {aiSettingsSaving ? "Saving..." : "Save"}
             </button>
           </div>
@@ -3789,8 +4548,8 @@
   }
 
   .ai-key-sheet {
-    width: min(520px, 100%);
-    max-height: min(620px, 100%);
+    width: min(780px, 100%);
+    max-height: min(760px, 100%);
     overflow: auto;
     background: #fff;
     border: 1px solid rgba(35, 46, 68, 0.16);
@@ -3858,6 +4617,175 @@
     display: flex;
     flex-direction: column;
     gap: 0.8rem;
+  }
+
+  .ai-task-section,
+  .ai-batch-section,
+  .ai-keys-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.65rem;
+    padding: 0.8rem;
+    border: 1px solid #d7dde7;
+    border-radius: 10px;
+    background: #fafbfd;
+  }
+
+  .ai-task-section h3,
+  .ai-batch-section h3,
+  .ai-keys-section h3 {
+    margin: 0;
+    font-size: 0.92rem;
+    color: #24324a;
+    font-weight: 700;
+  }
+
+  .ai-task-row {
+    display: grid;
+    grid-template-columns: 108px 1fr 1fr;
+    gap: 0.55rem;
+    align-items: end;
+    padding: 0.55rem 0.1rem;
+    border-top: 1px solid #e4e8f0;
+  }
+
+  .ai-task-row:first-of-type {
+    border-top: none;
+    padding-top: 0.2rem;
+  }
+
+  .ai-task-row p {
+    margin: 0;
+    font-size: 0.86rem;
+    font-weight: 700;
+    color: #374151;
+  }
+
+  .ai-task-control {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    font-size: 0.78rem;
+    color: #556274;
+    font-weight: 650;
+  }
+
+  .ai-task-control select {
+    width: 100%;
+    min-height: 38px;
+    padding: 0.45rem 0.55rem;
+    color: #0f172a;
+    border: 1px solid #cfd6e2;
+    border-radius: 8px;
+    background: #fff;
+    font: inherit;
+  }
+
+  .ai-custom-model-input {
+    grid-column: 2 / span 2;
+    width: 100%;
+    min-height: 38px;
+    padding: 0.45rem 0.55rem;
+    color: #0f172a;
+    border: 1px solid #cfd6e2;
+    border-radius: 8px;
+    background: #fff;
+    font: inherit;
+  }
+
+  .ai-model-note {
+    margin: 0.15rem 0 0;
+    color: #667085;
+    font-size: 0.8rem;
+    line-height: 1.35;
+  }
+
+  .ai-batch-copy {
+    margin: 0;
+    color: #526071;
+    line-height: 1.4;
+  }
+
+  .ai-batch-grid {
+    display: grid;
+    grid-template-columns: 110px 110px minmax(118px, auto) minmax(150px, auto);
+    gap: 0.55rem;
+    align-items: end;
+  }
+
+  .ai-batch-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    font-size: 0.78rem;
+    color: #556274;
+    font-weight: 650;
+  }
+
+  .ai-batch-field input {
+    width: 100%;
+    min-height: 38px;
+    padding: 0.45rem 0.55rem;
+    color: #0f172a;
+    border: 1px solid #cfd6e2;
+    border-radius: 8px;
+    background: #fff;
+    font: inherit;
+  }
+
+  .ai-batch-btn {
+    min-height: 38px;
+    padding: 0.5rem 0.8rem;
+    border-radius: 8px;
+    font: inherit;
+    font-weight: 700;
+    border: 1px solid #d6dde8;
+    transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+  }
+
+  .ai-batch-btn-primary {
+    background: #1f2f49;
+    border-color: #1f2f49;
+    color: #fff;
+  }
+
+  .ai-batch-btn-primary:hover:not(:disabled) {
+    background: #2d4265 !important;
+    border-color: #2d4265;
+  }
+
+  .ai-batch-btn-secondary {
+    background: #eef2f8;
+    color: #1f2f49;
+  }
+
+  .ai-batch-btn-secondary:hover:not(:disabled) {
+    background: #e5ebf5 !important;
+    border-color: #c5cfdd;
+  }
+
+  .ai-batch-btn:disabled {
+    opacity: 0.55;
+  }
+
+  .ai-batch-hint {
+    margin: 0;
+    color: #667085;
+    font-size: 0.8rem;
+  }
+
+  .ai-batch-error {
+    margin: 0;
+    color: #991b1b;
+    font-size: 0.85rem;
+    font-weight: 700;
+  }
+
+  .ai-batch-feedback {
+    margin: 0;
+    color: #065f46;
+    font-size: 0.85rem;
+    font-weight: 700;
   }
 
   .ai-key-field {
@@ -3952,6 +4880,21 @@
     background: #2d4265 !important;
   }
 
+  @media (max-width: 720px) {
+    .ai-task-row {
+      grid-template-columns: 1fr;
+      gap: 0.45rem;
+    }
+
+    .ai-custom-model-input {
+      grid-column: auto;
+    }
+
+    .ai-batch-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+
   /* ── Viewer ── */
   .viewer {
     position: relative;
@@ -3989,47 +4932,39 @@
     flex-wrap: wrap;
   }
 
-  .chunking-provider-group {
+  .provider-shortcuts {
     display: flex;
     align-items: center;
-    gap: 0.55rem;
+    gap: 0.45rem;
     flex-wrap: wrap;
   }
 
-  .chunking-provider-label {
-    font-size: 0.78rem;
-    font-weight: 600;
-    color: #667285;
+  .provider-shortcut {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.22rem 0.35rem;
+    border: 1px solid #d7dde7;
+    border-radius: 9px;
+    background: #f8fafe;
+    color: #445166;
+    font-size: 0.74rem;
+    font-weight: 700;
+  }
+
+  .provider-shortcut span {
     letter-spacing: 0.01em;
   }
 
-  .chunking-provider-toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.15rem;
-    padding: 0.18rem;
-    background: #f3f5f9;
-    border: 1px solid #d7dde7;
-    border-radius: 999px;
-  }
-
-  .chunking-provider-btn {
-    padding: 0.38rem 0.8rem;
-    background: transparent;
-    color: #556274;
-    border-radius: 999px;
-    font-size: 0.84rem;
-    font-weight: 600;
-    transition: background 0.12s, color 0.12s;
-  }
-
-  .chunking-provider-btn:hover {
-    background: #e7ebf4 !important;
-  }
-
-  .chunking-provider-btn.active {
-    background: #1f2f49 !important;
-    color: #fff;
+  .provider-shortcut select {
+    border: 1px solid #d6dde8;
+    border-radius: 7px;
+    background: #fff;
+    color: #334155;
+    padding: 0.18rem 0.3rem;
+    min-height: 26px;
+    font-size: 0.74rem;
+    font-weight: 700;
   }
 
   .rechunk-btn {
@@ -4076,7 +5011,7 @@
       margin-left: 0;
     }
 
-    .chunking-provider-group {
+    .provider-shortcuts {
       flex: 1 1 100%;
       justify-content: space-between;
     }

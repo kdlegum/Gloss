@@ -8,6 +8,8 @@ pub enum LlmProvider {
     Ollama,
     OpenAI,
     Gemini,
+    DeepSeek,
+    Zai,
 }
 
 impl LlmProvider {
@@ -16,7 +18,21 @@ impl LlmProvider {
             Self::Ollama => "ollama",
             Self::OpenAI => "openai",
             Self::Gemini => "gemini",
+            Self::DeepSeek => "deepseek",
+            Self::Zai => "zai",
         }
+    }
+
+    pub fn supports_chunking(self) -> bool {
+        !matches!(self, Self::Zai)
+    }
+
+    pub fn supports_chat(self) -> bool {
+        !matches!(self, Self::Zai)
+    }
+
+    pub fn supports_vision(self) -> bool {
+        !matches!(self, Self::DeepSeek)
     }
 }
 
@@ -34,6 +50,8 @@ impl FromStr for LlmProvider {
             "ollama" => Ok(Self::Ollama),
             "openai" => Ok(Self::OpenAI),
             "gemini" => Ok(Self::Gemini),
+            "deepseek" => Ok(Self::DeepSeek),
+            "zai" => Ok(Self::Zai),
             other => Err(format!("unknown llm provider {:?}", other)),
         }
     }

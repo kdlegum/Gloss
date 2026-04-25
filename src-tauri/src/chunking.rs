@@ -9,13 +9,18 @@
 // Progress is reported via Tauri events (`chunking_progress`) so the frontend can
 // re-render the overlay as chunks land.
 
+use crate::deepseek::DeepSeekClient;
 use crate::gemini::GeminiClient;
 use crate::llm::{BlockForPrompt, GroupedChunk, LlmProvider};
 use crate::ollama::OllamaClient;
 use crate::openai::OpenAiClient;
 use crate::references;
 use crate::settings;
+use crate::zai::ZaiClient;
 use crate::PdfiumWorker;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use futures::StreamExt;
+use image::{ImageBuffer, Rgba};
 use log::{debug, error, info, warn};
 use pdfium_render::prelude::*;
 use serde::Serialize;
@@ -34,9 +39,11 @@ pub struct RawBlock {
     pub text: String,
 }
 
+#[derive(Clone)]
 pub struct PersistedBlock {
     pub id: i64,
     pub text: String,
+    pub transcribed_text: Option<String>,
     pub bbox_x: f32,
     pub bbox_y: f32,
     pub bbox_w: f32,
@@ -72,6 +79,7 @@ pub async fn run_for_page(
     doc_id: i64,
     page_number: i64,
     provider: LlmProvider,
+    model_override: Option<String>,
 ) {
     info!(
         target: "gloss_lib::chunking",
@@ -80,7 +88,17 @@ pub async fn run_for_page(
         page_number,
         provider
     );
-    if let Err(e) = run_inner(&pool, &pdfium, &app, doc_id, page_number, provider).await {
+    if let Err(e) = run_inner(
+        &pool,
+        &pdfium,
+        &app,
+        doc_id,
+        page_number,
+        provider,
+        model_override,
+    )
+    .await
+    {
         error!(
             target: "gloss_lib::chunking",
             "chunking job failed for doc_id={} page={} provider={}: {}",
@@ -111,6 +129,7 @@ async fn run_inner(
     doc_id: i64,
     page_number: i64,
     provider: LlmProvider,
+    model_override: Option<String>,
 ) -> Result<(), String> {
     if page_number < 1 {
         return Err(format!("invalid page number {}", page_number));
@@ -203,7 +222,7 @@ async fn run_inner(
         return Ok(());
     }
 
-    let use_llm = provider_health_check(pool, provider).await;
+    let use_llm = provider_health_check(pool, provider, model_override.as_deref()).await;
     info!(
         target: "gloss_lib::chunking",
         "doc_id={} page={} provider={} available={}",
@@ -213,7 +232,7 @@ async fn run_inner(
         use_llm
     );
 
-    let blocks = load_unchunked_blocks(pool, page_id).await?;
+    let mut blocks = load_unchunked_blocks(pool, page_id).await?;
     if blocks.is_empty() {
         warn!(
             target: "gloss_lib::chunking",
@@ -232,10 +251,30 @@ async fn run_inner(
         blocks.len()
     );
 
+    // ZAI block transcription (optional — improves math in chunking prompt)
+    if use_llm {
+        match transcribe_blocks_for_page(pool, pdfium, &abs_path, page_index, &blocks).await {
+            Ok(updated) => {
+                info!(
+                    target: "gloss_lib::chunking",
+                    "doc_id={} page={} ZAI transcribed {} blocks",
+                    doc_id, page_number, updated.len()
+                );
+                blocks = updated;
+            }
+            Err(e) => warn!(
+                target: "gloss_lib::chunking",
+                "doc_id={} page={} ZAI block transcription skipped: {}",
+                doc_id, page_number, e
+            ),
+        }
+    }
+
     let used_llm = if use_llm {
-        match try_llm_chunking(pool, provider, &blocks).await {
+        match try_llm_chunking(pool, provider, &blocks, model_override.as_deref()).await {
             Ok(groups) if validate_groups(&groups, &blocks) => {
                 persist_chunks(pool, doc_id, page_id, &blocks, &groups, true).await?;
+                populate_formatted_body_from_transcriptions(pool, page_id).await?;
                 link_proofs_to_theorems(pool, page_id).await?;
                 if let Err(e) = references::reindex_document_references(pool, doc_id).await {
                     warn!(
@@ -304,6 +343,7 @@ pub async fn rechunk_page(
     doc_id: i64,
     page_number: i64,
     provider: LlmProvider,
+    model_override: Option<String>,
 ) -> Result<(), String> {
     info!(
         target: "gloss_lib::chunking",
@@ -312,7 +352,7 @@ pub async fn rechunk_page(
         page_number,
         provider
     );
-    match rechunk_inner(pool, app, doc_id, page_number, provider).await {
+    match rechunk_inner(pool, app, doc_id, page_number, provider, model_override).await {
         Ok(()) => {
             info!(
                 target: "gloss_lib::chunking",
@@ -344,6 +384,7 @@ async fn rechunk_inner(
     doc_id: i64,
     page_number: i64,
     provider: LlmProvider,
+    model_override: Option<String>,
 ) -> Result<(), String> {
     if page_number < 1 {
         return Err(format!("invalid page number {}", page_number));
@@ -356,7 +397,7 @@ async fn rechunk_inner(
     }
 
     set_status(pool, doc_id, "grouping").await?;
-    let groups = try_llm_chunking(pool, provider, &blocks).await?;
+    let groups = try_llm_chunking(pool, provider, &blocks, model_override.as_deref()).await?;
     if !validate_groups(&groups, &blocks) {
         return Err(format!(
             "received invalid {} grouping with {} groups",
@@ -366,6 +407,7 @@ async fn rechunk_inner(
     }
 
     replace_chunks(pool, doc_id, page_id, &blocks, &groups, true).await?;
+    populate_formatted_body_from_transcriptions(pool, page_id).await?;
     link_proofs_to_theorems(pool, page_id).await?;
     if let Err(e) = references::reindex_document_references(pool, doc_id).await {
         warn!(
@@ -379,12 +421,35 @@ async fn rechunk_inner(
     Ok(())
 }
 
-async fn provider_health_check(pool: &SqlitePool, provider: LlmProvider) -> bool {
+async fn provider_health_check(
+    pool: &SqlitePool,
+    provider: LlmProvider,
+    model_override: Option<&str>,
+) -> bool {
     let api_key = configured_api_key(pool, provider).await;
+    let model_override = normalize_model_override(model_override);
     match provider {
-        LlmProvider::Ollama => OllamaClient::new().health_check().await,
-        LlmProvider::OpenAI => OpenAiClient::with_api_key(api_key).health_check().await,
-        LlmProvider::Gemini => GeminiClient::with_api_key(api_key).health_check().await,
+        LlmProvider::Ollama => {
+            OllamaClient::with_text_model(model_override)
+                .health_check()
+                .await
+        }
+        LlmProvider::OpenAI => {
+            OpenAiClient::with_api_key_and_model(api_key, model_override)
+                .health_check()
+                .await
+        }
+        LlmProvider::Gemini => {
+            GeminiClient::with_api_key_and_model(api_key, model_override)
+                .health_check()
+                .await
+        }
+        LlmProvider::DeepSeek => {
+            DeepSeekClient::with_api_key_and_model(api_key, model_override)
+                .health_check()
+                .await
+        }
+        LlmProvider::Zai => false,
     }
 }
 
@@ -392,29 +457,36 @@ async fn try_llm_chunking(
     pool: &SqlitePool,
     provider: LlmProvider,
     blocks: &[PersistedBlock],
+    model_override: Option<&str>,
 ) -> Result<Vec<GroupedChunk>, String> {
     let prompt_blocks: Vec<BlockForPrompt> = blocks
         .iter()
         .map(|b| BlockForPrompt {
             id: b.id,
-            text: &b.text,
+            text: b.transcribed_text.as_deref().unwrap_or(&b.text),
         })
         .collect();
 
     let api_key = configured_api_key(pool, provider).await;
+    let model_override = normalize_model_override(model_override);
     match provider {
-        LlmProvider::Ollama => OllamaClient::new()
+        LlmProvider::Ollama => OllamaClient::with_text_model(model_override)
             .chunk_blocks(&prompt_blocks)
             .await
             .map_err(|e| e.to_string()),
-        LlmProvider::OpenAI => OpenAiClient::with_api_key(api_key)
+        LlmProvider::OpenAI => OpenAiClient::with_api_key_and_model(api_key, model_override)
             .chunk_blocks(&prompt_blocks)
             .await
             .map_err(|e| e.to_string()),
-        LlmProvider::Gemini => GeminiClient::with_api_key(api_key)
+        LlmProvider::Gemini => GeminiClient::with_api_key_and_model(api_key, model_override)
             .chunk_blocks(&prompt_blocks)
             .await
             .map_err(|e| e.to_string()),
+        LlmProvider::DeepSeek => DeepSeekClient::with_api_key_and_model(api_key, model_override)
+            .chunk_blocks(&prompt_blocks)
+            .await
+            .map_err(|e| e.to_string()),
+        LlmProvider::Zai => Err("provider zai does not support chunking".to_string()),
     }
 }
 
@@ -431,6 +503,13 @@ async fn configured_api_key(pool: &SqlitePool, provider: LlmProvider) -> Option<
             None
         }
     }
+}
+
+fn normalize_model_override(model_override: Option<&str>) -> Option<String> {
+    model_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// A valid grouping covers every block exactly once with no unknown ids.
@@ -525,7 +604,7 @@ async fn load_unchunked_blocks(
     page_id: i64,
 ) -> Result<Vec<PersistedBlock>, String> {
     let rows = sqlx::query(
-        "SELECT id, text, bbox_x, bbox_y, bbox_w, bbox_h \
+        "SELECT id, text, transcribed_text, bbox_x, bbox_y, bbox_w, bbox_h \
          FROM text_blocks WHERE page_id = ? AND chunk_id IS NULL ORDER BY order_idx",
     )
     .bind(page_id)
@@ -538,6 +617,7 @@ async fn load_unchunked_blocks(
         .map(|r| PersistedBlock {
             id: r.get("id"),
             text: r.get("text"),
+            transcribed_text: r.get("transcribed_text"),
             bbox_x: r.get("bbox_x"),
             bbox_y: r.get("bbox_y"),
             bbox_w: r.get("bbox_w"),
@@ -551,7 +631,7 @@ async fn load_blocks_for_page(
     page_id: i64,
 ) -> Result<Vec<PersistedBlock>, String> {
     let rows = sqlx::query(
-        "SELECT id, text, bbox_x, bbox_y, bbox_w, bbox_h \
+        "SELECT id, text, transcribed_text, bbox_x, bbox_y, bbox_w, bbox_h \
          FROM text_blocks WHERE page_id = ? ORDER BY order_idx",
     )
     .bind(page_id)
@@ -564,6 +644,7 @@ async fn load_blocks_for_page(
         .map(|r| PersistedBlock {
             id: r.get("id"),
             text: r.get("text"),
+            transcribed_text: r.get("transcribed_text"),
             bbox_x: r.get("bbox_x"),
             bbox_y: r.get("bbox_y"),
             bbox_w: r.get("bbox_w"),
@@ -846,6 +927,277 @@ fn normalise_chunk_type(raw: &str) -> &'static str {
         raw
     );
     "explanation"
+}
+
+// ── ZAI block transcription ─────────────────────────────────────────────────
+
+const TRANSCRIPTION_RENDER_WIDTH: u32 = 1500;
+const MAX_ZAI_CONCURRENT: usize = 2;
+
+/// Renders the page once, crops each block's bbox, transcribes via ZAI, persists
+/// `transcribed_text` to the DB, and returns the blocks with the field populated.
+/// Returns `Ok(original_blocks)` unchanged if ZAI is not configured.
+async fn transcribe_blocks_for_page(
+    pool: &SqlitePool,
+    pdfium: &PdfiumWorker,
+    abs_path: &PathBuf,
+    page_index: usize,
+    blocks: &[PersistedBlock],
+) -> Result<Vec<PersistedBlock>, String> {
+    let zai_key = match settings::api_key_for_provider(pool, LlmProvider::Zai).await? {
+        Some(key) => key,
+        None => {
+            debug!(
+                target: "gloss_lib::chunking",
+                "ZAI key not configured — skipping block transcription"
+            );
+            return Ok(blocks.to_vec());
+        }
+    };
+
+    let zai = ZaiClient::with_api_key_and_model(Some(zai_key), None);
+
+    let p = abs_path.clone();
+    let (page_w_px, page_h_px, rgba_bytes) = pdfium
+        .run(move |pdf| render_page_rgba(pdf, &p, page_index, TRANSCRIPTION_RENDER_WIDTH))
+        .await
+        .map_err(|e| format!("failed to render page for ZAI transcription: {e}"))?;
+
+    let crops: Vec<(i64, Result<String, String>)> = blocks
+        .iter()
+        .map(|b| (b.id, crop_and_encode_block(&rgba_bytes, page_w_px, page_h_px, b)))
+        .collect();
+
+    let transcriptions: Vec<(i64, Result<String, String>)> =
+        futures::stream::iter(crops)
+            .map(|(id, crop_result)| {
+                let zai = zai.clone();
+                async move {
+                    match crop_result {
+                        Err(e) => (id, Err(e)),
+                        Ok(crop_b64) => (
+                            id,
+                            zai.transcribe_block_image(&crop_b64)
+                                .await
+                                .map_err(|e| e.to_string()),
+                        ),
+                    }
+                }
+            })
+            .buffer_unordered(MAX_ZAI_CONCURRENT)
+            .collect()
+            .await;
+
+    let mut updated = blocks.to_vec();
+    for (id, result) in transcriptions {
+        match result {
+            Ok(text) => {
+                sqlx::query("UPDATE text_blocks SET transcribed_text = ? WHERE id = ?")
+                    .bind(&text)
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if let Some(b) = updated.iter_mut().find(|b| b.id == id) {
+                    b.transcribed_text = Some(text);
+                }
+            }
+            Err(e) => {
+                if e.contains("too small") || e.contains("degenerate") {
+                    debug!(
+                        target: "gloss_lib::chunking",
+                        "block_id={} skipped ZAI: {}",
+                        id, e
+                    );
+                } else {
+                    warn!(
+                        target: "gloss_lib::chunking",
+                        "ZAI transcription failed for block_id={}: {}",
+                        id, e
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(updated)
+}
+
+/// Renders a PDF page to raw RGBA bytes. Runs synchronously on the pdfium worker thread.
+fn render_page_rgba(
+    pdfium: &Pdfium,
+    abs_path: &PathBuf,
+    page_index: usize,
+    target_width: u32,
+) -> Result<(u32, u32, Vec<u8>), String> {
+    let doc = pdfium
+        .load_pdf_from_file(abs_path, None)
+        .map_err(|e| e.to_string())?;
+    let page = doc
+        .pages()
+        .get(page_index as i32)
+        .map_err(|e| e.to_string())?;
+    let width_px = target_width as i32;
+    let height_px =
+        ((target_width as f32) * (page.height().value / page.width().value)).round() as i32;
+    let bitmap = page
+        .render_with_config(
+            &PdfRenderConfig::new()
+                .set_target_width(width_px)
+                .set_target_height(height_px),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok((
+        bitmap.width() as u32,
+        bitmap.height() as u32,
+        bitmap.as_rgba_bytes(),
+    ))
+}
+
+// ZAI requires at least this many pixels in each dimension — anything smaller
+// is typically a page-number, stray glyph, or artefact that pdfium text handles fine.
+const MIN_CROP_PX: u32 = 16;
+
+/// Crops a block's bbox from pre-rendered full-page RGBA bytes and returns a JPEG data URI.
+fn crop_and_encode_block(
+    rgba_bytes: &[u8],
+    page_width_px: u32,
+    page_height_px: u32,
+    block: &PersistedBlock,
+) -> Result<String, String> {
+    let x0 = (block.bbox_x * page_width_px as f32).round() as u32;
+    let y0 = (block.bbox_y * page_height_px as f32).round() as u32;
+    let x1 = ((block.bbox_x + block.bbox_w) * page_width_px as f32).round() as u32;
+    let y1 = ((block.bbox_y + block.bbox_h) * page_height_px as f32).round() as u32;
+
+    let x0 = x0.min(page_width_px);
+    let y0 = y0.min(page_height_px);
+    let x1 = x1.min(page_width_px);
+    let y1 = y1.min(page_height_px);
+
+    if x1 <= x0 || y1 <= y0 {
+        return Err(format!(
+            "degenerate block bbox: x={} y={} w={} h={}",
+            block.bbox_x, block.bbox_y, block.bbox_w, block.bbox_h
+        ));
+    }
+
+    let crop_w = x1 - x0;
+    let crop_h = y1 - y0;
+
+    debug!(
+        target: "gloss_lib::chunking",
+        "block_id={} crop {}x{} px (bbox x={:.3} y={:.3} w={:.3} h={:.3})",
+        block.id, crop_w, crop_h,
+        block.bbox_x, block.bbox_y, block.bbox_w, block.bbox_h
+    );
+
+    if crop_w < MIN_CROP_PX || crop_h < MIN_CROP_PX {
+        return Err(format!(
+            "block_id={} crop too small ({}x{} px) — skipping ZAI",
+            block.id, crop_w, crop_h
+        ));
+    }
+
+    let mut crop = Vec::with_capacity((crop_w * crop_h * 4) as usize);
+    for row in y0..y1 {
+        let row_start = ((row * page_width_px + x0) * 4) as usize;
+        let row_end = row_start + (crop_w * 4) as usize;
+        crop.extend_from_slice(&rgba_bytes[row_start..row_end]);
+    }
+
+    let rgba_img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_raw(crop_w, crop_h, crop)
+        .ok_or_else(|| "failed to create image buffer from block crop".to_string())?;
+
+    // Convert RGBA → RGB; many OCR APIs reject alpha-channel PNGs.
+    let rgb_img = image::DynamicImage::ImageRgba8(rgba_img).into_rgb8();
+
+    let mut jpeg_bytes = Vec::new();
+    rgb_img
+        .write_to(
+            &mut std::io::Cursor::new(&mut jpeg_bytes),
+            image::ImageFormat::Jpeg,
+        )
+        .map_err(|e| e.to_string())?;
+
+    Ok(format!("data:image/jpeg;base64,{}", STANDARD.encode(&jpeg_bytes)))
+}
+
+/// After chunking, populates `formatted_body_md` for every non-noise chunk on the page
+/// by concatenating block text in order, preferring `transcribed_text` when present.
+async fn populate_formatted_body_from_transcriptions(
+    pool: &SqlitePool,
+    page_id: i64,
+) -> Result<(), String> {
+    let chunk_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM chunks WHERE page_id = ? AND chunk_type != 'noise'",
+    )
+    .bind(page_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    for chunk_id in chunk_ids {
+        let rows = sqlx::query(
+            "SELECT transcribed_text, text \
+             FROM text_blocks WHERE chunk_id = ? ORDER BY order_idx",
+        )
+        .bind(chunk_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if rows.is_empty() {
+            continue;
+        }
+
+        let mut used_transcribed_blocks: usize = 0;
+        let mut segments: Vec<String> = Vec::new();
+        for row in rows {
+            let transcribed: Option<String> = row.get("transcribed_text");
+            let extracted: String = row.get("text");
+
+            if let Some(value) = transcribed
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                used_transcribed_blocks += 1;
+                segments.push(value.to_string());
+                continue;
+            }
+
+            let extracted_trimmed = extracted.trim();
+            if !extracted_trimmed.is_empty() {
+                segments.push(extracted_trimmed.to_string());
+            }
+        }
+
+        if used_transcribed_blocks == 0 || segments.is_empty() {
+            continue;
+        }
+
+        let body_md = segments.join("\n\n");
+
+        if body_md.trim().is_empty() {
+            continue;
+        }
+
+        sqlx::query("UPDATE chunks SET formatted_body_md = ? WHERE id = ?")
+            .bind(&body_md)
+            .bind(chunk_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        debug!(
+            target: "gloss_lib::chunking",
+            "populated formatted_body_md for chunk_id={} ({} chars, {} transcribed blocks)",
+            chunk_id, body_md.len(), used_transcribed_blocks
+        );
+    }
+
+    Ok(())
 }
 
 fn emit_progress(app: &AppHandle, doc_id: i64, page_number: i64, phase: &'static str) {

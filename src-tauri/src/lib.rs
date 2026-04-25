@@ -1,17 +1,21 @@
 mod chunking;
+mod deepseek;
 mod gemini;
 mod llm;
 mod ollama;
 mod openai;
 mod references;
 mod settings;
+mod zai;
 
+use crate::deepseek::DeepSeekClient;
 use crate::gemini::GeminiClient;
 use crate::llm::{
     ChunkBodyPrompt, ChunkBodyResult, ChunkChatMessage, ChunkChatPrompt, LlmError, LlmProvider,
 };
 use crate::ollama::OllamaClient;
 use crate::openai::OpenAiClient;
+use crate::zai::ZaiClient;
 use log::info;
 use pdfium_render::prelude::*;
 use percent_encoding::percent_decode_str;
@@ -163,6 +167,7 @@ fn spawn_chunking_job(
     doc_id: i64,
     page_number: i64,
     provider: LlmProvider,
+    model_override: Option<String>,
 ) -> Result<bool, String> {
     if !begin_chunking_job(state, doc_id, page_number)? {
         return Ok(false);
@@ -178,7 +183,16 @@ fn spawn_chunking_job(
         provider
     );
     tokio::spawn(async move {
-        chunking::run_for_page(pool, pdfium, app, doc_id, page_number, provider).await;
+        chunking::run_for_page(
+            pool,
+            pdfium,
+            app,
+            doc_id,
+            page_number,
+            provider,
+            model_override,
+        )
+        .await;
         finish_chunking_job(&chunking_jobs, doc_id, page_number);
     });
     Ok(true)
@@ -278,6 +292,39 @@ fn emit_chunk_ai_stream(
             error,
         },
     );
+}
+
+fn validate_chunking_provider(provider: LlmProvider) -> Result<(), String> {
+    if provider.supports_chunking() {
+        Ok(())
+    } else {
+        Err(format!("provider {} does not support chunking", provider))
+    }
+}
+
+fn validate_chat_provider(provider: LlmProvider) -> Result<(), String> {
+    if provider.supports_chat() {
+        Ok(())
+    } else {
+        Err(format!("provider {} does not support chat", provider))
+    }
+}
+
+fn validate_vision_provider(provider: LlmProvider) -> Result<(), String> {
+    if provider.supports_vision() {
+        Ok(())
+    } else {
+        Err(format!(
+            "provider {} does not support vision transcription",
+            provider
+        ))
+    }
+}
+
+fn normalize_model_override(model: Option<String>) -> Option<String> {
+    model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[derive(serde::Deserialize, serde::Serialize, bincode::Encode, bincode::Decode, Clone, Copy)]
@@ -589,8 +636,12 @@ async fn get_ai_settings_state(
 async fn save_ai_api_keys(
     openai_api_key: Option<String>,
     gemini_api_key: Option<String>,
+    deepseek_api_key: Option<String>,
+    zai_api_key: Option<String>,
     clear_openai_api_key: Option<bool>,
     clear_gemini_api_key: Option<bool>,
+    clear_deepseek_api_key: Option<bool>,
+    clear_zai_api_key: Option<bool>,
     setup_complete: Option<bool>,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<settings::AiSettingsState, String> {
@@ -598,25 +649,75 @@ async fn save_ai_api_keys(
         pool.inner(),
         openai_api_key,
         gemini_api_key,
+        deepseek_api_key,
+        zai_api_key,
         clear_openai_api_key.unwrap_or(false),
         clear_gemini_api_key.unwrap_or(false),
+        clear_deepseek_api_key.unwrap_or(false),
+        clear_zai_api_key.unwrap_or(false),
         setup_complete.unwrap_or(false),
     )
     .await
+}
+
+async fn load_pretranscribed_chunk_body(
+    pool: &SqlitePool,
+    chunk_id: i64,
+) -> Result<Option<String>, String> {
+    let rows = sqlx::query(
+        "SELECT transcribed_text, text \
+         FROM text_blocks WHERE chunk_id = ? ORDER BY order_idx",
+    )
+    .bind(chunk_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut used_transcribed = false;
+    let mut segments = Vec::with_capacity(rows.len());
+    for row in rows {
+        let transcribed: Option<String> = row.get("transcribed_text");
+        let extracted: String = row.get("text");
+
+        if let Some(value) = transcribed
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            used_transcribed = true;
+            segments.push(value.to_string());
+            continue;
+        }
+
+        let extracted_trimmed = extracted.trim();
+        if !extracted_trimmed.is_empty() {
+            segments.push(extracted_trimmed.to_string());
+        }
+    }
+
+    if !used_transcribed || segments.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(segments.join("\n\n")))
 }
 
 #[tauri::command]
 async fn generate_chunk_formatted_body(
     chunk_id: i64,
     provider: String,
+    model: Option<String>,
     image_base64: String,
     force: Option<bool>,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<ChunkBodyResult, String> {
-    if image_base64.trim().is_empty() {
-        return Err("image payload was empty".into());
-    }
     let provider = provider.parse::<LlmProvider>()?;
+    validate_vision_provider(provider)?;
+    let model = normalize_model_override(model);
     let force = force.unwrap_or(false);
 
     let row = sqlx::query(
@@ -644,6 +745,34 @@ async fn generate_chunk_formatted_body(
                 body_markdown: existing.to_string(),
             });
         }
+
+        if let Some(reused) = load_pretranscribed_chunk_body(pool.inner(), chunk_id).await? {
+            info!(
+                target: "gloss_lib::llm",
+                "generate_chunk_formatted_body chunk_id={} reused block transcription",
+                chunk_id
+            );
+            sqlx::query("UPDATE chunks SET formatted_body_md = ? WHERE id = ?")
+                .bind(&reused)
+                .bind(chunk_id)
+                .execute(pool.inner())
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Err(e) = references::reindex_chunk_references(pool.inner(), chunk_id).await {
+                log::warn!(
+                    target: "gloss_lib::references",
+                    "failed to reindex references for chunk_id={}: {}",
+                    chunk_id, e
+                );
+            }
+            return Ok(ChunkBodyResult {
+                body_markdown: reused,
+            });
+        }
+    }
+
+    if image_base64.trim().is_empty() {
+        return Err("image payload was empty".into());
     }
 
     info!(
@@ -662,15 +791,26 @@ async fn generate_chunk_formatted_body(
     };
     let configured_api_key = settings::api_key_for_provider(pool.inner(), provider).await?;
     let result = match provider {
-        LlmProvider::Ollama => OllamaClient::new()
+        LlmProvider::Ollama => OllamaClient::with_vision_model(model.clone())
             .transcribe_chunk_body(&prompt, &image_base64)
             .await
             .map_err(|e| e.to_string())?,
-        LlmProvider::OpenAI => OpenAiClient::with_api_key(configured_api_key)
-            .transcribe_chunk_body(&prompt, &image_base64)
-            .await
-            .map_err(|e| e.to_string())?,
-        LlmProvider::Gemini => GeminiClient::with_api_key(configured_api_key)
+        LlmProvider::OpenAI => {
+            OpenAiClient::with_api_key_and_model(configured_api_key, model.clone())
+                .transcribe_chunk_body(&prompt, &image_base64)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        LlmProvider::Gemini => {
+            GeminiClient::with_api_key_and_model(configured_api_key, model.clone())
+                .transcribe_chunk_body(&prompt, &image_base64)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        LlmProvider::DeepSeek => {
+            return Err("provider deepseek does not support vision transcription".to_string())
+        }
+        LlmProvider::Zai => ZaiClient::with_api_key_and_model(configured_api_key, model)
             .transcribe_chunk_body(&prompt, &image_base64)
             .await
             .map_err(|e| e.to_string())?,
@@ -766,6 +906,7 @@ async fn run_chunk_ai_stream(
     request_id: String,
     chunk_id: i64,
     provider: LlmProvider,
+    model_override: Option<String>,
     history: Vec<ChunkChatMessage>,
     cancelled: Arc<AtomicBool>,
 ) {
@@ -806,20 +947,28 @@ async fn run_chunk_ai_stream(
 
         match provider {
             LlmProvider::Ollama => {
-                OllamaClient::new()
+                OllamaClient::with_text_model(model_override.clone())
                     .stream_chunk_chat(&prompt, &history, emit_delta, should_cancel)
                     .await
             }
             LlmProvider::OpenAI => {
-                OpenAiClient::with_api_key(configured_api_key)
+                OpenAiClient::with_api_key_and_model(configured_api_key, model_override.clone())
                     .stream_chunk_chat(&prompt, &history, emit_delta, should_cancel)
                     .await
             }
             LlmProvider::Gemini => {
-                GeminiClient::with_api_key(configured_api_key)
+                GeminiClient::with_api_key_and_model(configured_api_key, model_override.clone())
                     .stream_chunk_chat(&prompt, &history, emit_delta, should_cancel)
                     .await
             }
+            LlmProvider::DeepSeek => {
+                DeepSeekClient::with_api_key_and_model(configured_api_key, model_override.clone())
+                    .stream_chunk_chat(&prompt, &history, emit_delta, should_cancel)
+                    .await
+            }
+            LlmProvider::Zai => Err(LlmError::Config(
+                "provider zai does not support chat".to_string(),
+            )),
         }
     }
     .await;
@@ -855,6 +1004,7 @@ async fn start_chunk_ai_stream(
     request_id: String,
     chunk_id: i64,
     provider: String,
+    model: Option<String>,
     history: Vec<ChunkChatMessage>,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -869,6 +1019,8 @@ async fn start_chunk_ai_stream(
     }
 
     let provider = provider.parse::<LlmProvider>()?;
+    validate_chat_provider(provider)?;
+    let model = normalize_model_override(model);
     let history = sanitize_chunk_chat_history(history)?;
     let cancelled = begin_chat_stream(state.inner(), &request_id, chunk_id)?;
     let chat_streams = Arc::clone(&state.chat_streams);
@@ -881,6 +1033,7 @@ async fn start_chunk_ai_stream(
         request_id,
         chunk_id,
         provider,
+        model,
         history,
         cancelled,
     ));
@@ -1202,6 +1355,7 @@ async fn ensure_chunking_for_page(
     source_document_id: i64,
     page_number: i64,
     provider: String,
+    model: Option<String>,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     pool: tauri::State<'_, SqlitePool>,
@@ -1210,6 +1364,8 @@ async fn ensure_chunking_for_page(
         return Err(format!("invalid page number {}", page_number));
     }
     let provider = provider.parse::<LlmProvider>()?;
+    validate_chunking_provider(provider)?;
+    let model = normalize_model_override(model);
 
     sqlx::query("INSERT OR IGNORE INTO pages (source_document_id, page_number) VALUES (?, ?)")
         .bind(source_document_id)
@@ -1248,7 +1404,128 @@ async fn ensure_chunking_for_page(
         source_document_id,
         page_number,
         provider,
+        model,
     )
+}
+
+#[derive(serde::Serialize)]
+struct EnsureChunkingRangeResult {
+    requested_start_page: i64,
+    requested_end_page: i64,
+    started_pages: i64,
+    skipped_pages: i64,
+}
+
+#[tauri::command]
+async fn ensure_chunking_for_page_range(
+    source_document_id: i64,
+    start_page: i64,
+    end_page: i64,
+    provider: String,
+    model: Option<String>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<EnsureChunkingRangeResult, String> {
+    if start_page < 1 {
+        return Err(format!("invalid start page {}", start_page));
+    }
+    if end_page < start_page {
+        return Err(format!(
+            "invalid page range {}-{} (end before start)",
+            start_page, end_page
+        ));
+    }
+
+    let provider = provider.parse::<LlmProvider>()?;
+    validate_chunking_provider(provider)?;
+    let model = normalize_model_override(model);
+
+    let row = sqlx::query("SELECT file_path FROM source_documents WHERE id = ?")
+        .bind(source_document_id)
+        .fetch_one(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+    let relative_path: String = row.get("file_path");
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let abs_path = data_dir.join(relative_path);
+    let page_count = state
+        .pdfium
+        .run(move |pdfium| {
+            let doc = pdfium
+                .load_pdf_from_file(&abs_path, None)
+                .map_err(|e| e.to_string())?;
+            Ok(doc.pages().len() as i64)
+        })
+        .await?;
+
+    if end_page > page_count {
+        return Err(format!(
+            "invalid page range {}-{}; document has {} pages",
+            start_page, end_page, page_count
+        ));
+    }
+
+    let existing_chunk_pages: HashSet<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT p.page_number \
+         FROM chunks c \
+         JOIN pages p ON p.id = c.page_id \
+         WHERE p.source_document_id = ? \
+           AND p.page_number BETWEEN ? AND ?",
+    )
+    .bind(source_document_id)
+    .bind(start_page)
+    .bind(end_page)
+    .fetch_all(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .collect();
+
+    let mut pages_to_start: Vec<i64> = Vec::new();
+    let mut skipped_pages = 0_i64;
+
+    for page in start_page..=end_page {
+        if existing_chunk_pages.contains(&page) {
+            skipped_pages += 1;
+            continue;
+        }
+        if !begin_chunking_job(state.inner(), source_document_id, page)? {
+            skipped_pages += 1;
+            continue;
+        }
+        pages_to_start.push(page);
+    }
+
+    let started_pages = pages_to_start.len() as i64;
+    if started_pages > 0 {
+        let chunking_jobs = Arc::clone(&state.chunking_jobs);
+        let pdfium = state.pdfium.clone();
+        let pool = pool.inner().clone();
+        let app_for_tasks = app.clone();
+        tokio::spawn(async move {
+            for page_number in pages_to_start {
+                chunking::run_for_page(
+                    pool.clone(),
+                    pdfium.clone(),
+                    app_for_tasks.clone(),
+                    source_document_id,
+                    page_number,
+                    provider,
+                    model.clone(),
+                )
+                .await;
+                finish_chunking_job(&chunking_jobs, source_document_id, page_number);
+            }
+        });
+    }
+
+    Ok(EnsureChunkingRangeResult {
+        requested_start_page: start_page,
+        requested_end_page: end_page,
+        started_pages,
+        skipped_pages,
+    })
 }
 
 #[tauri::command]
@@ -1256,6 +1533,7 @@ async fn rechunk_page(
     source_document_id: i64,
     page_number: i64,
     provider: String,
+    model: Option<String>,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     pool: tauri::State<'_, SqlitePool>,
@@ -1264,6 +1542,8 @@ async fn rechunk_page(
         return Err(format!("invalid page number {}", page_number));
     }
     let provider = provider.parse::<LlmProvider>()?;
+    validate_chunking_provider(provider)?;
+    let model = normalize_model_override(model);
     if !begin_chunking_job(state.inner(), source_document_id, page_number)? {
         return Err("chunking already active for this page".into());
     }
@@ -1274,6 +1554,7 @@ async fn rechunk_page(
         source_document_id,
         page_number,
         provider,
+        model,
     )
     .await;
     finish_chunking_job(&state.chunking_jobs, source_document_id, page_number);
@@ -1742,6 +2023,8 @@ pub fn run() {
                 .level_for("gloss_lib::gemini", log::LevelFilter::Debug)
                 .level_for("gloss_lib::openai", log::LevelFilter::Debug)
                 .level_for("gloss_lib::ollama", log::LevelFilter::Debug)
+                .level_for("gloss_lib::deepseek", log::LevelFilter::Debug)
+                .level_for("gloss_lib::zai", log::LevelFilter::Debug)
                 .timezone_strategy(TimezoneStrategy::UseLocal)
                 .build(),
         )
@@ -1812,6 +2095,7 @@ pub fn run() {
             get_chunking_status,
             is_chunking_page_active,
             ensure_chunking_for_page,
+            ensure_chunking_for_page_range,
             rechunk_page,
         ])
         .run(tauri::generate_context!())

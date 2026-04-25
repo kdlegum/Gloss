@@ -32,3 +32,6 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 bincode = "2"
 pdfium-render = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
+futures = "0.3"

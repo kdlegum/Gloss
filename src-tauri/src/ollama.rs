@@ -20,11 +20,26 @@ pub struct OllamaClient {
 }
 
 impl OllamaClient {
-    pub fn new() -> Self {
+    pub fn with_text_model(model_override: Option<String>) -> Self {
+        Self::with_models(model_override, None)
+    }
+
+    pub fn with_vision_model(model_override: Option<String>) -> Self {
+        Self::with_models(None, model_override)
+    }
+
+    pub fn with_models(
+        model_override: Option<String>,
+        vision_model_override: Option<String>,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
             .expect("failed to build reqwest client");
+        let configured_model = normalize_model(model_override)
+            .or_else(|| normalize_model(std::env::var("LLAMA_SERVER_MODEL").ok()));
+        let configured_vision_model = normalize_model(vision_model_override)
+            .or_else(|| normalize_model(std::env::var("LLAMA_SERVER_VISION_MODEL").ok()));
         Self {
             base_url: std::env::var("LLAMA_SERVER_BASE_URL")
                 .ok()
@@ -32,14 +47,8 @@ impl OllamaClient {
                 .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
                 .trim_end_matches('/')
                 .to_string(),
-            model: std::env::var("LLAMA_SERVER_MODEL")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
-            vision_model: std::env::var("LLAMA_SERVER_VISION_MODEL")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+            model: configured_model,
+            vision_model: configured_vision_model,
             client,
         }
     }
@@ -369,4 +378,10 @@ fn first_model_id(value: &Value) -> Option<&str> {
         .and_then(|model| model.get("id"))
         .and_then(Value::as_str)
         .filter(|id| !id.trim().is_empty())
+}
+
+fn normalize_model(model: Option<String>) -> Option<String> {
+    model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }

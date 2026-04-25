@@ -21,11 +21,14 @@ pub struct GeminiClient {
 }
 
 impl GeminiClient {
-    pub fn with_api_key(api_key: Option<String>) -> Self {
+    pub fn with_api_key_and_model(api_key: Option<String>, model_override: Option<String>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
             .expect("failed to build reqwest client");
+        let model = normalize_model(model_override)
+            .or_else(|| normalize_model(std::env::var("GEMINI_MODEL").ok()))
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
         Self {
             api_key: normalize_api_key(api_key).or_else(|| std::env::var("GEMINI_API_KEY").ok()),
             base_url: std::env::var("GEMINI_API_BASE_URL")
@@ -34,11 +37,7 @@ impl GeminiClient {
                 .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
                 .trim_end_matches('/')
                 .to_string(),
-            model: std::env::var("GEMINI_MODEL")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            model,
             client,
         }
     }
@@ -257,6 +256,12 @@ impl GeminiClient {
 
 fn normalize_api_key(api_key: Option<String>) -> Option<String> {
     api_key
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_model(model: Option<String>) -> Option<String> {
+    model
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }

@@ -21,15 +21,18 @@ pub struct OpenAiClient {
 }
 
 impl OpenAiClient {
-    pub fn with_api_key(api_key: Option<String>) -> Self {
+    pub fn with_api_key_and_model(api_key: Option<String>, model_override: Option<String>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
             .expect("failed to build reqwest client");
+        let model = normalize_model(model_override)
+            .or_else(|| normalize_model(std::env::var("OPENAI_MODEL").ok()))
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
         Self {
             api_key: normalize_api_key(api_key).or_else(|| std::env::var("OPENAI_API_KEY").ok()),
             base_url: DEFAULT_BASE_URL.to_string(),
-            model: DEFAULT_MODEL.to_string(),
+            model,
             client,
         }
     }
@@ -61,21 +64,32 @@ impl OpenAiClient {
         );
 
         let prompt = build_prompt(blocks);
-        let value = self
-            .send_request(json!({
-                "model": self.model,
-                "store": false,
-                "input": prompt,
-                "temperature": 0.1,
-                "text": {
-                    "format": {
-                        "type": "json_schema",
-                        "name": "chunk_groups",
-                        "schema": chunk_groups_schema(),
-                        "strict": true
-                    }
+        let mut request = json!({
+            "model": self.model,
+            "store": false,
+            "input": prompt,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "chunk_groups",
+                    "schema": chunk_groups_schema(),
+                    "strict": true
                 }
-            }))
+            }
+        });
+        if model_supports_temperature(&self.model) {
+            if let Some(obj) = request.as_object_mut() {
+                obj.insert("temperature".to_string(), json!(0.1));
+            }
+        } else {
+            debug!(
+                target: LOG_TARGET,
+                "chunk_blocks model={} does not support temperature; omitting parameter",
+                self.model
+            );
+        }
+        let value = self
+            .send_request(request)
             .await?;
         let output_text =
             extract_output_text(&value).ok_or_else(|| LlmError::Parse(value.to_string()))?;
@@ -281,6 +295,16 @@ fn normalize_api_key(api_key: Option<String>) -> Option<String> {
     api_key
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn normalize_model(model: Option<String>) -> Option<String> {
+    model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn model_supports_temperature(model: &str) -> bool {
+    !model.trim().to_ascii_lowercase().starts_with("gpt-5-nano")
 }
 
 fn build_chat_input(prompt: &str, history: &[ChunkChatMessage]) -> Value {

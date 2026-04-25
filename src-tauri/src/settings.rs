@@ -4,6 +4,8 @@ use sqlx::SqlitePool;
 
 const OPENAI_API_KEY: &str = "openai_api_key";
 const GEMINI_API_KEY: &str = "gemini_api_key";
+const DEEPSEEK_API_KEY: &str = "deepseek_api_key";
+const ZAI_API_KEY: &str = "zai_api_key";
 const AI_SETUP_COMPLETE: &str = "ai_setup_complete";
 
 #[derive(Serialize)]
@@ -12,6 +14,8 @@ pub struct AiSettingsState {
     pub setup_complete: bool,
     pub openai_api_key_set: bool,
     pub gemini_api_key_set: bool,
+    pub deepseek_api_key_set: bool,
+    pub zai_api_key_set: bool,
 }
 
 pub async fn state(pool: &SqlitePool) -> Result<AiSettingsState, String> {
@@ -23,6 +27,8 @@ pub async fn state(pool: &SqlitePool) -> Result<AiSettingsState, String> {
             .is_some_and(|value| value == "true"),
         openai_api_key_set: setting_has_value(pool, OPENAI_API_KEY).await?,
         gemini_api_key_set: setting_has_value(pool, GEMINI_API_KEY).await?,
+        deepseek_api_key_set: setting_has_value(pool, DEEPSEEK_API_KEY).await?,
+        zai_api_key_set: setting_has_value(pool, ZAI_API_KEY).await?,
     })
 }
 
@@ -33,6 +39,8 @@ pub async fn api_key_for_provider(
     match provider {
         LlmProvider::OpenAI => get_setting(pool, OPENAI_API_KEY).await,
         LlmProvider::Gemini => get_setting(pool, GEMINI_API_KEY).await,
+        LlmProvider::DeepSeek => get_setting(pool, DEEPSEEK_API_KEY).await,
+        LlmProvider::Zai => get_setting(pool, ZAI_API_KEY).await,
         LlmProvider::Ollama => Ok(None),
     }
 }
@@ -41,8 +49,12 @@ pub async fn save_ai_api_keys(
     pool: &SqlitePool,
     openai_api_key: Option<String>,
     gemini_api_key: Option<String>,
+    deepseek_api_key: Option<String>,
+    zai_api_key: Option<String>,
     clear_openai_api_key: bool,
     clear_gemini_api_key: bool,
+    clear_deepseek_api_key: bool,
+    clear_zai_api_key: bool,
     setup_complete: bool,
 ) -> Result<AiSettingsState, String> {
     if clear_openai_api_key {
@@ -55,6 +67,18 @@ pub async fn save_ai_api_keys(
         delete_setting(pool, GEMINI_API_KEY).await?;
     } else if let Some(api_key) = normalize_secret(gemini_api_key) {
         set_setting(pool, GEMINI_API_KEY, &api_key).await?;
+    }
+
+    if clear_deepseek_api_key {
+        delete_setting(pool, DEEPSEEK_API_KEY).await?;
+    } else if let Some(api_key) = normalize_secret(deepseek_api_key) {
+        set_setting(pool, DEEPSEEK_API_KEY, &api_key).await?;
+    }
+
+    if clear_zai_api_key {
+        delete_setting(pool, ZAI_API_KEY).await?;
+    } else if let Some(api_key) = normalize_secret(zai_api_key) {
+        set_setting(pool, ZAI_API_KEY, &api_key).await?;
     }
 
     if setup_complete {
