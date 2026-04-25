@@ -11,7 +11,8 @@ mod zai;
 use crate::deepseek::DeepSeekClient;
 use crate::gemini::GeminiClient;
 use crate::llm::{
-    ChunkBodyPrompt, ChunkBodyResult, ChunkChatMessage, ChunkChatPrompt, LlmError, LlmProvider,
+    sanitize_chunk_body_markdown, ChunkBodyPrompt, ChunkBodyResult, ChunkChatMessage,
+    ChunkChatPrompt, LlmError, LlmProvider,
 };
 use crate::ollama::OllamaClient;
 use crate::openai::OpenAiClient;
@@ -28,6 +29,7 @@ use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_fs::{FilePath, FsExt};
 use tauri_plugin_log::{Target, TargetKind, TimezoneStrategy};
+use tokio::sync::Semaphore;
 
 // ── Pdfium worker ────────────────────────────────────────────────────────────
 // pdfium_render's Pdfium is !Send, so it must live on a single dedicated thread.
@@ -152,6 +154,7 @@ struct AppState {
     pdfium: PdfiumWorker,
     chunking_jobs: Arc<Mutex<HashSet<(i64, i64)>>>,
     chat_streams: Arc<Mutex<HashMap<String, ChatStreamHandle>>>,
+    zai_transcription_semaphore: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -175,6 +178,7 @@ fn spawn_chunking_job(
 
     let chunking_jobs = Arc::clone(&state.chunking_jobs);
     let pdfium = state.pdfium.clone();
+    let zai_transcription_semaphore = Arc::clone(&state.zai_transcription_semaphore);
     info!(
         target: "gloss_lib::chunking",
         "spawning tracked chunking job for doc_id={} page={} provider={}",
@@ -191,6 +195,7 @@ fn spawn_chunking_job(
             page_number,
             provider,
             model_override,
+            zai_transcription_semaphore,
         )
         .await;
         finish_chunking_job(&chunking_jobs, doc_id, page_number);
@@ -747,13 +752,17 @@ async fn generate_chunk_formatted_body(
         }
 
         if let Some(reused) = load_pretranscribed_chunk_body(pool.inner(), chunk_id).await? {
+            let cleaned = sanitize_chunk_body_markdown(&reused);
+            if cleaned.is_empty() {
+                return Err("reused chunk body was empty after sanitization".into());
+            }
             info!(
                 target: "gloss_lib::llm",
                 "generate_chunk_formatted_body chunk_id={} reused block transcription",
                 chunk_id
             );
             sqlx::query("UPDATE chunks SET formatted_body_md = ? WHERE id = ?")
-                .bind(&reused)
+                .bind(&cleaned)
                 .bind(chunk_id)
                 .execute(pool.inner())
                 .await
@@ -766,7 +775,7 @@ async fn generate_chunk_formatted_body(
                 );
             }
             return Ok(ChunkBodyResult {
-                body_markdown: reused,
+                body_markdown: cleaned,
             });
         }
     }
@@ -816,8 +825,13 @@ async fn generate_chunk_formatted_body(
             .map_err(|e| e.to_string())?,
     };
 
+    let body_markdown = sanitize_chunk_body_markdown(&result.body_markdown);
+    if body_markdown.is_empty() {
+        return Err("vision transcription returned empty chunk body".to_string());
+    }
+
     sqlx::query("UPDATE chunks SET formatted_body_md = ? WHERE id = ?")
-        .bind(&result.body_markdown)
+        .bind(&body_markdown)
         .bind(chunk_id)
         .execute(pool.inner())
         .await
@@ -831,7 +845,7 @@ async fn generate_chunk_formatted_body(
         );
     }
 
-    Ok(result)
+    Ok(ChunkBodyResult { body_markdown })
 }
 
 struct ChunkChatContext {
@@ -1413,6 +1427,7 @@ struct EnsureChunkingRangeResult {
     requested_start_page: i64,
     requested_end_page: i64,
     started_pages: i64,
+    started_page_numbers: Vec<i64>,
     skipped_pages: i64,
 }
 
@@ -1421,6 +1436,7 @@ async fn ensure_chunking_for_page_range(
     source_document_id: i64,
     start_page: i64,
     end_page: i64,
+    skip_chunked_pages: Option<bool>,
     provider: String,
     model: Option<String>,
     app: tauri::AppHandle,
@@ -1439,6 +1455,7 @@ async fn ensure_chunking_for_page_range(
 
     let provider = provider.parse::<LlmProvider>()?;
     validate_chunking_provider(provider)?;
+    let skip_chunked_pages = skip_chunked_pages.unwrap_or(true);
     let model = normalize_model_override(model);
 
     let row = sqlx::query("SELECT file_path FROM source_documents WHERE id = ?")
@@ -1482,11 +1499,12 @@ async fn ensure_chunking_for_page_range(
     .into_iter()
     .collect();
 
-    let mut pages_to_start: Vec<i64> = Vec::new();
+    let mut pages_to_start: Vec<(i64, bool)> = Vec::new();
     let mut skipped_pages = 0_i64;
 
     for page in start_page..=end_page {
-        if existing_chunk_pages.contains(&page) {
+        let has_existing_chunks = existing_chunk_pages.contains(&page);
+        if skip_chunked_pages && has_existing_chunks {
             skipped_pages += 1;
             continue;
         }
@@ -1494,27 +1512,45 @@ async fn ensure_chunking_for_page_range(
             skipped_pages += 1;
             continue;
         }
-        pages_to_start.push(page);
+        pages_to_start.push((page, has_existing_chunks));
     }
 
-    let started_pages = pages_to_start.len() as i64;
+    let started_page_numbers: Vec<i64> = pages_to_start
+        .iter()
+        .map(|(page_number, _)| *page_number)
+        .collect();
+    let started_pages = started_page_numbers.len() as i64;
     if started_pages > 0 {
         let chunking_jobs = Arc::clone(&state.chunking_jobs);
         let pdfium = state.pdfium.clone();
+        let zai_transcription_semaphore = Arc::clone(&state.zai_transcription_semaphore);
         let pool = pool.inner().clone();
         let app_for_tasks = app.clone();
         tokio::spawn(async move {
-            for page_number in pages_to_start {
-                chunking::run_for_page(
-                    pool.clone(),
-                    pdfium.clone(),
-                    app_for_tasks.clone(),
-                    source_document_id,
-                    page_number,
-                    provider,
-                    model.clone(),
-                )
-                .await;
+            for (page_number, has_existing_chunks) in pages_to_start {
+                if has_existing_chunks {
+                    let _ = chunking::rechunk_page(
+                        &pool,
+                        &app_for_tasks,
+                        source_document_id,
+                        page_number,
+                        provider,
+                        model.clone(),
+                    )
+                    .await;
+                } else {
+                    chunking::run_for_page(
+                        pool.clone(),
+                        pdfium.clone(),
+                        app_for_tasks.clone(),
+                        source_document_id,
+                        page_number,
+                        provider,
+                        model.clone(),
+                        Arc::clone(&zai_transcription_semaphore),
+                    )
+                    .await;
+                }
                 finish_chunking_job(&chunking_jobs, source_document_id, page_number);
             }
         });
@@ -1524,6 +1560,7 @@ async fn ensure_chunking_for_page_range(
         requested_start_page: start_page,
         requested_end_page: end_page,
         started_pages,
+        started_page_numbers,
         skipped_pages,
     })
 }
@@ -2061,6 +2098,8 @@ pub fn run() {
                 pdfium,
                 chunking_jobs: Arc::new(Mutex::new(HashSet::new())),
                 chat_streams: Arc::new(Mutex::new(HashMap::new())),
+                // Z.AI rejects higher fan-out, so keep transcription globally throttled.
+                zai_transcription_semaphore: Arc::new(Semaphore::new(2)),
             });
             info!(target: "gloss_lib::startup", "gloss startup complete");
             Ok(())

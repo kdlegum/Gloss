@@ -1,4 +1,4 @@
-<script lang="ts">
+﻿<script lang="ts">
   import "katex/dist/katex.min.css";
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -58,7 +58,27 @@
     requested_start_page: number;
     requested_end_page: number;
     started_pages: number;
+    started_page_numbers: number[];
     skipped_pages: number;
+  }
+
+  interface BatchChunkProgressState {
+    docId: number;
+    startPage: number;
+    endPage: number;
+    providerLabel: string;
+    modelLabel: string;
+    totalPages: number;
+    completedPages: number;
+    failedPages: number;
+    skippedPages: number;
+    startedPages: number[];
+    extractedPages: number[];
+    groupedPages: number[];
+    failedPageNumbers: number[];
+    statusMessage: string;
+    messages: string[];
+    finished: boolean;
   }
 
   const LEGACY_CHUNKING_PROVIDER_STORAGE_KEY = "gloss_chunking_provider";
@@ -211,9 +231,11 @@
   let aiSettingsError = $state<string | null>(null);
   let batchChunkStartInput = $state("1");
   let batchChunkEndInput = $state("1");
+  let batchChunkSkipChunkedPages = $state(true);
   let batchChunkStarting = $state(false);
   let batchChunkError = $state<string | null>(null);
   let batchChunkFeedback = $state<string | null>(null);
+  let batchChunkProgress = $state<BatchChunkProgressState | null>(null);
   let customModelMode = $state<{ chunking: boolean; chat: boolean; vision: boolean }>({
     chunking: false,
     chat: false,
@@ -325,7 +347,7 @@
   // DB row id for the current (source_document, page) pair; null until resolved
   let currentPageId = $state<number | null>(null);
 
-  // ── Stroke prefetch cache ──
+  // â”€â”€ Stroke prefetch cache â”€â”€
   // 5-entry LRU keyed by page DB id. Evicts the oldest entry when full.
   const STROKE_CACHE_SIZE = 5;
   const strokeCacheOrder: number[] = [];   // front = most recently used
@@ -427,7 +449,7 @@
     markDirty();
   }
 
-  // ── Tool mode ──
+  // â”€â”€ Tool mode â”€â”€
   type Mode = 'draw' | 'erase' | 'select';
   let mode = $state<Mode>('draw');
   const PEN_COLOURS = [
@@ -453,14 +475,14 @@
   let penThickness = $state(DEFAULT_PEN_THICKNESS);
   let showPenOptions = $state(false);
 
-  // ── Select state ──
+  // â”€â”€ Select state â”€â”€
   type Rect = { x: number; y: number; w: number; h: number }; // normalised page space
   let selectOrigin = $state<{ x: number; y: number } | null>(null);
   let selectRect   = $state<Rect | null>(null);
   let selectedStrokes = $state<Set<Stroke>>(new Set());
   let selection = $state<{ x: number; y: number; width: number; height: number } | null>(null);
 
-  // ── Drawing state ──
+  // â”€â”€ Drawing state â”€â”€
   type Point = { x: number; y: number; pressure: number };  // normalised page space
   type BBox = { minX: number; minY: number; maxX: number; maxY: number };
   type Stroke = {
@@ -493,7 +515,7 @@
 
   const PRESSURE_WIDTH_THRESHOLD = 0.5;
 
-  // ── Infinite canvas state ──
+  // â”€â”€ Infinite canvas state â”€â”€
   // camera is $state so the toolbar zoom% and disabled states stay in sync.
   // The render loop reads it directly (no reactive overhead on every frame).
   interface Camera { x: number; y: number; scale: number }
@@ -535,7 +557,7 @@
 
   function markDirty() { dirty = true; scheduleRender(); }
 
-  // ── PDF bitmap cache ──
+  // â”€â”€ PDF bitmap cache â”€â”€
   // Keyed by "pageNum:scaleKey". Stores rendered ImageBitmaps.
   const PDF_BITMAP_CACHE_MAX = 10;
   const PDF_PREVIEW_DPR_CAP = 1.25;
@@ -724,7 +746,7 @@
     }
   }
 
-  // ── Coordinate transforms ──
+  // â”€â”€ Coordinate transforms â”€â”€
 
   function screenToWorld(sx: number, sy: number): { x: number; y: number } {
     return {
@@ -746,7 +768,7 @@
     };
   }
 
-  /** Normalised page space → world space coordinates. */
+  /** Normalised page space â†’ world space coordinates. */
   function normToWorld(nx: number, ny: number): { x: number; y: number } {
     return {
       x: pageOrigin.x + nx * pageSize.w,
@@ -812,7 +834,7 @@
     return (thickness * (0.5 + pressure)) / camera.scale;
   }
 
-  // ── Erase eraser hit radius in world units ──
+  // â”€â”€ Erase eraser hit radius in world units â”€â”€
   const ERASE_RADIUS_WORLD = 6; // ~6px at scale=1
 
   function eraseAt(normX: number, normY: number) {
@@ -854,7 +876,7 @@
     markDirty();
   }
 
-  // ── Touch pan/pinch state ──
+  // â”€â”€ Touch pan/pinch state â”€â”€
   interface TouchPointer { id: number; x: number; y: number }
   let touchPointers: TouchPointer[] = [];
 
@@ -869,7 +891,7 @@
   let lastPinchDist = 0;
   let lastPinchMid = { x: 0, y: 0 };
 
-  // ── Pointer events ──
+  // â”€â”€ Pointer events â”€â”€
 
   function beginPendingChunkTap(e: PointerEvent, chunk: ChunkInfo) {
     pendingChunkTap = {
@@ -1193,7 +1215,7 @@
     markDirty();
   }
 
-  // ── Render loop ──
+  // â”€â”€ Render loop â”€â”€
 
   function renderAll() {
     renderGrid();
@@ -1402,7 +1424,7 @@
     ctx.stroke();
   }
 
-  // ── Hit test / selection helpers ──
+  // â”€â”€ Hit test / selection helpers â”€â”€
 
   function unionBBox(hits: Set<Stroke>): { x: number; y: number; width: number; height: number } | null {
     if (hits.size === 0) return null;
@@ -1432,7 +1454,7 @@
     return hit;
   }
 
-  // ── Canvas setup / resize ──
+  // â”€â”€ Canvas setup / resize â”€â”€
 
   function setupCanvases() {
     if (!canvasContainer || !gridCanvas || !pdfCanvas || !chunkOverlayCanvas || !dryCanvas || !wetCanvas) return;
@@ -1464,7 +1486,7 @@
     containerResizeObserver.observe(node);
   }
 
-  // ── Camera helpers ──
+  // â”€â”€ Camera helpers â”€â”€
 
   function zoomAt(screenX: number, screenY: number, factor: number) {
     const newScale = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, camera.scale * factor));
@@ -1485,7 +1507,7 @@
     markDirty();
   }
 
-  // ── PDF loading ──
+  // â”€â”€ PDF loading â”€â”€
 
   async function loadPdfPage(pageNum: number) {
     if (!selectedBook || !canvasContainer) return;
@@ -1528,7 +1550,7 @@
     }
   }
 
-  // ── Page navigation ──
+  // â”€â”€ Page navigation â”€â”€
 
   function getModelOptions(task: AiTask, provider: AnyProvider): ModelOption[] {
     if (task === "chunking") return CHUNKING_MODEL_OPTIONS[provider as ChunkingProvider] ?? [];
@@ -1914,6 +1936,9 @@
 
   async function openBook(book: SourceDocument) {
     error = null;
+    if (batchChunkProgress && batchChunkProgress.docId !== book.id) {
+      batchChunkProgress = null;
+    }
     if (chunkView) closeChunkView();
     pendingChunkTap = null;
     void appLogInfo(`[viewer] opening doc=${book.id} title="${book.title}"`);
@@ -2007,6 +2032,7 @@
   function closeViewer() {
     if (chunkView) closeChunkView();
     pendingChunkTap = null;
+    batchChunkProgress = null;
     selectedBook = null;
     currentPage = 1;
     currentPageId = null;
@@ -2026,7 +2052,7 @@
     chunkView = null;
   }
 
-  // ── Undo / Redo ──
+  // â”€â”€ Undo / Redo â”€â”€
 
   async function undoStroke() {
     if (strokes.length === 0) return;
@@ -2060,7 +2086,7 @@
     markDirty();
   }
 
-  // ── Delete selected ──
+  // â”€â”€ Delete selected â”€â”€
 
   async function deleteSelected() {
     if (selectedStrokes.size === 0) return;
@@ -2076,7 +2102,7 @@
     markDirty();
   }
 
-  // ── AI rasterisation ──
+  // â”€â”€ AI rasterisation â”€â”€
   let aiWorking = $state(false);
   let aiDebugImage = $state<string | null>(null);
   const CHUNK_TRANSCRIPTION_TARGET_WIDTH = 1400;
@@ -2118,7 +2144,7 @@
       const wBR = normToWorld(selection.x + selection.width, selection.y + selection.height);
       const worldW = wBR.x - wTL.x;
       const worldH = wBR.y - wTL.y;
-      // Scale to fill sw × sh
+      // Scale to fill sw x sh
       const renderS = sw / worldW;
       const inkCanvas = new OffscreenCanvas(Math.round(sw), Math.round(sh));
       const inkCtx = inkCanvas.getContext("2d")!;
@@ -2151,7 +2177,7 @@
     }
   }
 
-  // ── Chunks ──
+  // â”€â”€ Chunks â”€â”€
   interface ChunkInfo {
     id: number;
     chunk_type: string;
@@ -2265,9 +2291,16 @@
     surfaceId: number;
     strokes: Stroke[];
   } | null>(null);
+  let chunkViewTitleDisplay = $derived(chunkView ? getChunkTitleDisplay(chunkView.chunk) : null);
   let chunkViewRefs = $state<ResolvedReference[]>([]);
   let chunkViewBodyHtml = $derived(
-    chunkView ? renderChunkBodyHtml(getChunkDisplayBody(chunkView.chunk), chunkViewRefs) : "",
+    chunkView
+      ? renderChunkBodyHtml(getChunkDisplayBody(chunkView.chunk), chunkViewRefs, {
+        allowHeadings: false,
+        allowStrong: false,
+        suppressLeadingText: chunkViewTitleDisplay?.suppressionCandidates ?? [],
+      })
+      : "",
   );
   let chunkPeek = $state<{
     chunkId: number;
@@ -2647,6 +2680,117 @@
     return parsed;
   }
 
+  let batchChunkProgressPercent = $derived(
+    !batchChunkProgress
+      ? 0
+      : batchChunkProgress.totalPages <= 0
+        ? 100
+        : Math.round((batchChunkProgress.completedPages / batchChunkProgress.totalPages) * 100),
+  );
+
+  function pushBatchChunkProgressMessage(message: string) {
+    if (!batchChunkProgress) return;
+    const timestamp = new Date().toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+    batchChunkProgress = {
+      ...batchChunkProgress,
+      statusMessage: message,
+      messages: [`${timestamp}  ${message}`, ...batchChunkProgress.messages].slice(0, 6),
+    };
+  }
+
+  function beginBatchChunkProgress(options: {
+    docId: number;
+    startPage: number;
+    endPage: number;
+    providerLabel: string;
+    modelLabel: string;
+  }) {
+    const initialStatus = `Starting batch chunking with ${options.providerLabel}${options.modelLabel ? ` (${options.modelLabel})` : ""}...`;
+    batchChunkProgress = {
+      docId: options.docId,
+      startPage: options.startPage,
+      endPage: options.endPage,
+      providerLabel: options.providerLabel,
+      modelLabel: options.modelLabel,
+      totalPages: 0,
+      completedPages: 0,
+      failedPages: 0,
+      skippedPages: 0,
+      startedPages: [],
+      extractedPages: [],
+      groupedPages: [],
+      failedPageNumbers: [],
+      statusMessage: initialStatus,
+      messages: [],
+      finished: false,
+    };
+    pushBatchChunkProgressMessage(initialStatus);
+  }
+
+  function dismissBatchChunkProgress() {
+    batchChunkProgress = null;
+  }
+
+  function onBatchChunkProgressEvent(phase: string, pageNumber: number) {
+    const progress = batchChunkProgress;
+    if (!progress) return;
+    if (!progress.startedPages.includes(pageNumber)) return;
+
+    if (phase === "extracted") {
+      if (progress.extractedPages.includes(pageNumber)) return;
+      batchChunkProgress = {
+        ...progress,
+        extractedPages: [...progress.extractedPages, pageNumber],
+      };
+      pushBatchChunkProgressMessage(`Page ${pageNumber}: extracted text, grouping next.`);
+      return;
+    }
+
+    if (phase === "grouped") {
+      if (progress.groupedPages.includes(pageNumber) || progress.failedPageNumbers.includes(pageNumber)) return;
+      const completedPages = progress.completedPages + 1;
+      const groupedPages = [...progress.groupedPages, pageNumber];
+      const finished = completedPages >= progress.totalPages;
+      let statusMessage = `Page ${pageNumber}: chunked (${completedPages}/${progress.totalPages}).`;
+      if (finished) {
+        statusMessage = progress.failedPages > 0
+          ? `Batch finished: ${progress.totalPages - progress.failedPages}/${progress.totalPages} pages succeeded, ${progress.failedPages} failed, ${progress.skippedPages} skipped.`
+          : `Batch finished: ${progress.totalPages}/${progress.totalPages} pages chunked, ${progress.skippedPages} skipped.`;
+      }
+      batchChunkProgress = {
+        ...progress,
+        completedPages,
+        groupedPages,
+        finished,
+      };
+      pushBatchChunkProgressMessage(statusMessage);
+      return;
+    }
+
+    if (phase === "failed") {
+      if (progress.failedPageNumbers.includes(pageNumber) || progress.groupedPages.includes(pageNumber)) return;
+      const completedPages = progress.completedPages + 1;
+      const failedPages = progress.failedPages + 1;
+      const failedPageNumbers = [...progress.failedPageNumbers, pageNumber];
+      const finished = completedPages >= progress.totalPages;
+      const statusMessage = finished
+        ? `Batch finished with failures: ${progress.totalPages - failedPages}/${progress.totalPages} pages succeeded, ${failedPages} failed, ${progress.skippedPages} skipped.`
+        : `Page ${pageNumber}: chunking failed (${completedPages}/${progress.totalPages} finished).`;
+      batchChunkProgress = {
+        ...progress,
+        completedPages,
+        failedPages,
+        failedPageNumbers,
+        finished,
+      };
+      pushBatchChunkProgressMessage(statusMessage);
+    }
+  }
+
   async function reChunkCurrentPage() {
     if (!selectedBook || !canRechunkPage) return;
 
@@ -2696,28 +2840,42 @@
     const activeBook = selectedBook;
     if (!activeBook || !canBatchChunkDocument) return;
 
-    const chunkingProvider = aiTaskSettings.chunking.provider;
-    const chunkingModel = aiTaskSettings.chunking.model.trim();
-    const providerLabel = getChunkingProviderLabel(chunkingProvider);
+    // Use the currently selected dropdown values, even if settings were not "saved".
+    const selectedChunkingProvider = aiTaskSettings.chunking.provider;
+    const selectedChunkingModel = aiTaskSettings.chunking.model.trim();
+    const skipChunkedPages = batchChunkSkipChunkedPages;
+    const providerLabel = getChunkingProviderLabel(selectedChunkingProvider);
     const pageLabel = mode === "all"
       ? `all pages (${startPage}-${endPage})`
       : startPage === endPage ? `page ${startPage}` : `pages ${startPage}-${endPage}`;
+    const skipNote = skipChunkedPages
+      ? "Already chunked pages are skipped."
+      : "Already chunked pages will be re-chunked. Chunk-attached notes on those pages will be deleted when new chunks are saved. Page notes stay.";
     const confirmed = window.confirm(
-      `Chunk ${pageLabel} with ${providerLabel}?\n\nAlready chunked pages are skipped.`,
+      `Chunk ${pageLabel} with ${providerLabel}?\n\n${skipNote}`,
     );
     if (!confirmed) return;
 
+    closeAiKeySettings();
     batchChunkError = null;
     batchChunkFeedback = null;
     batchChunkStarting = true;
+    beginBatchChunkProgress({
+      docId: activeBook.id,
+      startPage,
+      endPage,
+      providerLabel,
+      modelLabel: selectedChunkingModel || "auto",
+    });
 
     try {
       const result = await invoke<EnsureChunkingRangeResult>("ensure_chunking_for_page_range", {
         sourceDocumentId: activeBook.id,
         startPage,
         endPage,
-        provider: chunkingProvider,
-        model: chunkingModel.length > 0 ? chunkingModel : null,
+        skipChunkedPages,
+        provider: selectedChunkingProvider,
+        model: selectedChunkingModel.length > 0 ? selectedChunkingModel : null,
       });
       const started = result.started_pages;
       const skipped = result.skipped_pages;
@@ -2725,18 +2883,46 @@
       batchChunkFeedback = started > 0
         ? `Started chunking ${started} ${startedLabel}; skipped ${skipped}.`
         : `No pages started; skipped ${skipped}.`;
+      if (batchChunkProgress && batchChunkProgress.docId === activeBook.id) {
+        const startedPages = result.started_page_numbers;
+        const finished = startedPages.length === 0;
+        batchChunkProgress = {
+          ...batchChunkProgress,
+          totalPages: startedPages.length,
+          completedPages: 0,
+          failedPages: 0,
+          skippedPages: skipped,
+          startedPages,
+          extractedPages: [],
+          groupedPages: [],
+          failedPageNumbers: [],
+          finished,
+        };
+        pushBatchChunkProgressMessage(
+          started > 0
+            ? `Queued ${started} ${startedLabel} (${startedPages.join(", ")}). Skipped ${skipped}.`
+            : `No new pages queued. Skipped ${skipped}.`,
+        );
+      }
       if (selectedBook?.id === activeBook.id && currentPage >= startPage && currentPage <= endPage && started > 0) {
         currentChunkingStatus = "extracting";
         void refreshCurrentPageChunkingActive(activeBook.id, currentPage);
       }
       await appLogInfo(
-        `[chunking] batch start: doc=${activeBook.id} pages=${startPage}-${endPage} provider=${chunkingProvider} model=${chunkingModel || "auto"} started=${started} skipped=${skipped}`,
+        `[chunking] batch start: doc=${activeBook.id} pages=${startPage}-${endPage} skipChunkedPages=${skipChunkedPages} provider=${selectedChunkingProvider} model=${selectedChunkingModel || "auto"} started=${started} skipped=${skipped}`,
       );
       void logChunkingStatus(activeBook.id, "after batch chunk start");
     } catch (err) {
       batchChunkError = formatLogError(err);
+      if (batchChunkProgress && batchChunkProgress.docId === activeBook.id) {
+        batchChunkProgress = {
+          ...batchChunkProgress,
+          finished: true,
+        };
+        pushBatchChunkProgressMessage(`Failed to start batch chunking: ${formatLogError(err)}`);
+      }
       await appLogError(
-        `[chunking] batch start failed: doc=${activeBook.id} pages=${startPage}-${endPage} provider=${chunkingProvider} model=${chunkingModel || "auto"}: ${formatLogError(err)}`,
+        `[chunking] batch start failed: doc=${activeBook.id} pages=${startPage}-${endPage} provider=${selectedChunkingProvider} model=${selectedChunkingModel || "auto"}: ${formatLogError(err)}`,
       );
     } finally {
       batchChunkStarting = false;
@@ -2850,6 +3036,77 @@
 
   function chunkHasFormattedBody(chunk: ChunkInfo): boolean {
     return !!chunk.formatted_body_md?.trim();
+  }
+
+  interface ChunkTitleDisplay {
+    heading: string;
+    indexLabel: string | null;
+    suppressionCandidates: string[];
+  }
+
+  const CHUNK_TITLE_TYPE_ALIASES: Record<string, string[]> = {
+    definition: ["definition"],
+    theorem: ["theorem", "lemma", "proposition", "corollary"],
+    proof: ["proof"],
+    exercise: ["exercise"],
+    example: ["example"],
+    explanation: ["explanation", "note", "remark"],
+  };
+
+  function getChunkTitleDisplay(chunk: Pick<ChunkInfo, "chunk_type" | "title">): ChunkTitleDisplay | null {
+    const rawTitle = normalizeChunkTitleText(chunk.title ?? "");
+    if (!rawTitle) return null;
+
+    let heading = rawTitle;
+    let indexLabel: string | null = null;
+    let typeLabel: string | null = null;
+
+    const indexedTypeMatch = heading.match(/^(\d+(?:\.\d+)*[a-z]?)\s+([a-z][a-z0-9-]*)\s*:\s*(.+)$/i);
+    if (indexedTypeMatch && isChunkTypeLabel(indexedTypeMatch[2], chunk.chunk_type)) {
+      indexLabel = indexedTypeMatch[1];
+      typeLabel = indexedTypeMatch[2];
+      heading = normalizeChunkTitleText(indexedTypeMatch[3]);
+    } else {
+      const typeMatch = heading.match(/^([a-z][a-z0-9-]*)\s*:\s*(.+)$/i);
+      if (typeMatch && isChunkTypeLabel(typeMatch[1], chunk.chunk_type)) {
+        typeLabel = typeMatch[1];
+        heading = normalizeChunkTitleText(typeMatch[2]);
+      }
+    }
+
+    const suppressionCandidates = [rawTitle, heading];
+    if (typeLabel) suppressionCandidates.push(`${typeLabel}: ${heading}`);
+    if (indexLabel) suppressionCandidates.push(`${indexLabel} ${heading}`);
+    if (indexLabel && typeLabel) suppressionCandidates.push(`${indexLabel} ${typeLabel}: ${heading}`);
+
+    return {
+      heading,
+      indexLabel,
+      suppressionCandidates: [...new Set(suppressionCandidates.map(normalizeChunkTitleText).filter(Boolean))],
+    };
+  }
+
+  function isChunkTypeLabel(label: string, chunkType: string): boolean {
+    const normalisedLabel = normaliseTypeToken(label);
+    const aliases = CHUNK_TITLE_TYPE_ALIASES[chunkType] ?? [chunkType];
+    return aliases.some((alias) => {
+      const normalisedAlias = normaliseTypeToken(alias);
+      return normalisedLabel === normalisedAlias
+        || singulariseTypeToken(normalisedLabel) === normalisedAlias
+        || normalisedLabel === singulariseTypeToken(normalisedAlias);
+    });
+  }
+
+  function normaliseTypeToken(value: string): string {
+    return value.toLocaleLowerCase().replace(/[^a-z]/g, "");
+  }
+
+  function singulariseTypeToken(value: string): string {
+    return value.endsWith("s") ? value.slice(0, -1) : value;
+  }
+
+  function normalizeChunkTitleText(value: string): string {
+    return value.replace(/\s+/g, " ").trim();
   }
 
   function getChunkDisplayBody(chunk: ChunkInfo): string {
@@ -3058,7 +3315,7 @@
   }
 
 
-  // ── Chunk view canvases ──
+  // â”€â”€ Chunk view canvases â”€â”€
   let chunkWetCanvas = $state<HTMLCanvasElement>(null!);
   let chunkDryCanvas = $state<HTMLCanvasElement>(null!);
   let chunkWetCtx: CanvasRenderingContext2D | null = null;
@@ -3248,7 +3505,7 @@
     }
   }
 
-  // ── Chunking progress events ──
+  // â”€â”€ Chunking progress events â”€â”€
   let chunkingUnlisten: UnlistenFn | null = null;
   let chunkAiUnlisten: UnlistenFn | null = null;
   async function setupChunkingListener() {
@@ -3260,6 +3517,7 @@
         );
         if (!selectedBook) return;
         if (e.payload.source_document_id !== selectedBook.id) return;
+        onBatchChunkProgressEvent(e.payload.phase, e.payload.page_number);
         if (e.payload.page_number === currentPage) {
           if (e.payload.phase === "extracted") currentChunkingStatus = "grouping";
           if (e.payload.phase === "grouped") {
@@ -3267,9 +3525,13 @@
             currentPageChunkingActive = false;
             if (currentPageId !== null) void loadChunksForPage(currentPageId);
           }
+          if (e.payload.phase === "failed") {
+            currentChunkingStatus = "failed";
+            currentPageChunkingActive = false;
+          }
           return;
         }
-        if (e.payload.phase === "grouped") {
+        if (e.payload.phase === "grouped" || e.payload.phase === "failed") {
           void refreshCurrentPageChunkingActive(selectedBook.id, currentPage);
         }
       },
@@ -3300,7 +3562,11 @@
           updateChunkChatMessage(payload.request_id, (message) => ({
             ...message,
             state: "complete",
-            html: renderChunkBodyHtml(message.content, undefined, { copyCodeBlocks: true }),
+            html: renderChunkBodyHtml(message.content, undefined, {
+              copyCodeBlocks: true,
+              allowHeadings: false,
+              allowStrong: false,
+            }),
           }));
           chunkChatStreaming = false;
           chunkChatLoadingContext = false;
@@ -3340,7 +3606,7 @@
     );
   }
 
-  // ── Wheel handler ──
+  // â”€â”€ Wheel handler â”€â”€
 
   function handleWheel(e: WheelEvent) {
     if (!selectedBook) return;
@@ -3356,7 +3622,7 @@
     }
   }
 
-  // ── Keyboard ──
+  // â”€â”€ Keyboard â”€â”€
 
   async function handleKeydown(e: KeyboardEvent) {
     if (showAiKeySheet) {
@@ -3506,6 +3772,49 @@
         <p class="error">{error}</p>
       {/if}
 
+      {#if batchChunkProgress && batchChunkProgress.docId === selectedBook.id}
+        <div class="batch-progress-card" class:is-finished={batchChunkProgress.finished}>
+          <div class="batch-progress-head">
+            <div>
+              <p class="batch-progress-title">
+                Batch chunking {batchChunkProgress.startPage}-{batchChunkProgress.endPage}
+              </p>
+              <p class="batch-progress-status">{batchChunkProgress.statusMessage}</p>
+            </div>
+            <button
+              class="batch-progress-close"
+              type="button"
+              onclick={dismissBatchChunkProgress}
+              aria-label="Dismiss batch chunking progress"
+            >
+              x
+            </button>
+          </div>
+          <div class="batch-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={batchChunkProgressPercent}>
+            <div class="batch-progress-fill" style={`width: ${batchChunkProgressPercent}%`}></div>
+          </div>
+          <div class="batch-progress-meta">
+            <span>{batchChunkProgressPercent}%</span>
+            <span>
+              {batchChunkProgress.totalPages === 0
+                ? "No pages queued"
+                : `${batchChunkProgress.completedPages}/${batchChunkProgress.totalPages} pages finished`}
+            </span>
+            <span>Skipped {batchChunkProgress.skippedPages}</span>
+            {#if batchChunkProgress.failedPages > 0}
+              <span>Failed {batchChunkProgress.failedPages}</span>
+            {/if}
+          </div>
+          {#if batchChunkProgress.messages.length > 0}
+            <ul class="batch-progress-messages">
+              {#each batchChunkProgress.messages as message}
+                <li>{message}</li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+      {/if}
+
       <!-- Infinite canvas -->
       <div
         class="infinite-canvas"
@@ -3544,14 +3853,17 @@
               <div class="cpl-meta">
                 <span class="chunk-badge">{cc.short}</span>
                 <span class="chunk-status-dot status-{chunkView.chunk.status}"></span>
+                {#if chunkViewTitleDisplay?.indexLabel}
+                  <span class="chunk-index-label">{chunkViewTitleDisplay.indexLabel}</span>
+                {/if}
                 <button class="chunk-close-btn" type="button" onclick={closeChunkView} aria-label="Close chunk notes">
                   <svg viewBox="0 0 16 16" fill="none" width="14" height="14">
                     <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
                   </svg>
                 </button>
               </div>
-              {#if chunkView.chunk.title}
-                <h2 class="cpl-title">{chunkView.chunk.title}</h2>
+              {#if chunkViewTitleDisplay}
+                <h2 class="cpl-title">{chunkViewTitleDisplay.heading}</h2>
               {:else if chunkView.chunk.subject}
                 <h2 class="cpl-title">Proof of {chunkView.chunk.subject}</h2>
               {/if}
@@ -3650,7 +3962,7 @@
                       {#if glossarySaveError}
                         <span class="chunk-glossary-status-error">Save failed</span>
                       {:else if glossarySaving}
-                        Saving…
+                        Savingâ€¦
                       {:else if glossaryDraft.trim()}
                         Saved
                       {/if}
@@ -3659,7 +3971,7 @@
                   {#if glossaryMode === 'edit'}
                     <textarea
                       class="chunk-glossary-editor"
-                      placeholder="Write your own explanation. Markdown works, and LaTeX via $…$ inline or $$…$$ block."
+                      placeholder="Write your own explanation. Markdown works, and LaTeX via $â€¦$ inline or $$â€¦$$ block."
                       value={glossaryDraft}
                       oninput={onGlossaryInput}
                       onblur={() => void flushGlossarySave()}
@@ -3772,7 +4084,7 @@
 
       {#if aiDebugImage}
         <div class="ai-debug" role="dialog" aria-label="Debug preview">
-          <button class="ai-debug-close" onclick={() => aiDebugImage = null} aria-label="Close">✕</button>
+          <button class="ai-debug-close" onclick={() => aiDebugImage = null} aria-label="Close">âœ•</button>
           <img src={aiDebugImage} alt="Rasterised selection" />
         </div>
       {/if}
@@ -4010,7 +4322,7 @@
             AI settings
           </button>
           <button onclick={importPdf} disabled={importing} class="import-btn">
-            {importing ? "Importing…" : "Import PDF"}
+            {importing ? "Importingâ€¦" : "Import PDF"}
           </button>
         </div>
       </div>
@@ -4210,8 +4522,16 @@
             <h3>Batch chunking</h3>
             {#if selectedBook && totalPages > 0}
               <p class="ai-batch-copy">
-                Run chunking over a page range for <strong>{selectedBook.title}</strong>. Already chunked pages are skipped.
+                Run chunking over a page range for <strong>{selectedBook.title}</strong>. Uses the currently selected Chunking provider/model.
               </p>
+              <label class="ai-batch-toggle">
+                <input
+                  type="checkbox"
+                  bind:checked={batchChunkSkipChunkedPages}
+                  disabled={!canBatchChunkDocument}
+                />
+                Skip already chunked pages
+              </label>
               <div class="ai-batch-grid">
                 <label class="ai-batch-field">
                   <span>From</span>
@@ -4424,7 +4744,7 @@
     min-height: 100vh;
   }
 
-  /* ── Library ── */
+  /* â”€â”€ Library â”€â”€ */
   .library {
     max-width: 640px;
     margin: 0 auto;
@@ -4491,6 +4811,99 @@
     color: #c00;
     font-size: 0.9em;
     margin: 0.5rem 0;
+  }
+
+  .batch-progress-card {
+    margin: 0.6rem 1rem 0.2rem;
+    padding: 0.7rem 0.8rem;
+    border: 1px solid #d6dde8;
+    border-radius: 10px;
+    background: #f8fafd;
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+
+  .batch-progress-card.is-finished {
+    background: #f4f8f5;
+    border-color: #c8decf;
+  }
+
+  .batch-progress-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.8rem;
+  }
+
+  .batch-progress-title {
+    margin: 0;
+    color: #1f2937;
+    font-size: 0.88rem;
+    font-weight: 700;
+  }
+
+  .batch-progress-status {
+    margin: 0.12rem 0 0;
+    color: #475467;
+    font-size: 0.82rem;
+    line-height: 1.35;
+  }
+
+  .batch-progress-close {
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 7px;
+    border: 1px solid #d6dde8;
+    background: #fff;
+    color: #475467;
+    font-size: 1rem;
+    line-height: 1;
+    padding: 0;
+  }
+
+  .batch-progress-close:hover {
+    background: #eef3f9 !important;
+  }
+
+  .batch-progress-track {
+    width: 100%;
+    height: 10px;
+    border-radius: 999px;
+    background: #e3e8f1;
+    overflow: hidden;
+  }
+
+  .batch-progress-fill {
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, #4b678f 0%, #2f4668 100%);
+    transition: width 0.2s ease;
+  }
+
+  .batch-progress-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.65rem;
+    color: #475467;
+    font-size: 0.79rem;
+    font-weight: 600;
+  }
+
+  .batch-progress-messages {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 0.18rem;
+    color: #5c6777;
+    font-size: 0.76rem;
+    line-height: 1.32;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
 
   .empty {
@@ -4706,6 +5119,20 @@
     line-height: 1.4;
   }
 
+  .ai-batch-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: #374151;
+    font-size: 0.86rem;
+    font-weight: 600;
+  }
+
+  .ai-batch-toggle input {
+    width: 16px;
+    height: 16px;
+  }
+
   .ai-batch-grid {
     display: grid;
     grid-template-columns: 110px 110px minmax(118px, auto) minmax(150px, auto);
@@ -4895,7 +5322,7 @@
     }
   }
 
-  /* ── Viewer ── */
+  /* â”€â”€ Viewer â”€â”€ */
   .viewer {
     position: relative;
     display: flex;
@@ -5017,7 +5444,7 @@
     }
   }
 
-  /* ── Infinite canvas ── */
+  /* â”€â”€ Infinite canvas â”€â”€ */
   .infinite-canvas {
     position: relative;
     flex: 1;
@@ -5036,7 +5463,7 @@
     top: 0;
     left: 0;
     /* width/height set in JS to clientWidth/clientHeight in CSS px,
-       but the bitmap is dpr-scaled — keep CSS size at 100% */
+       but the bitmap is dpr-scaled â€” keep CSS size at 100% */
     width: 100%;
     height: 100%;
   }
@@ -5045,9 +5472,9 @@
   .layer-pdf  { pointer-events: none; }
   .layer-chunk { pointer-events: none; }
   .layer-dry  { pointer-events: none; }
-  /* .layer-wet receives all pointer events — no overrides needed */
+  /* .layer-wet receives all pointer events â€” no overrides needed */
 
-  /* ── Chunk note sheet ── */
+  /* â”€â”€ Chunk note sheet â”€â”€ */
   .chunk-sheet-backdrop {
     position: absolute;
     inset: 0;
@@ -5118,6 +5545,15 @@
   .chunk-status-dot.status-in_progress   { background: oklch(0.72 0.13 65); }
   .chunk-status-dot.status-incomplete    { border: 1.5px solid #9ca3af; }
 
+  .chunk-index-label {
+    font-size: 10.5px;
+    line-height: 1;
+    color: #6b7280;
+    letter-spacing: 0.03em;
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
   .chunk-close-btn {
     margin-left: auto;
     width: 26px;
@@ -5150,6 +5586,8 @@
     line-height: 1.65;
     color: #4b5563;
     font-family: Georgia, 'Times New Roman', serif;
+    font-variant-numeric: lining-nums slashed-zero;
+    font-feature-settings: "zero" 1;
   }
 
   .cpl-body:empty::after {
@@ -5593,6 +6031,8 @@
   .chunk-chat-bubble.rendered {
     white-space: normal;
     font-family: Georgia, 'Times New Roman', serif;
+    font-variant-numeric: lining-nums slashed-zero;
+    font-feature-settings: "zero" 1;
   }
 
   .chunk-chat-bubble.rendered :global(p) {
@@ -6031,7 +6471,7 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   .spin { animation: spin 0.9s linear infinite; }
 
-  /* ── AI debug overlay ── */
+  /* â”€â”€ AI debug overlay â”€â”€ */
   .ai-debug {
     position: absolute;
     top: 60px;
@@ -6059,3 +6499,4 @@
 
   .ai-debug-close:hover { color: #000; }
 </style>
+

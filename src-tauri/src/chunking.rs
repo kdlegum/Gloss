@@ -26,7 +26,9 @@ use pdfium_render::prelude::*;
 use serde::Serialize;
 use sqlx::{Row, SqlitePool};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::Semaphore;
 
 // ── Data types ──────────────────────────────────────────────────────────────
 
@@ -54,7 +56,7 @@ pub struct PersistedBlock {
 struct ProgressEvent {
     source_document_id: i64,
     page_number: i64,
-    phase: &'static str, // "extracted" | "grouped"
+    phase: &'static str, // "extracted" | "grouped" | "failed"
 }
 
 const ALLOWED_TYPES: &[&str] = &[
@@ -80,6 +82,7 @@ pub async fn run_for_page(
     page_number: i64,
     provider: LlmProvider,
     model_override: Option<String>,
+    zai_transcription_semaphore: Arc<Semaphore>,
 ) {
     info!(
         target: "gloss_lib::chunking",
@@ -96,6 +99,7 @@ pub async fn run_for_page(
         page_number,
         provider,
         model_override,
+        &zai_transcription_semaphore,
     )
     .await
     {
@@ -107,6 +111,7 @@ pub async fn run_for_page(
             provider,
             e
         );
+        emit_progress(&app, doc_id, page_number, "failed");
         let _ = sqlx::query("UPDATE source_documents SET chunking_status = 'failed' WHERE id = ?")
             .bind(doc_id)
             .execute(&pool)
@@ -130,6 +135,7 @@ async fn run_inner(
     page_number: i64,
     provider: LlmProvider,
     model_override: Option<String>,
+    zai_transcription_semaphore: &Arc<Semaphore>,
 ) -> Result<(), String> {
     if page_number < 1 {
         return Err(format!("invalid page number {}", page_number));
@@ -253,7 +259,16 @@ async fn run_inner(
 
     // ZAI block transcription (optional — improves math in chunking prompt)
     if use_llm {
-        match transcribe_blocks_for_page(pool, pdfium, &abs_path, page_index, &blocks).await {
+        match transcribe_blocks_for_page(
+            pool,
+            pdfium,
+            &abs_path,
+            page_index,
+            &blocks,
+            Arc::clone(zai_transcription_semaphore),
+        )
+        .await
+        {
             Ok(updated) => {
                 info!(
                     target: "gloss_lib::chunking",
@@ -372,6 +387,7 @@ pub async fn rechunk_page(
                 provider,
                 err
             );
+            emit_progress(app, doc_id, page_number, "failed");
             let _ = set_status(pool, doc_id, "failed").await;
             Err(err)
         }
@@ -943,6 +959,7 @@ async fn transcribe_blocks_for_page(
     abs_path: &PathBuf,
     page_index: usize,
     blocks: &[PersistedBlock],
+    zai_transcription_semaphore: Arc<Semaphore>,
 ) -> Result<Vec<PersistedBlock>, String> {
     let zai_key = match settings::api_key_for_provider(pool, LlmProvider::Zai).await? {
         Some(key) => key,
@@ -972,15 +989,19 @@ async fn transcribe_blocks_for_page(
         futures::stream::iter(crops)
             .map(|(id, crop_result)| {
                 let zai = zai.clone();
+                let zai_transcription_semaphore = Arc::clone(&zai_transcription_semaphore);
                 async move {
                     match crop_result {
                         Err(e) => (id, Err(e)),
-                        Ok(crop_b64) => (
-                            id,
-                            zai.transcribe_block_image(&crop_b64)
-                                .await
-                                .map_err(|e| e.to_string()),
-                        ),
+                        Ok(crop_b64) => match zai_transcription_semaphore.acquire_owned().await {
+                            Ok(_permit) => (
+                                id,
+                                zai.transcribe_block_image(&crop_b64)
+                                    .await
+                                    .map_err(|e| e.to_string()),
+                            ),
+                            Err(_) => (id, Err("ZAI transcription limiter closed".to_string())),
+                        },
                     }
                 }
             })

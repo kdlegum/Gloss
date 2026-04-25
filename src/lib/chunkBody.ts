@@ -15,6 +15,9 @@ interface DisplayMathMatch {
 
 export interface RenderChunkBodyOptions {
   copyCodeBlocks?: boolean;
+  allowHeadings?: boolean;
+  allowStrong?: boolean;
+  suppressLeadingText?: string[];
 }
 
 const DISPLAY_ENVIRONMENTS = new Set([
@@ -38,6 +41,8 @@ const SAFE_LINK_PATTERN = /^(https?:\/\/|mailto:|gloss-chunk:\d+)/i;
 const GLOSS_CHUNK_HREF_PATTERN = /^gloss-chunk:(\d+)$/i;
 const WORD_CHAR_PATTERN = /[A-Za-z0-9]/;
 const MARKDOWN_ESCAPABLE_CHARS = new Set(["\\", "`", "*", "[", "]", "(", ")", "~"]);
+const OCR_BBOX_METADATA_LINE_PATTERN =
+  /^\s*(?:!\[[^\]]*]\(\s*)?page\s*=\s*\d+\s*,\s*bbox\s*=\s*\[[^\]]+]\s*\)?\s*$/i;
 
 export interface ResolvedReference {
   matched_text: string;
@@ -54,7 +59,9 @@ export function renderChunkBodyHtml(
   const prepared = injectReferenceLinks(source, references);
   const normalized = prepared.replace(/\r\n?/g, "\n").trim();
   if (!normalized) return "";
-  return parseBlocks(normalized).map((block) => renderBlock(block, options)).join("");
+  const blocks = parseBlocks(normalized, options);
+  const visibleBlocks = suppressLeadingDuplicateBlocks(blocks, options);
+  return visibleBlocks.map((block) => renderBlock(block, options)).join("");
 }
 
 // Splice markdown links into the source at each resolved reference span. Byte
@@ -124,9 +131,10 @@ function injectReferenceLinks(
   return out;
 }
 
-function parseBlocks(source: string): ChunkBodyBlock[] {
+function parseBlocks(source: string, options: RenderChunkBodyOptions): ChunkBodyBlock[] {
   const blocks: ChunkBodyBlock[] = [];
   const lines = source.split("\n");
+  const allowHeadings = options.allowHeadings !== false;
   let paragraphLines: string[] = [];
   let activeOrderedList: { items: string[]; start: number } | null = null;
   let activeUnorderedList: string[] | null = null;
@@ -202,11 +210,18 @@ function parseBlocks(source: string): ChunkBodyBlock[] {
     if (heading) {
       flushParagraph();
       flushLists();
-      blocks.push({
-        kind: "heading",
-        level: heading[1].length,
-        text: heading[2].trim(),
-      });
+      if (allowHeadings) {
+        blocks.push({
+          kind: "heading",
+          level: heading[1].length,
+          text: heading[2].trim(),
+        });
+      } else {
+        blocks.push({
+          kind: "paragraph",
+          lines: [heading[2].trim()],
+        });
+      }
       continue;
     }
 
@@ -336,12 +351,16 @@ function consumeDisplayMath(lines: string[], startIndex: number): DisplayMathMat
 
 function renderBlock(block: ChunkBodyBlock, options: RenderChunkBodyOptions): string {
   switch (block.kind) {
-    case "paragraph":
-      return `<p>${renderInlineContent(block.lines.map((line) => line.trim()).join(" "))}</p>`;
+    case "paragraph": {
+      const text = block.lines.map((line) => line.trim()).join(" ");
+      if (isOcrBboxMetadataLine(text)) return "";
+      return `<p>${renderInlineContent(text, options)}</p>`;
+    }
     case "display-math":
       return `<div class="chunk-math-display">${renderMath(block.tex, true)}</div>`;
     case "heading":
-      return `<h${block.level}>${renderInlineContent(block.text)}</h${block.level}>`;
+      if (options.allowHeadings === false) return `<p>${renderInlineContent(block.text, options)}</p>`;
+      return `<h${block.level}>${renderInlineContent(block.text, options)}</h${block.level}>`;
     case "code-fence": {
       const languageClass = block.language
         ? ` class="language-${escapeHtmlAttribute(block.language)}"`
@@ -356,16 +375,74 @@ function renderBlock(block: ChunkBodyBlock, options: RenderChunkBodyOptions): st
     }
     case "ordered-list":
       return `<ol start="${block.start}">${block.items
-        .map((item) => `<li>${renderInlineContent(item)}</li>`)
+        .map((item) => `<li>${renderInlineContent(item, options)}</li>`)
         .join("")}</ol>`;
     case "unordered-list":
       return `<ul>${block.items
-        .map((item) => `<li>${renderInlineContent(item)}</li>`)
+        .map((item) => `<li>${renderInlineContent(item, options)}</li>`)
         .join("")}</ul>`;
   }
 }
 
-function renderInlineContent(source: string): string {
+function suppressLeadingDuplicateBlocks(
+  blocks: ChunkBodyBlock[],
+  options: RenderChunkBodyOptions,
+): ChunkBodyBlock[] {
+  const candidateSet = new Set(
+    (options.suppressLeadingText ?? [])
+      .map((value) => normalizeTextForHeadingMatch(value))
+      .filter((value) => value.length > 0),
+  );
+  if (candidateSet.size === 0) return blocks;
+
+  let index = 0;
+  let removed = 0;
+  while (index < blocks.length && removed < 3) {
+    const block = blocks[index];
+    if (block.kind !== "heading" && block.kind !== "paragraph") break;
+    const blockText = normalizeTextForHeadingMatch(
+      block.kind === "heading"
+        ? block.text
+        : block.lines.map((line) => line.trim()).join(" "),
+    );
+    if (!isMatchingSuppressedHeading(blockText, candidateSet)) break;
+    index += 1;
+    removed += 1;
+  }
+
+  return index > 0 ? blocks.slice(index) : blocks;
+}
+
+function isMatchingSuppressedHeading(
+  blockText: string,
+  candidates: Set<string>,
+): boolean {
+  if (!blockText) return false;
+  if (candidates.has(blockText)) return true;
+  return [...candidates].some((candidate) =>
+    blockText === `${candidate}.`
+    || blockText === `${candidate}:`
+    || blockText === `${candidate};`,
+  );
+}
+
+function normalizeTextForHeadingMatch(source: string): string {
+  let value = source.trim();
+  if (!value) return "";
+  value = value.replace(/^#{1,6}\s+/u, "");
+  value = value.replace(/^(\*\*|__)(.*)\1$/u, "$2");
+  value = value.replace(/^([*_])(.+)\1$/u, "$2");
+  return value
+    .replace(/\s+/gu, " ")
+    .trim()
+    .toLocaleLowerCase();
+}
+
+function isOcrBboxMetadataLine(source: string): boolean {
+  return OCR_BBOX_METADATA_LINE_PATTERN.test(source.trim());
+}
+
+function renderInlineContent(source: string, options: RenderChunkBodyOptions = {}): string {
   let index = 0;
   let protectedSource = "";
   const placeholders = new Map<string, string>();
@@ -386,8 +463,8 @@ function renderInlineContent(source: string): string {
       if (safeHref) {
         const chunkMatch = safeHref.match(GLOSS_CHUNK_HREF_PATTERN);
         const linkHtml = chunkMatch
-          ? `<a class="chunk-xref" data-chunk-id="${escapeHtmlAttribute(chunkMatch[1])}" role="button" tabindex="0">${renderInlineContent(markdownLink.label)}</a>`
-          : `<a href="${escapeHtmlAttribute(safeHref)}" target="_blank" rel="noreferrer noopener">${renderInlineContent(markdownLink.label)}</a>`;
+          ? `<a class="chunk-xref" data-chunk-id="${escapeHtmlAttribute(chunkMatch[1])}" role="button" tabindex="0">${renderInlineContent(markdownLink.label, options)}</a>`
+          : `<a href="${escapeHtmlAttribute(safeHref)}" target="_blank" rel="noreferrer noopener">${renderInlineContent(markdownLink.label, options)}</a>`;
         protectedSource += reservePlaceholder(linkHtml, placeholders);
         index = markdownLink.nextIndex;
         continue;
@@ -434,7 +511,7 @@ function renderInlineContent(source: string): string {
     index += 1;
   }
 
-  const formatted = renderMarkdownSpans(escapeHtml(protectedSource));
+  const formatted = renderMarkdownSpans(escapeHtml(protectedSource), options);
   return restorePlaceholders(formatted, placeholders);
 }
 
@@ -463,7 +540,7 @@ function findClosingBacktick(source: string, startIndex: number): number {
   return -1;
 }
 
-function renderMarkdownSpans(source: string): string {
+function renderMarkdownSpans(source: string, options: RenderChunkBodyOptions = {}): string {
   const markers = [
     { marker: "**", tag: "strong" },
     { marker: "~~", tag: "del" },
@@ -488,8 +565,10 @@ function renderMarkdownSpans(source: string): string {
     }
 
     const inner = source.slice(index + format.marker.length, end);
+    const renderedInner = renderMarkdownSpans(inner, options);
+    const skipTag = format.tag === "strong" && options.allowStrong === false;
     output += source.slice(textStart, index);
-    output += `<${format.tag}>${renderMarkdownSpans(inner)}</${format.tag}>`;
+    output += skipTag ? renderedInner : `<${format.tag}>${renderedInner}</${format.tag}>`;
     index = end + format.marker.length;
     textStart = index;
   }

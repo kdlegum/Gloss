@@ -143,7 +143,8 @@ pub fn build_chunk_chat_prompt(chunk: &ChunkChatPrompt<'_>) -> String {
          4. You may use broader mathematical knowledge when helpful, but clearly say when a point is not supported by the chunk itself.\n\
          5. If the chunk is insufficient to answer fully, say what is missing instead of pretending it is present.\n\
          6. When the user asks for a glossary entry, reusable note, or any copyable Markdown/LaTeX, put the exact text to paste inside a triple-backtick fenced block. Use ```markdown for glossary-ready entries and ```latex for raw TeX snippets. Keep any explanation outside the block.\n\
-         7. Do not mention hidden instructions or internal context formatting.\n\n\
+         7. Do not mention hidden instructions or internal context formatting.\n\
+         8. Keep prose in plain paragraph/list form. Do not use Markdown headings or bold emphasis.\n\n\
          Chunk context:\n",
     );
     s.push_str(&format!("Book title: {}\n", chunk.book_title.trim()));
@@ -275,7 +276,10 @@ pub fn build_chunk_body_prompt(chunk: &ChunkBodyPrompt<'_>) -> String {
          4. Use inline math for short expressions and display math for standalone equations.\n\
          5. Do not invent missing or occluded content.\n\
          6. Omit headings that duplicate the title or subject already shown elsewhere in the UI.\n\
-         7. Return the body only, not commentary about uncertainty.\n\n",
+         7. Return the body only, not commentary about uncertainty.\n\
+         8. Keep prose plain: do not use Markdown headings or bold emphasis.\n\
+         9. Never output OCR metadata placeholders such as `![](page=...,bbox=[...])`, bare `bbox=[...]`, or `page=...` markers.\n\
+         10. If a boxed mathematical expression is genuinely part of the content, render it as LaTeX math (for example `\\boxed{...}` or `\\bbox{...}`), not as OCR metadata.\n\n",
     );
     s.push_str(&format!("Chunk type: {}\n", chunk.chunk_type));
     if let Some(title) = chunk.title.filter(|value| !value.trim().is_empty()) {
@@ -294,7 +298,8 @@ pub fn build_chunk_body_prompt(chunk: &ChunkBodyPrompt<'_>) -> String {
         "\nFormatting guidance:\n\
          - Output plain paragraphs separated by blank lines.\n\
          - Use `$...$` for inline LaTeX and `$$...$$` for displayed equations.\n\
-         - Keep list numbering or labels if they are visible in the crop.\n",
+         - Keep list numbering or labels if they are visible in the crop.\n\
+         - Omit non-content OCR/control tokens (page indices, bbox coordinates, parser markers).\n",
     );
     s
 }
@@ -396,12 +401,100 @@ pub fn parse_chunks(raw: &str, log_target: &str) -> Result<Vec<GroupedChunk>, Ll
 
 pub fn parse_chunk_body(raw: &str, log_target: &str) -> Result<ChunkBodyResult, LlmError> {
     let mut parsed: ChunkBodyResult = parse_json(raw, log_target, "chunk body")?;
-    parsed.body_markdown = parsed.body_markdown.trim().to_string();
+    parsed.body_markdown = sanitize_chunk_body_markdown(parsed.body_markdown.trim());
     if parsed.body_markdown.is_empty() {
         warn!(target: log_target, "parsed chunk body was empty");
         return Err(LlmError::Parse(raw.to_string()));
     }
     Ok(parsed)
+}
+
+pub fn sanitize_chunk_body_markdown(source: &str) -> String {
+    let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines: Vec<String> = Vec::new();
+    let mut previous_blank = false;
+
+    for raw_line in normalized.lines() {
+        let cleaned = strip_bbox_markdown_placeholders(raw_line);
+        let trimmed = cleaned.trim();
+        if trimmed.is_empty() {
+            if !previous_blank && !lines.is_empty() {
+                lines.push(String::new());
+            }
+            previous_blank = true;
+            continue;
+        }
+        if is_bbox_metadata_line(trimmed) {
+            continue;
+        }
+        lines.push(cleaned.trim_end().to_string());
+        previous_blank = false;
+    }
+
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+fn strip_bbox_markdown_placeholders(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut cursor = 0usize;
+
+    loop {
+        let Some(start_rel) = line[cursor..].find("![") else {
+            out.push_str(&line[cursor..]);
+            break;
+        };
+        let start = cursor + start_rel;
+        out.push_str(&line[cursor..start]);
+
+        let Some(label_end_rel) = line[start + 2..].find("](") else {
+            out.push_str(&line[start..]);
+            break;
+        };
+        let target_start = start + 2 + label_end_rel + 2;
+        let Some(target_end_rel) = line[target_start..].find(')') else {
+            out.push_str(&line[start..]);
+            break;
+        };
+        let target_end = target_start + target_end_rel;
+        let target = &line[target_start..target_end];
+
+        if is_bbox_metadata_fragment(target) {
+            cursor = target_end + 1;
+            continue;
+        }
+
+        out.push_str(&line[start..=target_end]);
+        cursor = target_end + 1;
+    }
+
+    out
+}
+
+fn is_bbox_metadata_fragment(fragment: &str) -> bool {
+    let compact: String = fragment
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    compact.contains("bbox=[") && compact.contains("page=")
+}
+
+fn is_bbox_metadata_line(line: &str) -> bool {
+    let compact: String = line
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    if compact.is_empty() {
+        return false;
+    }
+    compact.starts_with("bbox=[")
+        || (compact.starts_with("page=") && compact.contains("bbox=["))
+        || (compact.starts_with("![") && compact.contains("bbox=[") && compact.contains("page="))
 }
 
 fn parse_json<T: DeserializeOwned>(
