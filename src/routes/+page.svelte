@@ -2230,6 +2230,95 @@
   const chunkBodyRequests = new Map<number, Promise<boolean>>();
   let chunkMode = $state<'draw' | 'erase'>('draw');
   let chunkTab = $state<'ink' | 'glossary' | 'ai'>('ink');
+  let showChunkPenOptions = $state(false);
+  const CHUNK_LEFT_PANEL_DEFAULT_WIDTH = 360;
+  const CHUNK_LEFT_PANEL_MIN_WIDTH = 260;
+  const CHUNK_LEFT_PANEL_MAX_WIDTH = 760;
+  let chunkLeftPanelWidth = $state(CHUNK_LEFT_PANEL_DEFAULT_WIDTH);
+  let chunkSheet = $state<HTMLDivElement>(null!);
+  let chunkResizingPointerId: number | null = null;
+
+  function activateChunkDrawTool() {
+    const wasDrawMode = chunkMode === 'draw';
+    chunkMode = 'draw';
+    showChunkPenOptions = wasDrawMode ? !showChunkPenOptions : true;
+  }
+
+  function activateChunkEraseTool() {
+    chunkMode = 'erase';
+    showChunkPenOptions = false;
+  }
+
+  function getChunkLeftPanelBounds() {
+    const sheetWidth = chunkSheet?.clientWidth ?? window.innerWidth;
+    const maxBySheet = Math.floor(sheetWidth * 0.6);
+    const max = Math.max(CHUNK_LEFT_PANEL_MIN_WIDTH, Math.min(CHUNK_LEFT_PANEL_MAX_WIDTH, maxBySheet));
+    return { min: CHUNK_LEFT_PANEL_MIN_WIDTH, max };
+  }
+
+  function clampChunkLeftPanelWidth(width: number) {
+    const { min, max } = getChunkLeftPanelBounds();
+    return Math.min(max, Math.max(min, Math.round(width)));
+  }
+
+  function applyChunkLeftPanelWidthFromClientX(clientX: number) {
+    if (!chunkSheet) return;
+    const rect = chunkSheet.getBoundingClientRect();
+    chunkLeftPanelWidth = clampChunkLeftPanelWidth(clientX - rect.left);
+  }
+
+  function stopChunkPanelResize() {
+    if (chunkResizingPointerId === null) return;
+    chunkResizingPointerId = null;
+    window.removeEventListener("pointermove", onChunkPanelResizeMove);
+    window.removeEventListener("pointerup", onChunkPanelResizeEnd);
+    window.removeEventListener("pointercancel", onChunkPanelResizeEnd);
+  }
+
+  function onChunkPanelResizeMove(e: PointerEvent) {
+    if (e.pointerId !== chunkResizingPointerId) return;
+    applyChunkLeftPanelWidthFromClientX(e.clientX);
+  }
+
+  function onChunkPanelResizeEnd(e: PointerEvent) {
+    if (e.pointerId !== chunkResizingPointerId) return;
+    stopChunkPanelResize();
+  }
+
+  function startChunkPanelResize(e: PointerEvent) {
+    if (window.matchMedia("(max-width: 720px)").matches) return;
+    const target = e.currentTarget as HTMLElement;
+    chunkResizingPointerId = e.pointerId;
+    target.setPointerCapture(e.pointerId);
+    window.addEventListener("pointermove", onChunkPanelResizeMove);
+    window.addEventListener("pointerup", onChunkPanelResizeEnd);
+    window.addEventListener("pointercancel", onChunkPanelResizeEnd);
+    applyChunkLeftPanelWidthFromClientX(e.clientX);
+    e.preventDefault();
+  }
+
+  function onChunkPanelResizeKeydown(e: KeyboardEvent) {
+    if (window.matchMedia("(max-width: 720px)").matches) return;
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      chunkLeftPanelWidth = clampChunkLeftPanelWidth(chunkLeftPanelWidth - 20);
+      return;
+    }
+    if (e.key === "ArrowRight") {
+      e.preventDefault();
+      chunkLeftPanelWidth = clampChunkLeftPanelWidth(chunkLeftPanelWidth + 20);
+      return;
+    }
+    if (e.key === "Home") {
+      e.preventDefault();
+      chunkLeftPanelWidth = getChunkLeftPanelBounds().min;
+      return;
+    }
+    if (e.key === "End") {
+      e.preventDefault();
+      chunkLeftPanelWidth = getChunkLeftPanelBounds().max;
+    }
+  }
 
   let glossaryDraft = $state("");
   let glossaryMode = $state<'edit' | 'preview'>('edit');
@@ -3265,12 +3354,14 @@
 
   async function openChunkView(chunk: ChunkInfo) {
     void cancelChunkChatForReset();
+    stopChunkPanelResize();
     const cache = await ensureChunkSurface(chunk.id);
     void appLogInfo(
       `[chunk] open chunkId=${chunk.id} type=${chunk.chunk_type} cachedStrokes=${cache.strokes.length}`,
     );
     chunkMode = 'draw';
     chunkTab = 'ink';
+    showChunkPenOptions = false;
     chunkView = {
       chunk,
       surfaceId: cache.surfaceId,
@@ -3294,6 +3385,7 @@
   function closeChunkView() {
     void cancelChunkChatForReset();
     void flushGlossarySave();
+    stopChunkPanelResize();
     if (chunkView) {
       void appLogInfo(
         `[chunk] close chunkId=${chunkView.chunk.id} strokes=${chunkView.strokes.length}`,
@@ -3303,6 +3395,7 @@
     }
     chunkView = null;
     chunkMode = 'draw';
+    showChunkPenOptions = false;
     chunkWetCtx = null;
     chunkDryCtx = null;
     chunkWetCanvas = null!;
@@ -3485,6 +3578,19 @@
     drawChunkWet();
   }
 
+  async function undoChunkStroke() {
+    if (!chunkView || chunkView.strokes.length === 0) return;
+    const last = chunkView.strokes[chunkView.strokes.length - 1];
+    chunkView.strokes = chunkView.strokes.slice(0, -1);
+    redrawChunkDry();
+    if (last.id === null) return;
+    try {
+      await invoke("delete_surface_stroke", { strokeId: last.id });
+    } catch (err) {
+      console.error("delete_surface_stroke failed", err);
+    }
+  }
+
   async function eraseInChunk(x: number, y: number) {
     if (!chunkView) return;
     const rNorm = 0.015;
@@ -3610,6 +3716,7 @@
 
   function handleWheel(e: WheelEvent) {
     if (!selectedBook) return;
+    if (chunkView) return;
     e.preventDefault();
     if (e.ctrlKey || e.metaKey) {
       const rect = canvasContainer.getBoundingClientRect();
@@ -3693,6 +3800,7 @@
 
   onDestroy(() => {
     void cancelChunkChatForReset();
+    stopChunkPanelResize();
     window.removeEventListener("keydown", handleKeydown);
     window.removeEventListener("wheel", handleWheel);
     containerResizeObserver?.disconnect();
@@ -3707,6 +3815,17 @@
     currentPage;
     if (pageInputFocused) return;
     pageInputValue = String(currentPage);
+  });
+
+  $effect(() => {
+    if (!chunkView || !chunkSheet) return;
+    const syncWidth = () => {
+      chunkLeftPanelWidth = clampChunkLeftPanelWidth(chunkLeftPanelWidth);
+    };
+    syncWidth();
+    const observer = new ResizeObserver(syncWidth);
+    observer.observe(chunkSheet);
+    return () => observer.disconnect();
   });
 </script>
 
@@ -3842,6 +3961,7 @@
         <div class="chunk-sheet-backdrop">
           <div
             class="chunk-sheet"
+            bind:this={chunkSheet}
             role="dialog"
             aria-modal="true"
             aria-label={`${cc.label} notes`}
@@ -3849,7 +3969,7 @@
           >
 
             <!-- Left panel: chunk content -->
-            <div class="chunk-panel-left" style={`--chunk-accent: ${cc.accent}; --chunk-tint: ${cc.tint};`}>
+            <div class="chunk-panel-left" style={`--chunk-accent: ${cc.accent}; --chunk-tint: ${cc.tint}; --chunk-panel-left-width: ${chunkLeftPanelWidth}px;`}>
               <div class="cpl-meta">
                 <span class="chunk-badge">{cc.short}</span>
                 <span class="chunk-status-dot status-{chunkView.chunk.status}"></span>
@@ -3870,6 +3990,17 @@
               <div class="cpl-body" role="presentation" onclick={onChunkBodyClick}>{@html chunkViewBodyHtml}</div>
             </div>
 
+            <div
+              class="chunk-panel-resizer"
+              style={`--chunk-accent: ${cc.accent};`}
+              role="separator"
+              aria-label="Resize chunk text panel"
+              aria-orientation="vertical"
+              tabindex="0"
+              onpointerdown={startChunkPanelResize}
+              onkeydown={onChunkPanelResizeKeydown}
+            ></div>
+
             <!-- Right panel: tabs + content -->
             <div class="chunk-panel-right" style={`--chunk-accent: ${cc.accent};`}>
               <div class="chunk-tab-bar">
@@ -3887,7 +4018,10 @@
                 <button
                   class="chunk-tab"
                   class:active={chunkTab === 'glossary'}
-                  onclick={() => chunkTab = 'glossary'}
+                  onclick={() => {
+                    chunkTab = 'glossary';
+                    showChunkPenOptions = false;
+                  }}
                 >
                   <svg viewBox="0 0 16 16" fill="none" width="13" height="13">
                     <rect x="4" y="2" width="7" height="9" rx="0.8" stroke="currentColor" stroke-width="1.2"/>
@@ -3898,7 +4032,10 @@
                 <button
                   class="chunk-tab"
                   class:active={chunkTab === 'ai'}
-                  onclick={() => chunkTab = 'ai'}
+                  onclick={() => {
+                    chunkTab = 'ai';
+                    showChunkPenOptions = false;
+                  }}
                 >
                   AI
                 </button>
@@ -3917,26 +4054,83 @@
                   ></canvas>
                   <div class="chunk-ink-bar">
                     <button
-                      class="chunk-tool-btn"
-                      class:active={chunkMode === 'draw'}
-                      onclick={() => chunkMode = 'draw'}
-                      aria-label="Draw"
-                      aria-pressed={chunkMode === 'draw'}
+                      class="ink-btn"
+                      type="button"
+                      onclick={undoChunkStroke}
+                      disabled={chunkView.strokes.length === 0}
+                      aria-label="Undo chunk stroke"
                     >
-                      <svg viewBox="0 0 18 18" fill="none" width="16" height="16">
-                        <path d="M3.5 14.5l2.2-0.9 8-8-1.3-1.3-8 8z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
-                        <circle cx="3.5" cy="14.5" r="0.8" fill="currentColor"/>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M9 14 4 9l5-5"/>
+                        <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>
                       </svg>
                     </button>
+                    <div class="divider"></div>
+                    <div class="pen-tool">
+                      <button
+                        class="tool-btn"
+                        class:active={chunkMode === 'draw'}
+                        type="button"
+                        onclick={activateChunkDrawTool}
+                        aria-label="Draw"
+                        aria-pressed={chunkMode === 'draw'}
+                      >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M12 19l7-7 3 3-7 7-3-3z"/>
+                          <path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/>
+                          <path d="M2 2l7.586 7.586"/>
+                          <circle cx="11" cy="11" r="2"/>
+                        </svg>
+                      </button>
+                      {#if showChunkPenOptions}
+                        <div class="pen-popout chunk-pen-popout" transition:fade={{ duration: 140 }}>
+                          <div class="pen-popout-header">
+                            <span class="pen-popout-title">Pen</span>
+                            <span class="pen-preview" style={`--pen-preview-colour: ${penColour}; --pen-preview-size: ${penThickness}px;`}>
+                              <span class="pen-preview-dot"></span>
+                            </span>
+                          </div>
+                          <label class="pen-slider-group" for="chunk-pen-thickness">
+                            <span>Thickness</span>
+                            <span>{penThickness.toFixed(1)} px</span>
+                          </label>
+                          <input
+                            id="chunk-pen-thickness"
+                            class="pen-slider"
+                            type="range"
+                            min="1"
+                            max="12"
+                            step="0.5"
+                            value={penThickness}
+                            oninput={(e) => penThickness = Number((e.currentTarget as HTMLInputElement).value)}
+                          />
+                          <div class="pen-colours" aria-label="Pen colours">
+                            {#each PEN_COLOURS as colour}
+                              <button
+                                class="colour-swatch"
+                                class:selected={penColour === colour}
+                                type="button"
+                                onclick={() => penColour = colour}
+                                aria-label={`Select ${colour} pen`}
+                                aria-pressed={penColour === colour}
+                                style={`--swatch-colour: ${colour};`}
+                              ></button>
+                            {/each}
+                          </div>
+                        </div>
+                      {/if}
+                    </div>
                     <button
-                      class="chunk-tool-btn"
+                      class="tool-btn"
                       class:active={chunkMode === 'erase'}
-                      onclick={() => chunkMode = 'erase'}
+                      type="button"
+                      onclick={activateChunkEraseTool}
                       aria-label="Erase"
                       aria-pressed={chunkMode === 'erase'}
                     >
-                      <svg viewBox="0 0 18 18" fill="none" width="16" height="16">
-                        <path d="M12 4L7.5 8.5l-2.5 2.5H3v-2.5l4.5-4.5z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M20 20H7L3 16l10-10 7 7-2.5 2.5"/>
+                        <path d="M6.5 17.5l5-5"/>
                       </svg>
                     </button>
                   </div>
@@ -5476,32 +5670,32 @@
 
   /* â”€â”€ Chunk note sheet â”€â”€ */
   .chunk-sheet-backdrop {
-    position: absolute;
+    position: fixed;
     inset: 0;
     z-index: 120;
     display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 1rem;
-    background: rgba(18, 24, 35, 0.3);
-    backdrop-filter: blur(4px);
+    padding: 0;
+    background: #ffffff;
   }
 
   .chunk-sheet {
-    width: min(920px, 100%);
-    height: min(680px, 100%);
+    width: 100%;
+    height: 100%;
     display: flex;
     flex-direction: row;
     overflow: hidden;
+    isolation: isolate;
     background: #fff;
-    border: 1px solid rgba(41, 52, 76, 0.12);
-    border-radius: 16px;
-    box-shadow: 0 24px 60px rgba(17, 25, 40, 0.24);
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
   }
 
   /* Left panel */
   .chunk-panel-left {
-    width: 240px;
+    position: relative;
+    z-index: 1;
+    width: var(--chunk-panel-left-width, 360px);
     flex-shrink: 0;
     border-right: 1px solid rgba(0, 0, 0, 0.07);
     display: flex;
@@ -5509,6 +5703,37 @@
     overflow: hidden;
     background: #f9fafb;
     border-left: 3px solid var(--chunk-accent);
+  }
+
+  .chunk-panel-resizer {
+    position: relative;
+    width: 10px;
+    flex-shrink: 0;
+    cursor: col-resize;
+    background: transparent;
+    z-index: 3;
+    touch-action: none;
+  }
+
+  .chunk-panel-resizer::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: 1px;
+    transform: translateX(-50%);
+    background: rgba(148, 163, 184, 0.42);
+    transition: background 0.12s;
+  }
+
+  .chunk-panel-resizer:hover::before,
+  .chunk-panel-resizer:focus-visible::before {
+    background: color-mix(in oklch, var(--chunk-accent) 72%, white);
+  }
+
+  .chunk-panel-resizer:focus-visible {
+    outline: none;
   }
 
   .cpl-meta {
@@ -5702,11 +5927,13 @@
 
   /* Right panel */
   .chunk-panel-right {
+    position: relative;
+    z-index: 2;
     flex: 1;
     min-width: 0;
     display: flex;
     flex-direction: column;
-    overflow: hidden;
+    overflow: visible;
   }
 
   .chunk-tab-bar {
@@ -5748,7 +5975,13 @@
     position: relative;
     flex: 1;
     min-height: 0;
-    background: linear-gradient(180deg, #fbfcfe 0%, #f2f5fa 100%);
+    overflow: hidden;
+    background-color: #f4f7fb;
+    background-image:
+      radial-gradient(circle at center, rgba(15, 23, 42, 0.18) 1.3px, transparent 1.4px),
+      linear-gradient(180deg, #fbfcfe 0%, #f2f5fa 100%);
+    background-size: 40px 40px, 100% 100%;
+    background-position: 20px 20px, 0 0;
     touch-action: none;
   }
 
@@ -5759,39 +5992,78 @@
     inset: 0;
     width: 100%;
     height: 100%;
+    z-index: 1;
   }
 
-  .chunk-layer-dry { pointer-events: none; }
+  .chunk-layer-dry { pointer-events: none; z-index: 1; }
+  .chunk-layer-wet { z-index: 2; }
 
   .chunk-ink-bar {
     position: absolute;
     bottom: 0;
     left: 0;
     right: 0;
-    height: 34px;
+    height: 38px;
     display: flex;
     align-items: center;
-    padding: 0 8px;
-    gap: 2px;
+    padding: 0 10px;
+    gap: 4px;
     background: rgba(255, 255, 255, 0.92);
     backdrop-filter: blur(6px);
     border-top: 1px solid rgba(0, 0, 0, 0.07);
+    z-index: 20;
+    overflow: visible;
   }
 
-  .chunk-tool-btn {
+  .chunk-ink-bar .divider {
+    width: 1px;
+    height: 20px;
+    background: rgba(15, 23, 42, 0.14);
+    margin: 0 2px;
+  }
+
+  .chunk-ink-bar .ink-btn,
+  .chunk-ink-bar .tool-btn {
     width: 30px;
     height: 30px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: 6px;
     color: #6b7280;
-    cursor: pointer;
-    transition: background 0.1s, color 0.1s;
   }
 
-  .chunk-tool-btn:hover  { background: #f3f4f6; color: #374151; }
-  .chunk-tool-btn.active { background: #f3f4f6; color: #111827; }
+  .chunk-ink-bar .ink-btn:hover:not(:disabled),
+  .chunk-ink-bar .tool-btn:hover:not(:disabled) {
+    background: #f3f4f6 !important;
+    color: #374151;
+  }
+
+  .chunk-ink-bar .tool-btn.active {
+    background: color-mix(in oklch, var(--chunk-accent) 14%, white) !important;
+    color: var(--chunk-accent);
+  }
+
+  .chunk-ink-bar .ink-btn:disabled {
+    opacity: 0.4;
+  }
+
+  .chunk-ink-bar .pen-popout {
+    border: 1px solid color-mix(in oklch, var(--chunk-accent) 26%, transparent);
+    box-shadow: 0 14px 34px color-mix(in oklch, var(--chunk-accent) 14%, transparent);
+    z-index: 120;
+  }
+
+  .chunk-ink-bar .pen-popout::after {
+    border-right: 1px solid color-mix(in oklch, var(--chunk-accent) 26%, transparent);
+    border-bottom: 1px solid color-mix(in oklch, var(--chunk-accent) 26%, transparent);
+  }
+
+  .chunk-ink-bar .pen-slider {
+    accent-color: var(--chunk-accent);
+  }
+
+  .chunk-ink-bar .colour-swatch.selected {
+    box-shadow:
+      0 0 0 2px color-mix(in oklch, var(--chunk-accent) 72%, black),
+      0 0 0 5px color-mix(in oklch, var(--chunk-accent) 28%, transparent);
+  }
 
   .chunk-tab-placeholder {
     flex: 1;
@@ -5808,6 +6080,7 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+    overflow: hidden;
     background: #ffffff;
   }
 
@@ -5940,6 +6213,7 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+    overflow: hidden;
     background: linear-gradient(180deg, #fbfcfe 0%, #f4f7fb 100%);
   }
 
@@ -6239,8 +6513,8 @@
   }
 
   @media (max-width: 720px) {
-    .chunk-sheet-backdrop { padding: 0.5rem; }
-    .chunk-sheet { width: 100%; height: 100%; border-radius: 12px; flex-direction: column; }
+    .chunk-sheet { flex-direction: column; }
+    .chunk-panel-resizer { display: none; }
     .chunk-panel-left { width: 100%; max-height: 180px; border-right: none; border-bottom: 1px solid rgba(0,0,0,0.07); border-left: none; border-top: 3px solid var(--chunk-accent); }
   }
 
@@ -6348,6 +6622,7 @@
     position: relative;
     display: flex;
     align-items: center;
+    z-index: 40;
   }
 
   .pen-popout {
@@ -6362,7 +6637,7 @@
     border-radius: 14px;
     box-shadow: 0 12px 32px rgba(25, 34, 68, 0.18);
     backdrop-filter: blur(8px);
-    z-index: 30;
+    z-index: 120;
   }
 
   .pen-popout::after {
