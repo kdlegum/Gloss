@@ -1,6 +1,7 @@
 use crate::llm::{
-    build_chunk_chat_prompt, build_prompt, map_reqwest_error, parse_chunks, stream_sse_events,
-    BlockForPrompt, ChunkChatMessage, ChunkChatPrompt, GroupedChunk, LlmError,
+    build_chunk_chat_prompt, build_chunk_rewrite_prompt, build_prompt, map_reqwest_error,
+    parse_chunk_rewrite, parse_chunks, stream_sse_events, BlockForPrompt, ChunkChatMessage,
+    ChunkChatPrompt, ChunkRewritePrompt, ChunkRewriteResult, GroupedChunk, LlmError,
 };
 use log::{debug, info};
 use serde_json::{json, Value};
@@ -175,6 +176,44 @@ impl DeepSeekClient {
             ));
         }
         Ok(trimmed)
+    }
+
+    pub async fn rewrite_chunk_with_prompt(
+        &self,
+        chunk: &ChunkRewritePrompt<'_>,
+    ) -> Result<ChunkRewriteResult, LlmError> {
+        let prompt = build_chunk_rewrite_prompt(chunk);
+        info!(
+            target: LOG_TARGET,
+            "rewrite_chunk_with_prompt model={} chunk_type={} title_present={} subject_present={}",
+            self.model,
+            chunk.chunk_type,
+            chunk.title.is_some(),
+            chunk.subject.is_some()
+        );
+
+        let value = self
+            .send_request(json!({
+                "model": self.model,
+                "messages": [{
+                    "role": "user",
+                    "content": prompt
+                }],
+                "temperature": 0.1,
+                "response_format": {
+                    "type": "json_object"
+                }
+            }))
+            .await?;
+        let output_text =
+            extract_message_content(&value).ok_or_else(|| LlmError::Parse(value.to_string()))?;
+        debug!(
+            target: LOG_TARGET,
+            "received {} response chars from deepseek chunk rewrite",
+            output_text.len()
+        );
+
+        parse_chunk_rewrite(&output_text, LOG_TARGET)
     }
 
     async fn send_request(&self, request: Value) -> Result<Value, LlmError> {

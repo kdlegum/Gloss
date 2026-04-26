@@ -12,7 +12,7 @@ use crate::deepseek::DeepSeekClient;
 use crate::gemini::GeminiClient;
 use crate::llm::{
     sanitize_chunk_body_markdown, ChunkBodyPrompt, ChunkBodyResult, ChunkChatMessage,
-    ChunkChatPrompt, LlmError, LlmProvider,
+    ChunkChatPrompt, ChunkRewritePrompt, ChunkRewriteResult, LlmError, LlmProvider,
 };
 use crate::ollama::OllamaClient;
 use crate::openai::OpenAiClient;
@@ -332,6 +332,59 @@ fn normalize_model_override(model: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+async fn run_vision_body_transcription(
+    pool: &SqlitePool,
+    provider: LlmProvider,
+    model: Option<String>,
+    image_base64: &str,
+    chunk_type: &str,
+    title: Option<&str>,
+    subject: Option<&str>,
+) -> Result<String, String> {
+    if image_base64.trim().is_empty() {
+        return Err("image payload was empty".into());
+    }
+
+    let prompt = ChunkBodyPrompt {
+        chunk_type,
+        title,
+        subject,
+    };
+    let configured_api_key = settings::api_key_for_provider(pool, provider).await?;
+    let result = match provider {
+        LlmProvider::Ollama => OllamaClient::with_vision_model(model.clone())
+            .transcribe_chunk_body(&prompt, image_base64)
+            .await
+            .map_err(|e| e.to_string())?,
+        LlmProvider::OpenAI => {
+            OpenAiClient::with_api_key_and_model(configured_api_key, model.clone())
+                .transcribe_chunk_body(&prompt, image_base64)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        LlmProvider::Gemini => {
+            GeminiClient::with_api_key_and_model(configured_api_key, model.clone())
+                .transcribe_chunk_body(&prompt, image_base64)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        LlmProvider::DeepSeek => {
+            return Err("provider deepseek does not support vision transcription".to_string())
+        }
+        LlmProvider::Zai => ZaiClient::with_api_key_and_model(configured_api_key, model)
+            .transcribe_chunk_body(&prompt, image_base64)
+            .await
+            .map_err(|e| e.to_string())?,
+    };
+
+    let body_markdown = sanitize_chunk_body_markdown(&result.body_markdown);
+    if body_markdown.is_empty() {
+        return Err("vision transcription returned empty chunk body".to_string());
+    }
+
+    Ok(body_markdown)
+}
+
 #[derive(serde::Deserialize, serde::Serialize, bincode::Encode, bincode::Decode, Clone, Copy)]
 struct Point {
     x: f32,
@@ -592,6 +645,55 @@ async fn save_chunk_glossary(
 }
 
 #[tauri::command]
+async fn save_chunk_title(
+    chunk_id: i64,
+    title: Option<String>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<(), String> {
+    let trimmed = title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    sqlx::query("UPDATE chunks SET title = ? WHERE id = ?")
+        .bind(trimmed.as_deref())
+        .bind(chunk_id)
+        .execute(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn save_chunk_body_markdown(
+    chunk_id: i64,
+    body_markdown: Option<String>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<(), String> {
+    let trimmed = body_markdown
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(sanitize_chunk_body_markdown)
+        .filter(|value| !value.trim().is_empty());
+    sqlx::query("UPDATE chunks SET formatted_body_md = ? WHERE id = ?")
+        .bind(trimmed.as_deref())
+        .bind(chunk_id)
+        .execute(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Err(e) = references::reindex_chunk_references(pool.inner(), chunk_id).await {
+        log::warn!(
+            target: "gloss_lib::references",
+            "failed to reindex references after manual body save chunk_id={}: {}",
+            chunk_id,
+            e
+        );
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_chunk_for_transcription(
     chunk_id: i64,
     pool: tauri::State<'_, SqlitePool>,
@@ -780,10 +882,6 @@ async fn generate_chunk_formatted_body(
         }
     }
 
-    if image_base64.trim().is_empty() {
-        return Err("image payload was empty".into());
-    }
-
     info!(
         target: "gloss_lib::llm",
         "generate_chunk_formatted_body chunk_id={} provider={} force={} chunk_type={}",
@@ -793,42 +891,16 @@ async fn generate_chunk_formatted_body(
         chunk_type
     );
 
-    let prompt = ChunkBodyPrompt {
-        chunk_type: &chunk_type,
-        title: title.as_deref(),
-        subject: subject.as_deref(),
-    };
-    let configured_api_key = settings::api_key_for_provider(pool.inner(), provider).await?;
-    let result = match provider {
-        LlmProvider::Ollama => OllamaClient::with_vision_model(model.clone())
-            .transcribe_chunk_body(&prompt, &image_base64)
-            .await
-            .map_err(|e| e.to_string())?,
-        LlmProvider::OpenAI => {
-            OpenAiClient::with_api_key_and_model(configured_api_key, model.clone())
-                .transcribe_chunk_body(&prompt, &image_base64)
-                .await
-                .map_err(|e| e.to_string())?
-        }
-        LlmProvider::Gemini => {
-            GeminiClient::with_api_key_and_model(configured_api_key, model.clone())
-                .transcribe_chunk_body(&prompt, &image_base64)
-                .await
-                .map_err(|e| e.to_string())?
-        }
-        LlmProvider::DeepSeek => {
-            return Err("provider deepseek does not support vision transcription".to_string())
-        }
-        LlmProvider::Zai => ZaiClient::with_api_key_and_model(configured_api_key, model)
-            .transcribe_chunk_body(&prompt, &image_base64)
-            .await
-            .map_err(|e| e.to_string())?,
-    };
-
-    let body_markdown = sanitize_chunk_body_markdown(&result.body_markdown);
-    if body_markdown.is_empty() {
-        return Err("vision transcription returned empty chunk body".to_string());
-    }
+    let body_markdown = run_vision_body_transcription(
+        pool.inner(),
+        provider,
+        model,
+        &image_base64,
+        &chunk_type,
+        title.as_deref(),
+        subject.as_deref(),
+    )
+    .await?;
 
     sqlx::query("UPDATE chunks SET formatted_body_md = ? WHERE id = ?")
         .bind(&body_markdown)
@@ -848,12 +920,244 @@ async fn generate_chunk_formatted_body(
     Ok(ChunkBodyResult { body_markdown })
 }
 
+#[tauri::command]
+async fn transcribe_ai_chat_image(
+    provider: String,
+    model: Option<String>,
+    image_base64: String,
+    chunk_type: Option<String>,
+    title: Option<String>,
+    subject: Option<String>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<ChunkBodyResult, String> {
+    let provider = provider.parse::<LlmProvider>()?;
+    validate_vision_provider(provider)?;
+    let model = normalize_model_override(model);
+    let chunk_type = chunk_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("explanation");
+    let title = title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let subject = subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let body_markdown = run_vision_body_transcription(
+        pool.inner(),
+        provider,
+        model,
+        &image_base64,
+        chunk_type,
+        title,
+        subject,
+    )
+    .await?;
+
+    Ok(ChunkBodyResult { body_markdown })
+}
+
+#[derive(Clone)]
+struct ChunkAliasContext {
+    alias: String,
+    alias_kind: String,
+}
+
+#[derive(Clone)]
+struct RelatedChunkContext {
+    relation: String,
+    chunk_id: i64,
+    chunk_type: String,
+    title: Option<String>,
+    subject: Option<String>,
+    body_preview: Option<String>,
+    glossary_preview: Option<String>,
+    aliases: Vec<String>,
+}
+
 struct ChunkChatContext {
     book_title: String,
     chunk_type: String,
     title: Option<String>,
     subject: Option<String>,
     body_markdown: String,
+    glossary_markdown: Option<String>,
+    aliases: Vec<ChunkAliasContext>,
+    related_chunks: Vec<RelatedChunkContext>,
+}
+
+fn compose_chunk_chat_body(context: &ChunkChatContext) -> String {
+    let mut body = context.body_markdown.trim().to_string();
+    let mut extras = String::new();
+
+    if let Some(glossary) = context
+        .glossary_markdown
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        extras.push_str("Chunk glossary entry:\n");
+        extras.push_str("---\n");
+        extras.push_str(glossary);
+        extras.push_str("\n---\n");
+    }
+
+    if !context.aliases.is_empty() {
+        if !extras.is_empty() {
+            extras.push('\n');
+        }
+        extras.push_str("Chunk aliases:\n");
+        for alias in &context.aliases {
+            extras.push_str(&format!("- {} ({})\n", alias.alias, alias.alias_kind));
+        }
+    }
+
+    if !context.related_chunks.is_empty() {
+        if !extras.is_empty() {
+            extras.push('\n');
+        }
+        extras.push_str("Related chunk context:\n");
+        for related in &context.related_chunks {
+            extras.push_str(&format!(
+                "- [{}] chunk {} ({})\n",
+                related.relation, related.chunk_id, related.chunk_type
+            ));
+            if let Some(title) = related
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                extras.push_str(&format!("  title: {}\n", title));
+            }
+            if let Some(subject) = related
+                .subject
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                extras.push_str(&format!("  subject: {}\n", subject));
+            }
+            if !related.aliases.is_empty() {
+                extras.push_str(&format!("  aliases: {}\n", related.aliases.join(", ")));
+            }
+            if let Some(preview) = related
+                .body_preview
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                extras.push_str("  body preview:\n");
+                for line in preview.lines() {
+                    extras.push_str("    ");
+                    extras.push_str(line);
+                    extras.push('\n');
+                }
+            }
+            if let Some(glossary) = related
+                .glossary_preview
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                extras.push_str("  glossary preview:\n");
+                for line in glossary.lines() {
+                    extras.push_str("    ");
+                    extras.push_str(line);
+                    extras.push('\n');
+                }
+            }
+        }
+    }
+
+    if !extras.trim().is_empty() {
+        body.push_str("\n\nSupplemental context (glossary, aliases, linked chunks, and references):\n---\n");
+        body.push_str(extras.trim_end());
+        body.push_str("\n---\n");
+    }
+
+    body
+}
+
+async fn load_chunk_alias_context(
+    pool: &SqlitePool,
+    chunk_id: i64,
+) -> Result<Vec<ChunkAliasContext>, String> {
+    let rows = sqlx::query(
+        "SELECT alias, alias_kind FROM chunk_aliases \
+         WHERE chunk_id = ? ORDER BY alias_kind, alias",
+    )
+    .bind(chunk_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ChunkAliasContext {
+            alias: row.get("alias"),
+            alias_kind: row.get("alias_kind"),
+        })
+        .collect())
+}
+
+async fn load_related_chunk_aliases(pool: &SqlitePool, chunk_id: i64) -> Result<Vec<String>, String> {
+    let rows = sqlx::query(
+        "SELECT alias FROM chunk_aliases WHERE chunk_id = ? ORDER BY alias_kind, alias LIMIT 6",
+    )
+    .bind(chunk_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(|row| row.get("alias")).collect())
+}
+
+async fn append_related_chunk(
+    pool: &SqlitePool,
+    related_chunks: &mut Vec<RelatedChunkContext>,
+    seen_ids: &mut HashSet<i64>,
+    relation: &str,
+    chunk_id: i64,
+    chunk_type: String,
+    title: Option<String>,
+    subject: Option<String>,
+    body_markdown: Option<String>,
+    glossary_markdown: Option<String>,
+    max_related: usize,
+) -> Result<(), String> {
+    if related_chunks.len() >= max_related {
+        return Ok(());
+    }
+    if !seen_ids.insert(chunk_id) {
+        return Ok(());
+    }
+
+    let aliases = load_related_chunk_aliases(pool, chunk_id).await?;
+    let body_preview = body_markdown
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(truncate_markdown_preview);
+    let glossary_preview = glossary_markdown
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(truncate_markdown_preview);
+    related_chunks.push(RelatedChunkContext {
+        relation: relation.to_string(),
+        chunk_id,
+        chunk_type,
+        title,
+        subject,
+        body_preview,
+        glossary_preview,
+        aliases,
+    });
+    Ok(())
 }
 
 fn sanitize_chunk_chat_history(
@@ -866,12 +1170,22 @@ fn sanitize_chunk_chat_history(
             return Err(format!("invalid chat role {:?}", message.role));
         }
         let content = message.content.trim();
-        if content.is_empty() {
+        let image_base64 = message
+            .image_base64
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if role != "user" && image_base64.is_some() {
+            return Err("image attachments are only allowed on user messages".into());
+        }
+        if content.is_empty() && image_base64.is_none() {
             continue;
         }
         cleaned.push(ChunkChatMessage {
             role: role.to_string(),
             content: content.to_string(),
+            image_base64,
         });
     }
 
@@ -886,8 +1200,9 @@ async fn load_chunk_chat_context(
     chunk_id: i64,
 ) -> Result<ChunkChatContext, String> {
     let row = sqlx::query(
-        "SELECT sd.title AS book_title, c.chunk_type, c.title, c.subject, \
-                COALESCE(NULLIF(TRIM(c.formatted_body_md), ''), NULLIF(TRIM(c.ocr_text), '')) AS body_markdown \
+        "SELECT sd.title AS book_title, c.source_document_id, c.chunk_type, c.title, c.subject, c.proves_chunk_id, \
+                COALESCE(NULLIF(TRIM(c.formatted_body_md), ''), NULLIF(TRIM(c.ocr_text), '')) AS body_markdown, \
+                NULLIF(TRIM(c.glossary_md), '') AS glossary_markdown \
          FROM chunks c \
          JOIN source_documents sd ON sd.id = c.source_document_id \
          WHERE c.id = ?",
@@ -898,18 +1213,135 @@ async fn load_chunk_chat_context(
     .map_err(|e| e.to_string())?
     .ok_or_else(|| format!("chunk {} not found", chunk_id))?;
 
-    let body_markdown: Option<String> = row.get("body_markdown");
-    let body_markdown = body_markdown
+    let body_markdown = row
+        .get::<Option<String>, _>("body_markdown")
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty());
+    let glossary_markdown = row
+        .get::<Option<String>, _>("glossary_markdown")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let body_markdown = body_markdown
+        .or_else(|| glossary_markdown.as_ref().map(|_| "No chunk body text is available for this chunk.".to_string()))
         .ok_or_else(|| "No chunk text is available for AI chat yet.".to_string())?;
+
+    let source_document_id: i64 = row.get("source_document_id");
+    let chunk_type: String = row.get("chunk_type");
+    let proves_chunk_id: Option<i64> = row.get("proves_chunk_id");
+    let aliases = load_chunk_alias_context(pool, chunk_id).await?;
+
+    const MAX_RELATED: usize = 6;
+    let mut related_chunks: Vec<RelatedChunkContext> = Vec::new();
+    let mut seen_ids: HashSet<i64> = HashSet::new();
+
+    if chunk_type == "proof" {
+        if let Some(target_chunk_id) = proves_chunk_id {
+            if let Some(linked) = sqlx::query(
+                "SELECT id, chunk_type, title, subject, \
+                        COALESCE(NULLIF(TRIM(formatted_body_md), ''), NULLIF(TRIM(ocr_text), '')) AS body_markdown, \
+                        NULLIF(TRIM(glossary_md), '') AS glossary_markdown \
+                 FROM chunks \
+                 WHERE id = ? AND source_document_id = ?",
+            )
+            .bind(target_chunk_id)
+            .bind(source_document_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            {
+                append_related_chunk(
+                    pool,
+                    &mut related_chunks,
+                    &mut seen_ids,
+                    "proof_target",
+                    linked.get("id"),
+                    linked.get("chunk_type"),
+                    linked.get("title"),
+                    linked.get("subject"),
+                    linked.get("body_markdown"),
+                    linked.get("glossary_markdown"),
+                    MAX_RELATED,
+                )
+                .await?;
+            }
+        }
+    } else if let Some(linked_proof) = sqlx::query(
+        "SELECT id, chunk_type, title, subject, \
+                COALESCE(NULLIF(TRIM(formatted_body_md), ''), NULLIF(TRIM(ocr_text), '')) AS body_markdown, \
+                NULLIF(TRIM(glossary_md), '') AS glossary_markdown \
+         FROM chunks \
+         WHERE source_document_id = ? AND chunk_type = 'proof' AND proves_chunk_id = ? \
+         ORDER BY id LIMIT 1",
+    )
+    .bind(source_document_id)
+    .bind(chunk_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    {
+        append_related_chunk(
+            pool,
+            &mut related_chunks,
+            &mut seen_ids,
+            "linked_proof",
+            linked_proof.get("id"),
+            linked_proof.get("chunk_type"),
+            linked_proof.get("title"),
+            linked_proof.get("subject"),
+            linked_proof.get("body_markdown"),
+            linked_proof.get("glossary_markdown"),
+            MAX_RELATED,
+        )
+        .await?;
+    }
+
+    let reference_rows = sqlx::query(
+        "SELECT c.id, c.chunk_type, c.title, c.subject, \
+                COALESCE(NULLIF(TRIM(c.formatted_body_md), ''), NULLIF(TRIM(c.ocr_text), '')) AS body_markdown, \
+                NULLIF(TRIM(c.glossary_md), '') AS glossary_markdown \
+         FROM chunk_references r \
+         JOIN chunks src ON src.id = r.source_chunk_id \
+         JOIN chunk_aliases a ON a.alias = r.matched_text \
+         JOIN chunks c ON c.id = a.chunk_id \
+             AND c.source_document_id = src.source_document_id \
+             AND c.id != src.id \
+         WHERE r.source_chunk_id = ? \
+         ORDER BY r.span_start, c.id",
+    )
+    .bind(chunk_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    for row in reference_rows {
+        append_related_chunk(
+            pool,
+            &mut related_chunks,
+            &mut seen_ids,
+            "body_reference",
+            row.get("id"),
+            row.get("chunk_type"),
+            row.get("title"),
+            row.get("subject"),
+            row.get("body_markdown"),
+            row.get("glossary_markdown"),
+            MAX_RELATED,
+        )
+        .await?;
+        if related_chunks.len() >= MAX_RELATED {
+            break;
+        }
+    }
 
     Ok(ChunkChatContext {
         book_title: row.get("book_title"),
-        chunk_type: row.get("chunk_type"),
+        chunk_type,
         title: row.get("title"),
         subject: row.get("subject"),
         body_markdown,
+        glossary_markdown,
+        aliases,
+        related_chunks,
     })
 }
 
@@ -932,12 +1364,13 @@ async fn run_chunk_ai_stream(
         let context = load_chunk_chat_context(&pool, chunk_id)
             .await
             .map_err(LlmError::Config)?;
+        let prompt_body = compose_chunk_chat_body(&context);
         let prompt = ChunkChatPrompt {
             book_title: &context.book_title,
             chunk_type: &context.chunk_type,
             title: context.title.as_deref(),
             subject: context.subject.as_deref(),
-            body_markdown: &context.body_markdown,
+            body_markdown: &prompt_body,
         };
         let configured_api_key = settings::api_key_for_provider(&pool, provider)
             .await
@@ -1011,6 +1444,173 @@ async fn run_chunk_ai_stream(
             }
         }
     }
+}
+
+async fn run_chunk_rewrite_request(
+    pool: &SqlitePool,
+    provider: LlmProvider,
+    model: Option<String>,
+    rewrite_prompt: &ChunkRewritePrompt<'_>,
+) -> Result<ChunkRewriteResult, String> {
+    let configured_api_key = settings::api_key_for_provider(pool, provider).await?;
+
+    let result = match provider {
+        LlmProvider::Ollama => OllamaClient::with_text_model(model.clone())
+            .rewrite_chunk_with_prompt(rewrite_prompt)
+            .await
+            .map_err(|e| e.to_string())?,
+        LlmProvider::OpenAI => {
+            OpenAiClient::with_api_key_and_model(configured_api_key.clone(), model.clone())
+                .rewrite_chunk_with_prompt(rewrite_prompt)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        LlmProvider::Gemini => {
+            GeminiClient::with_api_key_and_model(configured_api_key.clone(), model.clone())
+                .rewrite_chunk_with_prompt(rewrite_prompt)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        LlmProvider::DeepSeek => {
+            DeepSeekClient::with_api_key_and_model(configured_api_key, model)
+                .rewrite_chunk_with_prompt(rewrite_prompt)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        LlmProvider::Zai => {
+            return Err("provider zai does not support chat".to_string());
+        }
+    };
+
+    Ok(result)
+}
+
+#[tauri::command]
+async fn rewrite_chunk_text_with_prompt(
+    chunk_id: i64,
+    prompt: String,
+    provider: String,
+    model: Option<String>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<ChunkRewriteResult, String> {
+    if chunk_id < 1 {
+        return Err(format!("invalid chunk_id {}", chunk_id));
+    }
+    let prompt = prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err("prompt was empty".into());
+    }
+
+    let provider = provider.parse::<LlmProvider>()?;
+    validate_chat_provider(provider)?;
+    let model = normalize_model_override(model);
+    let context = load_chunk_chat_context(pool.inner(), chunk_id).await?;
+    let rewrite_prompt = ChunkRewritePrompt {
+        book_title: &context.book_title,
+        chunk_type: &context.chunk_type,
+        title: context.title.as_deref(),
+        subject: context.subject.as_deref(),
+        body_markdown: &context.body_markdown,
+        user_prompt: &prompt,
+    };
+    let result = run_chunk_rewrite_request(pool.inner(), provider, model, &rewrite_prompt).await?;
+
+    Ok(result)
+}
+
+#[derive(serde::Serialize)]
+struct ChunkGlossaryRewriteResult {
+    glossary_markdown: String,
+}
+
+#[tauri::command]
+async fn rewrite_chunk_glossary_with_prompt(
+    chunk_id: i64,
+    prompt: String,
+    provider: String,
+    model: Option<String>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<ChunkGlossaryRewriteResult, String> {
+    if chunk_id < 1 {
+        return Err(format!("invalid chunk_id {}", chunk_id));
+    }
+    let prompt = prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err("prompt was empty".into());
+    }
+
+    let provider = provider.parse::<LlmProvider>()?;
+    validate_chat_provider(provider)?;
+    let model = normalize_model_override(model);
+
+    let row = sqlx::query(
+        "SELECT sd.title AS book_title, c.chunk_type, c.title, c.subject, \
+                COALESCE(NULLIF(TRIM(c.formatted_body_md), ''), NULLIF(TRIM(c.ocr_text), '')) AS body_markdown, \
+                NULLIF(TRIM(c.glossary_md), '') AS glossary_markdown \
+         FROM chunks c \
+         JOIN source_documents sd ON sd.id = c.source_document_id \
+         WHERE c.id = ?",
+    )
+    .bind(chunk_id)
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("chunk {} not found", chunk_id))?;
+
+    let chunk_body_markdown = row
+        .get::<Option<String>, _>("body_markdown")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let glossary_markdown = row
+        .get::<Option<String>, _>("glossary_markdown")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let book_title = row.get::<String, _>("book_title");
+    let chunk_type = row.get::<String, _>("chunk_type");
+    let title = row
+        .get::<Option<String>, _>("title")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let subject = row
+        .get::<Option<String>, _>("subject")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let wrapped_prompt = format!(
+        "Edit ONLY the glossary entry markdown for this chunk.\n\
+         Output requirements:\n\
+         - Return title as null.\n\
+         - Put the rewritten glossary entry in body_markdown.\n\
+         - Keep glossary prose plain (no headings or bold).\n\
+         - Preserve mathematical correctness and use LaTeX where helpful.\n\
+         - If the glossary should stay exactly unchanged, return body_markdown as null.\n\n\
+         Current glossary markdown:\n---\n{}\n---\n\n\
+         Chunk body reference (for context only):\n---\n{}\n---\n\n\
+         User glossary edit instruction:\n{}",
+        glossary_markdown,
+        chunk_body_markdown,
+        prompt
+    );
+
+    let rewrite_prompt = ChunkRewritePrompt {
+        book_title: book_title.trim(),
+        chunk_type: chunk_type.trim(),
+        title: title.as_deref(),
+        subject: subject.as_deref(),
+        body_markdown: &glossary_markdown,
+        user_prompt: &wrapped_prompt,
+    };
+
+    let result = run_chunk_rewrite_request(pool.inner(), provider, model, &rewrite_prompt).await?;
+    let glossary_markdown = result
+        .body_markdown
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "AI response did not include glossary markdown edits.".to_string())?;
+
+    Ok(ChunkGlossaryRewriteResult { glossary_markdown })
 }
 
 #[tauri::command]
@@ -1148,6 +1748,7 @@ struct ChunkPreview {
     subject: Option<String>,
     status: String,
     body_preview: Option<String>,
+    glossary_preview: Option<String>,
     has_formatted_body: bool,
     has_self_explanation: bool,
 }
@@ -1158,7 +1759,7 @@ async fn get_chunk_preview(
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<ChunkPreview, String> {
     let row = sqlx::query(
-        "SELECT id, chunk_type, title, subject, status, formatted_body_md, ocr_text \
+        "SELECT id, chunk_type, title, subject, status, formatted_body_md, ocr_text, glossary_md \
          FROM chunks WHERE id = ?",
     )
     .bind(chunk_id)
@@ -1179,6 +1780,12 @@ async fn get_chunk_preview(
         .filter(|v| !v.is_empty())
         .or_else(|| ocr.as_deref().map(str::trim).filter(|v| !v.is_empty()));
     let body_preview = body_source.map(truncate_markdown_preview);
+    let glossary: Option<String> = row.get("glossary_md");
+    let glossary_source = glossary
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let glossary_preview = glossary_source.map(truncate_markdown_preview);
 
     Ok(ChunkPreview {
         id: row.get("id"),
@@ -1187,10 +1794,27 @@ async fn get_chunk_preview(
         subject: row.get("subject"),
         status: row.get("status"),
         body_preview,
+        glossary_preview,
         has_formatted_body,
-        // Stub — flips to a real EXISTS lookup once the glossary table ships.
-        has_self_explanation: false,
+        has_self_explanation: glossary_source.is_some(),
     })
+}
+
+#[tauri::command]
+async fn get_proof_chunk_for_target(
+    target_chunk_id: i64,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<Option<i64>, String> {
+    let proof_id = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM chunks \
+         WHERE chunk_type = 'proof' AND proves_chunk_id = ? \
+         ORDER BY id LIMIT 1",
+    )
+    .bind(target_chunk_id)
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(proof_id)
 }
 
 /// Truncate a markdown body at a block boundary (paragraph / display-math /
@@ -2122,13 +2746,19 @@ pub fn run() {
             get_chunks_for_page,
             get_chunk_for_transcription,
             save_chunk_glossary,
+            save_chunk_title,
+            save_chunk_body_markdown,
             get_ai_settings_state,
             save_ai_api_keys,
             generate_chunk_formatted_body,
+            transcribe_ai_chat_image,
+            rewrite_chunk_text_with_prompt,
+            rewrite_chunk_glossary_with_prompt,
             start_chunk_ai_stream,
             cancel_chunk_ai_stream,
             get_chunk_references,
             get_chunk_preview,
+            get_proof_chunk_for_target,
             reindex_document_references,
             debug_references,
             get_chunking_status,

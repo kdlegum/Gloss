@@ -1,8 +1,9 @@
 use crate::llm::{
-    build_chunk_body_prompt, build_chunk_chat_prompt, build_prompt, chunk_body_schema,
-    chunk_groups_schema, map_reqwest_error, parse_chunk_body, parse_chunks, stream_sse_events,
-    BlockForPrompt, ChunkBodyPrompt, ChunkBodyResult, ChunkChatMessage, ChunkChatPrompt,
-    GroupedChunk, LlmError,
+    build_chunk_body_prompt, build_chunk_chat_prompt, build_chunk_rewrite_prompt, build_prompt,
+    chunk_body_schema, chunk_groups_schema, chunk_rewrite_schema, map_reqwest_error,
+    parse_chunk_body, parse_chunk_rewrite, parse_chunks, stream_sse_events, BlockForPrompt,
+    ChunkBodyPrompt, ChunkBodyResult, ChunkChatMessage, ChunkChatPrompt, ChunkRewritePrompt,
+    ChunkRewriteResult, GroupedChunk, LlmError,
 };
 use log::{debug, info};
 use serde_json::{json, Value};
@@ -260,6 +261,44 @@ impl OllamaClient {
         Ok(trimmed)
     }
 
+    pub async fn rewrite_chunk_with_prompt(
+        &self,
+        chunk: &ChunkRewritePrompt<'_>,
+    ) -> Result<ChunkRewriteResult, LlmError> {
+        let model = self.resolve_text_model().await?;
+        let prompt = build_chunk_rewrite_prompt(chunk);
+        info!(
+            target: LOG_TARGET,
+            "rewrite_chunk_with_prompt base_url={} model={} chunk_type={} title_present={} subject_present={}",
+            self.base_url,
+            model,
+            chunk.chunk_type,
+            chunk.title.is_some(),
+            chunk.subject.is_some()
+        );
+
+        let output = self
+            .chat_completion(
+                &model,
+                json!([{
+                    "role": "user",
+                    "content": prompt
+                }]),
+                json!({
+                    "type": "json_schema",
+                    "schema": chunk_rewrite_schema()
+                }),
+            )
+            .await?;
+        debug!(
+            target: LOG_TARGET,
+            "received {} response chars from llama-server chunk rewrite",
+            output.len()
+        );
+
+        parse_chunk_rewrite(&output, LOG_TARGET)
+    }
+
     async fn resolve_text_model(&self) -> Result<String, LlmError> {
         if let Some(model) = &self.model {
             return Ok(model.clone());
@@ -361,10 +400,26 @@ fn build_chat_messages(prompt: &str, history: &[ChunkChatMessage]) -> Value {
         } else {
             "user"
         };
-        messages.push(json!({
+        let mut entry = json!({
             "role": role,
             "content": message.content
-        }));
+        });
+        if role == "user" {
+            if let Some(image_base64) = message
+                .image_base64
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert(
+                        "images".to_string(),
+                        json!([image_base64]),
+                    );
+                }
+            }
+        }
+        messages.push(entry);
     }
 
     Value::Array(messages)

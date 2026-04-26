@@ -10,6 +10,7 @@
     subject: string | null;
     status: string;
     body_preview: string | null;
+    glossary_preview: string | null;
     has_formatted_body: boolean;
     has_self_explanation: boolean;
   }
@@ -40,6 +41,7 @@
   let preview = $state<ChunkPreview | null>(null);
   let loadError = $state<string | null>(null);
   let card: HTMLDivElement | null = $state(null);
+  let activeTab = $state<"chunk" | "glossary">("chunk");
 
   const placement = $derived(computePlacement(anchorRect));
   const colour = $derived<ChunkColour>(
@@ -49,7 +51,25 @@
   const bodyHtml = $derived(
     preview?.body_preview ? renderChunkBodyHtml(preview.body_preview) : "",
   );
+  const glossaryHtml = $derived(
+    preview?.glossary_preview ? renderChunkBodyHtml(preview.glossary_preview) : "",
+  );
+  const hasGlossary = $derived(Boolean(preview?.glossary_preview?.trim()));
   const displayTitle = $derived(preview?.title ?? preview?.subject ?? null);
+
+  $effect(() => {
+    if (!preview) {
+      activeTab = "chunk";
+      return;
+    }
+    if (hasGlossary && !bodyHtml) {
+      activeTab = "glossary";
+      return;
+    }
+    if (!hasGlossary) {
+      activeTab = "chunk";
+    }
+  });
 
   function computePlacement(rect: DOMRect) {
     const cardWidth = 320;
@@ -141,14 +161,35 @@
         <span class="peek-title muted">{colour.label}</span>
       {/if}
     </header>
-    {#if bodyHtml}
+    {#if hasGlossary}
+      <div class="peek-tab-bar" role="tablist" aria-label="Chunk preview sections">
+        <button
+          type="button"
+          class="peek-tab"
+          class:active={activeTab === "chunk"}
+          onclick={() => activeTab = "chunk"}
+        >Chunk</button>
+        <button
+          type="button"
+          class="peek-tab"
+          class:active={activeTab === "glossary"}
+          onclick={() => activeTab = "glossary"}
+        >Glossary</button>
+      </div>
+    {/if}
+
+    {#if activeTab === "glossary"}
+      {#if glossaryHtml}
+        <div class="peek-body">{@html glossaryHtml}</div>
+      {:else}
+        <div class="peek-body muted">No glossary entry yet.</div>
+      {/if}
+    {:else if bodyHtml}
       <div class="peek-body">{@html bodyHtml}</div>
     {:else}
       <div class="peek-body muted">No body content yet.</div>
     {/if}
-    {#if preview.has_self_explanation}
-      <div class="peek-attached">Your self-explanation is attached.</div>
-    {/if}
+
     <div class="peek-actions">
       <button type="button" class="peek-open" onclick={() => onOpen(preview!.id)}>Open</button>
     </div>
@@ -226,16 +267,79 @@
     margin-bottom: 0;
   }
 
-  .peek-body.muted {
-    color: #777;
+  .peek-body :global(h1),
+  .peek-body :global(h2),
+  .peek-body :global(h3),
+  .peek-body :global(h4) {
+    margin: 0.2em 0 0.45em;
+    font-family: Georgia, serif;
+    font-weight: 600;
+    line-height: 1.25;
+    color: #111827;
   }
 
-  .peek-attached {
-    padding: 0.4rem 0.75rem;
-    font-size: 0.75rem;
+  .peek-body :global(h1) { font-size: 1.02rem; }
+  .peek-body :global(h2) { font-size: 0.96rem; }
+  .peek-body :global(h3) { font-size: 0.9rem; }
+
+  .peek-body :global(ul),
+  .peek-body :global(ol) {
+    margin: 0.2em 0 0.6em 1.1em;
+  }
+
+  .peek-body :global(code) {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.82em;
+    background: rgba(15, 23, 42, 0.07);
+    padding: 0.1em 0.26em;
+    border-radius: 0.2em;
+  }
+
+  .peek-body :global(pre) {
+    margin: 0.25em 0 0.7em;
+    padding: 0.5em 0.6em;
+    border-radius: 6px;
+    background: rgba(15, 23, 42, 0.05);
+    overflow-x: auto;
+  }
+
+  .peek-body :global(pre code) {
+    background: transparent;
+    padding: 0;
+  }
+
+  .peek-tab-bar {
+    display: flex;
+    gap: 0.25rem;
+    padding: 0.35rem 0.65rem;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+    background: #fff;
+  }
+
+  .peek-tab {
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: #6b7280;
+    border: 1px solid rgba(0, 0, 0, 0.12);
+    background: #fff;
+    border-radius: 999px;
+    padding: 0.18rem 0.55rem;
+    cursor: pointer;
+    transition: color 120ms ease, background-color 120ms ease, border-color 120ms ease;
+  }
+
+  .peek-tab:hover {
+    color: #374151;
+  }
+
+  .peek-tab.active {
     color: var(--peek-accent);
-    border-top: 1px solid rgba(0, 0, 0, 0.06);
-    background: rgba(0, 0, 0, 0.015);
+    border-color: var(--peek-accent);
+    background: var(--peek-tint);
+  }
+
+  .peek-body.muted {
+    color: #777;
   }
 
   .peek-actions {

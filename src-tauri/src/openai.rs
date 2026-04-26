@@ -1,8 +1,9 @@
 use crate::llm::{
-    build_chunk_body_prompt, build_chunk_chat_prompt, build_prompt, chunk_body_schema,
-    chunk_groups_schema, map_reqwest_error, merge_stream_text, parse_chunk_body, parse_chunks,
-    stream_sse_events, BlockForPrompt, ChunkBodyPrompt, ChunkBodyResult, ChunkChatMessage,
-    ChunkChatPrompt, GroupedChunk, LlmError,
+    build_chunk_body_prompt, build_chunk_chat_prompt, build_chunk_rewrite_prompt, build_prompt,
+    chunk_body_schema, chunk_groups_schema, chunk_rewrite_schema, map_reqwest_error,
+    merge_stream_text, parse_chunk_body, parse_chunk_rewrite, parse_chunks, stream_sse_events,
+    BlockForPrompt, ChunkBodyPrompt, ChunkBodyResult, ChunkChatMessage, ChunkChatPrompt,
+    ChunkRewritePrompt, ChunkRewriteResult, GroupedChunk, LlmError,
 };
 use log::{debug, info};
 use serde_json::{json, Value};
@@ -262,6 +263,50 @@ impl OpenAiClient {
         Ok(trimmed)
     }
 
+    pub async fn rewrite_chunk_with_prompt(
+        &self,
+        chunk: &ChunkRewritePrompt<'_>,
+    ) -> Result<ChunkRewriteResult, LlmError> {
+        let prompt = build_chunk_rewrite_prompt(chunk);
+        info!(
+            target: LOG_TARGET,
+            "rewrite_chunk_with_prompt model={} chunk_type={} title_present={} subject_present={}",
+            self.model,
+            chunk.chunk_type,
+            chunk.title.is_some(),
+            chunk.subject.is_some()
+        );
+
+        let mut request = json!({
+            "model": self.model,
+            "store": false,
+            "input": prompt,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "chunk_rewrite",
+                    "schema": chunk_rewrite_schema(),
+                    "strict": true
+                }
+            }
+        });
+        if model_supports_temperature(&self.model) {
+            if let Some(obj) = request.as_object_mut() {
+                obj.insert("temperature".to_string(), json!(0.1));
+            }
+        }
+        let value = self.send_request(request).await?;
+        let output_text =
+            extract_output_text(&value).ok_or_else(|| LlmError::Parse(value.to_string()))?;
+        debug!(
+            target: LOG_TARGET,
+            "received {} response chars from openai chunk rewrite",
+            output_text.len()
+        );
+
+        parse_chunk_rewrite(&output_text, LOG_TARGET)
+    }
+
     async fn send_request(&self, request: Value) -> Result<Value, LlmError> {
         let api_key = self
             .api_key
@@ -322,12 +367,33 @@ fn build_chat_input(prompt: &str, history: &[ChunkChatMessage]) -> Value {
         } else {
             "user"
         };
-        messages.push(json!({
-            "role": role,
-            "content": [{
+        let mut content_items: Vec<Value> = Vec::new();
+        if !message.content.trim().is_empty() {
+            content_items.push(json!({
                 "type": "input_text",
                 "text": message.content
-            }]
+            }));
+        }
+        if role == "user" {
+            if let Some(image_base64) = message
+                .image_base64
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                content_items.push(json!({
+                    "type": "input_image",
+                    "image_url": format!("data:image/png;base64,{image_base64}"),
+                    "detail": "high"
+                }));
+            }
+        }
+        if content_items.is_empty() {
+            continue;
+        }
+        messages.push(json!({
+            "role": role,
+            "content": content_items
         }));
     }
 

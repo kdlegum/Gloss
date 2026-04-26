@@ -59,9 +59,38 @@ export function renderChunkBodyHtml(
   const prepared = injectReferenceLinks(source, references);
   const normalized = prepared.replace(/\r\n?/g, "\n").trim();
   if (!normalized) return "";
-  const blocks = parseBlocks(normalized, options);
+  const preSuppressed = suppressLeadingDuplicateSource(normalized, options.suppressLeadingText ?? []);
+  const blocks = parseBlocks(preSuppressed, options);
   const visibleBlocks = suppressLeadingDuplicateBlocks(blocks, options);
   return visibleBlocks.map((block) => renderBlock(block, options)).join("");
+}
+
+function suppressLeadingDuplicateSource(source: string, suppressLeadingText: string[]): string {
+  const candidates = buildSuppressionCandidates(suppressLeadingText);
+  if (candidates.length === 0) return source;
+  const candidateSet = new Set(candidates.map((candidate) => candidate.normalized));
+
+  const lines = source.split("\n");
+  let removed = 0;
+  for (let index = 0; index < lines.length && removed < 3; index += 1) {
+    const trimmed = lines[index].trim();
+    if (!trimmed) continue;
+
+    const normalized = normalizeTextForHeadingMatch(trimmed);
+    if (isMatchingSuppressedHeading(normalized, candidateSet)) {
+      lines[index] = "";
+      removed += 1;
+      continue;
+    }
+
+    const stripped = stripSuppressedPrefixFromParagraph(trimmed, candidates);
+    if (stripped === null) break;
+    lines[index] = stripped;
+    removed += 1;
+    break;
+  }
+
+  return lines.join("\n").trim();
 }
 
 // Splice markdown links into the source at each resolved reference span. Byte
@@ -388,29 +417,69 @@ function suppressLeadingDuplicateBlocks(
   blocks: ChunkBodyBlock[],
   options: RenderChunkBodyOptions,
 ): ChunkBodyBlock[] {
-  const candidateSet = new Set(
-    (options.suppressLeadingText ?? [])
-      .map((value) => normalizeTextForHeadingMatch(value))
-      .filter((value) => value.length > 0),
-  );
-  if (candidateSet.size === 0) return blocks;
+  const candidateEntries = buildSuppressionCandidates(options.suppressLeadingText ?? []);
+  if (candidateEntries.length === 0) return blocks;
+  const candidateSet = new Set(candidateEntries.map((entry) => entry.normalized));
+  const outputBlocks = [...blocks];
 
   let index = 0;
   let removed = 0;
-  while (index < blocks.length && removed < 3) {
-    const block = blocks[index];
-    if (block.kind !== "heading" && block.kind !== "paragraph") break;
-    const blockText = normalizeTextForHeadingMatch(
-      block.kind === "heading"
-        ? block.text
-        : block.lines.map((line) => line.trim()).join(" "),
-    );
-    if (!isMatchingSuppressedHeading(blockText, candidateSet)) break;
-    index += 1;
+  while (index < outputBlocks.length && removed < 3) {
+    const block = outputBlocks[index];
+    if (block.kind !== "heading" && block.kind !== "paragraph" && block.kind !== "ordered-list") break;
+    if (block.kind === "heading") {
+      const blockText = normalizeTextForHeadingMatch(block.text);
+      if (!isMatchingSuppressedHeading(blockText, candidateSet)) break;
+      index += 1;
+      removed += 1;
+      continue;
+    }
+
+    const paragraphText = block.kind === "paragraph"
+      ? block.lines.map((line) => line.trim()).join(" ")
+      : `${block.start}. ${block.items[0] ?? ""}`.trim();
+    const blockText = normalizeTextForHeadingMatch(paragraphText);
+    if (isMatchingSuppressedHeading(blockText, candidateSet)) {
+      index += 1;
+      removed += 1;
+      continue;
+    }
+
+    const trimmed = stripSuppressedPrefixFromParagraph(paragraphText, candidateEntries);
+    if (trimmed === null) break;
     removed += 1;
+    if (!trimmed) {
+      index += 1;
+      continue;
+    }
+    outputBlocks[index] = { kind: "paragraph", lines: [trimmed] };
+    break;
   }
 
-  return index > 0 ? blocks.slice(index) : blocks;
+  return index > 0 ? outputBlocks.slice(index) : outputBlocks;
+}
+
+interface SuppressionCandidate {
+  normalized: string;
+  compact: string;
+}
+
+function buildSuppressionCandidates(values: string[]): SuppressionCandidate[] {
+  const out: SuppressionCandidate[] = [];
+  const seen = new Set<string>();
+
+  for (const value of values) {
+    const normalized = normalizeTextForHeadingMatch(value);
+    if (!normalized) continue;
+    const compact = compactAsciiAlnum(normalized);
+    if (!compact) continue;
+    const key = `${normalized}\u0000${compact}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ normalized, compact });
+  }
+
+  return out;
 }
 
 function isMatchingSuppressedHeading(
@@ -426,6 +495,39 @@ function isMatchingSuppressedHeading(
   );
 }
 
+function stripSuppressedPrefixFromParagraph(
+  paragraphText: string,
+  candidates: SuppressionCandidate[],
+): string | null {
+  const trimmed = paragraphText.trim();
+  if (!trimmed) return null;
+
+  const { compact, compactEndRawIndexes } = buildCompactPrefixIndex(trimmed);
+  if (!compact) return null;
+
+  // Prefer longer matches so we remove the most specific duplicate heading.
+  const sortedCandidates = [...candidates]
+    .filter((candidate) => candidate.compact.length >= 8)
+    .sort((a, b) => b.compact.length - a.compact.length);
+
+  for (const candidate of sortedCandidates) {
+    if (!compact.startsWith(candidate.compact)) continue;
+    const compactEnd = candidate.compact.length - 1;
+    const rawEnd = compactEndRawIndexes[compactEnd];
+    if (rawEnd === undefined) continue;
+
+    let remainderStart = rawEnd + 1;
+    remainderStart = consumeOptionalMarkdownLinkTail(trimmed, remainderStart);
+    remainderStart = consumeOptionalMathSuffix(trimmed, remainderStart);
+    while (remainderStart < trimmed.length && isLikelyHeadingSeparator(trimmed[remainderStart])) {
+      remainderStart += 1;
+    }
+    return trimmed.slice(remainderStart).trimStart();
+  }
+
+  return null;
+}
+
 function normalizeTextForHeadingMatch(source: string): string {
   let value = source.trim();
   if (!value) return "";
@@ -436,6 +538,106 @@ function normalizeTextForHeadingMatch(source: string): string {
     .replace(/\s+/gu, " ")
     .trim()
     .toLocaleLowerCase();
+}
+
+function compactAsciiAlnum(source: string): string {
+  return source.toLocaleLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function buildCompactPrefixIndex(source: string): {
+  compact: string;
+  compactEndRawIndexes: number[];
+} {
+  const compactChars: string[] = [];
+  const compactEndRawIndexes: number[] = [];
+  const lowered = source.toLocaleLowerCase();
+
+  for (let index = 0; index < lowered.length; index += 1) {
+    const ch = lowered[index];
+    if ((ch >= "a" && ch <= "z") || (ch >= "0" && ch <= "9")) {
+      compactChars.push(ch);
+      compactEndRawIndexes.push(index);
+    }
+  }
+
+  return {
+    compact: compactChars.join(""),
+    compactEndRawIndexes,
+  };
+}
+
+function isLikelyHeadingSeparator(char: string): boolean {
+  if (/\s/u.test(char)) return true;
+  return char === "."
+    || char === ","
+    || char === ";"
+    || char === ":"
+    || char === "!"
+    || char === "?"
+    || char === ")"
+    || char === "("
+    || char === "]"
+    || char === "-"
+    || char === "^";
+}
+
+function consumeOptionalMarkdownLinkTail(source: string, startIndex: number): number {
+  let index = startIndex;
+  if (index >= source.length || source[index] !== "]") return startIndex;
+  index += 1;
+  if (index >= source.length || source[index] !== "(") return startIndex;
+  index += 1;
+
+  let depth = 1;
+  while (index < source.length) {
+    const ch = source[index];
+    if (ch === "\\" && index + 1 < source.length) {
+      index += 2;
+      continue;
+    }
+    if (ch === "(") {
+      depth += 1;
+      index += 1;
+      continue;
+    }
+    if (ch === ")") {
+      depth -= 1;
+      index += 1;
+      if (depth === 0) return index;
+      continue;
+    }
+    index += 1;
+  }
+  return startIndex;
+}
+
+function consumeOptionalMathSuffix(source: string, startIndex: number): number {
+  let index = startIndex;
+  if (index >= source.length) return index;
+
+  const marker = source[index];
+  if (marker !== "^" && marker !== "_") return index;
+  index += 1;
+  if (index >= source.length) return index;
+
+  if (source[index] === "{") {
+    index += 1;
+    while (index < source.length && source[index] !== "}") {
+      index += 1;
+    }
+    if (index < source.length && source[index] === "}") index += 1;
+    return index;
+  }
+
+  while (index < source.length) {
+    const ch = source[index];
+    if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || (ch >= "0" && ch <= "9")) {
+      index += 1;
+      continue;
+    }
+    break;
+  }
+  return index;
 }
 
 function isOcrBboxMetadataLine(source: string): boolean {

@@ -97,10 +97,21 @@ pub struct ChunkChatPrompt<'a> {
     pub body_markdown: &'a str,
 }
 
+pub struct ChunkRewritePrompt<'a> {
+    pub book_title: &'a str,
+    pub chunk_type: &'a str,
+    pub title: Option<&'a str>,
+    pub subject: Option<&'a str>,
+    pub body_markdown: &'a str,
+    pub user_prompt: &'a str,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ChunkChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, alias = "imageBase64", skip_serializing_if = "Option::is_none")]
+    pub image_base64: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -131,6 +142,12 @@ pub struct ChunkBodyResult {
     pub body_markdown: String,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ChunkRewriteResult {
+    pub title: Option<String>,
+    pub body_markdown: Option<String>,
+}
+
 pub fn build_chunk_chat_prompt(chunk: &ChunkChatPrompt<'_>) -> String {
     let mut s = String::new();
     s.push_str(
@@ -158,6 +175,41 @@ pub fn build_chunk_chat_prompt(chunk: &ChunkChatPrompt<'_>) -> String {
     s.push_str("\nChunk body:\n---\n");
     s.push_str(chunk.body_markdown.trim());
     s.push_str("\n---\n");
+    s
+}
+
+pub fn build_chunk_rewrite_prompt(chunk: &ChunkRewritePrompt<'_>) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You are editing textbook chunk text in a mathematics notes app.\n\
+         Return ONLY valid JSON matching this schema:\n\
+         { \"title\": string | null, \"body_markdown\": string | null }\n\n\
+         Rewrite rules:\n\
+         1. Apply the user instruction to the chunk title and/or body.\n\
+         2. Use Markdown + LaTeX for math in the body.\n\
+         3. Keep prose plain: no Markdown headings or bold emphasis.\n\
+         4. Preserve mathematical correctness and avoid inventing facts not implied by context.\n\
+         5. If title should stay unchanged, return title as null.\n\
+         6. If body should stay unchanged, return body_markdown as null.\n\
+         7. Never include commentary outside the JSON object.\n\n\
+         Current chunk context:\n",
+    );
+    s.push_str(&format!("Book title: {}\n", chunk.book_title.trim()));
+    s.push_str(&format!("Chunk type: {}\n", chunk.chunk_type.trim()));
+    if let Some(title) = chunk.title.filter(|value| !value.trim().is_empty()) {
+        s.push_str(&format!("Current title: {}\n", title.trim()));
+    } else {
+        s.push_str("Current title: (none)\n");
+    }
+    if let Some(subject) = chunk.subject.filter(|value| !value.trim().is_empty()) {
+        s.push_str(&format!("Proof subject: {}\n", subject.trim()));
+    }
+    s.push_str("\nCurrent body markdown:\n---\n");
+    s.push_str(chunk.body_markdown.trim());
+    s.push_str("\n---\n");
+    s.push_str("\nUser edit instruction:\n");
+    s.push_str(chunk.user_prompt.trim());
+    s.push('\n');
     s
 }
 
@@ -376,6 +428,22 @@ pub fn chunk_body_schema() -> Value {
     })
 }
 
+pub fn chunk_rewrite_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "body_markdown"],
+        "properties": {
+            "title": {
+                "type": ["string", "null"]
+            },
+            "body_markdown": {
+                "type": ["string", "null"]
+            }
+        }
+    })
+}
+
 pub fn parse_chunks(raw: &str, log_target: &str) -> Result<Vec<GroupedChunk>, LlmError> {
     let stripped = strip_code_fences(raw);
 
@@ -404,6 +472,27 @@ pub fn parse_chunk_body(raw: &str, log_target: &str) -> Result<ChunkBodyResult, 
     parsed.body_markdown = sanitize_chunk_body_markdown(parsed.body_markdown.trim());
     if parsed.body_markdown.is_empty() {
         warn!(target: log_target, "parsed chunk body was empty");
+        return Err(LlmError::Parse(raw.to_string()));
+    }
+    Ok(parsed)
+}
+
+pub fn parse_chunk_rewrite(raw: &str, log_target: &str) -> Result<ChunkRewriteResult, LlmError> {
+    let mut parsed: ChunkRewriteResult = parse_json(raw, log_target, "chunk rewrite")?;
+    parsed.title = parsed
+        .title
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    parsed.body_markdown = parsed
+        .body_markdown
+        .map(|value| sanitize_chunk_body_markdown(value.trim()))
+        .filter(|value| !value.is_empty());
+
+    if parsed.title.is_none() && parsed.body_markdown.is_none() {
+        warn!(
+            target: log_target,
+            "parsed chunk rewrite did not include any edits"
+        );
         return Err(LlmError::Parse(raw.to_string()));
     }
     Ok(parsed)
