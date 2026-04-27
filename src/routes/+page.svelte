@@ -5062,6 +5062,7 @@
           chunk: { ...chunkView.chunk, achieved_marks: parsed },
         };
       }
+      questionAchievedMarksDraft = parsed == null ? "" : formatQuestionMarksValue(parsed);
       await loadQuestionMarkAttempts(view.chunk.id);
     } catch (err) {
       questionAchievedMarksError = formatLogError(err);
@@ -5079,7 +5080,7 @@
       if (questionSourceSlices.length === 0) return;
     }
     const target = questionSourceSlices[0];
-    await goToPage(target.page_number, { keepChunkView: true });
+    await goToPage(target.page_number);
   }
 
   async function runQuestionMarking() {
@@ -5100,6 +5101,7 @@
         includeVisuals: includeQuestionMarkVisuals,
       });
       questionMarkingSuggestion = suggestion;
+      questionMarkingSuggestionIncludeVisuals = includeQuestionMarkVisuals;
     } catch (err) {
       questionMarkingError = formatLogError(err);
       await appLogWarn(`[question] AI marking failed chunkId=${view.chunk.id}: ${questionMarkingError}`);
@@ -5122,7 +5124,7 @@
         source: "ai",
         achievedMarks: questionMarkingSuggestion.achieved_marks,
         feedbackMd: questionMarkingSuggestion.feedback_md,
-        includeVisuals: includeQuestionMarkVisuals,
+        includeVisuals: questionMarkingSuggestionIncludeVisuals,
         provider: chatProvider,
         model: chatModel.length > 0 ? chatModel : null,
       });
@@ -5139,9 +5141,10 @@
           chunk: { ...chunkView.chunk, achieved_marks: achieved },
         };
       }
-      questionAchievedMarksDraft = achieved == null ? "" : `${Number(achieved.toFixed(2))}`;
+      questionAchievedMarksDraft = achieved == null ? "" : formatQuestionMarksValue(achieved);
       await loadQuestionMarkAttempts(view.chunk.id);
       questionMarkingSuggestion = null;
+      questionMarkingSuggestionIncludeVisuals = false;
     } catch (err) {
       questionMarkingError = formatLogError(err);
       await appLogWarn(`[question] apply AI marking failed chunkId=${view.chunk.id}: ${questionMarkingError}`);
@@ -5224,13 +5227,16 @@
     glossaryRewriteSuggestion = null;
     glossaryRewriteLoading = false;
     glossaryRewriteApplying = false;
-    questionAchievedMarksDraft = chunk.achieved_marks == null ? "" : `${Number(chunk.achieved_marks.toFixed(2))}`;
+    questionAchievedMarksDraft = chunk.achieved_marks == null
+      ? ""
+      : formatQuestionMarksValue(chunk.achieved_marks);
     questionAchievedMarksSaving = false;
     questionAchievedMarksError = null;
     questionMarkingLoading = false;
     questionMarkingApplying = false;
     questionMarkingError = null;
     questionMarkingSuggestion = null;
+    questionMarkingSuggestionIncludeVisuals = false;
     includeQuestionMarkVisuals = false;
     questionSourceSlices = [];
     questionSourceError = null;
@@ -5308,6 +5314,7 @@
     questionMarkingApplying = false;
     questionMarkingError = null;
     questionMarkingSuggestion = null;
+    questionMarkingSuggestionIncludeVisuals = false;
     includeQuestionMarkVisuals = false;
     questionSourceSlices = [];
     questionSourceLoading = false;
@@ -6635,14 +6642,74 @@
                     }
                   }}
                 >{chunkViewTitleDisplay.heading}</h2>
-              {:else}
-                <button class="cpl-title-add-btn" type="button" onclick={beginChunkTitleEdit}>
-                  {chunkView.chunk.subject ? `Proof of ${chunkView.chunk.subject}` : "Add title"}
-                </button>
-              {/if}
+	              {:else}
+	                <button class="cpl-title-add-btn" type="button" onclick={beginChunkTitleEdit}>
+	                  {chunkView.chunk.subject ? `Proof of ${chunkView.chunk.subject}` : "Add title"}
+	                </button>
+	              {/if}
 
-              {#if linkedChunkLabel}
-                <section class="cpl-linked">
+	              {#if chunkIsQuestion}
+	                <section class="cpl-question-meta">
+	                  <div class="cpl-question-row">
+	                    <span class="cpl-question-label">Question</span>
+	                    <span class="cpl-question-value">
+	                      {chunkView.chunk.question_label ? `Q${chunkView.chunk.question_label}` : "Unknown"}
+	                    </span>
+	                  </div>
+	                  <div class="cpl-question-row">
+	                    <span class="cpl-question-label">Marks</span>
+	                    <span class="cpl-question-value">{chunkMarksDisplay ?? "?/?"}</span>
+	                  </div>
+	                  <div class="cpl-question-entry">
+	                    <input
+	                      class="cpl-question-input"
+	                      type="text"
+	                      inputmode="decimal"
+	                      placeholder="Achieved marks"
+	                      bind:value={questionAchievedMarksDraft}
+	                      disabled={questionAchievedMarksSaving}
+	                      onkeydown={(event) => {
+	                        if (event.key === "Enter") {
+	                          event.preventDefault();
+	                          void saveQuestionAchievedMarks();
+	                        }
+	                      }}
+	                    />
+	                    <button
+	                      class="cpl-question-save"
+	                      type="button"
+	                      onclick={() => void saveQuestionAchievedMarks()}
+	                      disabled={questionAchievedMarksSaving}
+	                    >
+	                      {questionAchievedMarksSaving ? "Saving..." : "Save"}
+	                    </button>
+	                  </div>
+	                  <div class="cpl-question-source-row">
+	                    <button
+	                      class="cpl-question-source"
+	                      type="button"
+	                      onclick={() => void openQuestionSource()}
+	                      disabled={questionSourceLoading}
+	                    >
+	                      {questionSourceLoading ? "Loading source..." : "Open source"}
+	                    </button>
+	                    {#if questionSourceSlices.length > 0}
+	                      <span class="cpl-question-source-count">
+	                        {questionSourceSlices.length} source {questionSourceSlices.length === 1 ? "slice" : "slices"}
+	                      </span>
+	                    {/if}
+	                  </div>
+	                  {#if questionAchievedMarksError}
+	                    <p class="cpl-question-error">{questionAchievedMarksError}</p>
+	                  {/if}
+	                  {#if questionSourceError}
+	                    <p class="cpl-question-error">{questionSourceError}</p>
+	                  {/if}
+	                </section>
+	              {/if}
+
+	              {#if linkedChunkLabel}
+	                <section class="cpl-linked">
                   <button
                     class="cpl-linked-toggle"
                     type="button"
@@ -6761,12 +6828,12 @@
                     showChunkShapeOptions = false;
                   }}
                 >
-                  <svg viewBox="0 0 16 16" fill="none" width="13" height="13">
-                    <rect x="4" y="2" width="7" height="9" rx="0.8" stroke="currentColor" stroke-width="1.2"/>
-                    <path d="M3 12.5h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-                  </svg>
-                  Glossary
-                </button>
+	                  <svg viewBox="0 0 16 16" fill="none" width="13" height="13">
+	                    <rect x="4" y="2" width="7" height="9" rx="0.8" stroke="currentColor" stroke-width="1.2"/>
+	                    <path d="M3 12.5h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+	                  </svg>
+	                  {chunkGlossaryTabLabel}
+	                </button>
                 <button
                   class="chunk-tab"
                   class:active={chunkTab === 'ai'}
@@ -7038,14 +7105,16 @@
                     </span>
                   </div>
                   {#if glossaryMode === 'edit'}
-                    <textarea
-                      class="chunk-glossary-editor"
-                      placeholder="Write your own explanation. Markdown works, and LaTeX via $â€¦$ inline or $$â€¦$$ block."
-                      value={glossaryDraft}
-                      oninput={onGlossaryInput}
-                      onblur={() => void flushGlossarySave()}
-                      spellcheck="true"
-                    ></textarea>
+	                    <textarea
+	                      class="chunk-glossary-editor"
+	                      placeholder={chunkIsQuestion
+	                        ? "Write your answer. Markdown works, and LaTeX via $â€¦$ inline or $$â€¦$$ block."
+	                        : "Write your own explanation. Markdown works, and LaTeX via $â€¦$ inline or $$â€¦$$ block."}
+	                      value={glossaryDraft}
+	                      oninput={onGlossaryInput}
+	                      onblur={() => void flushGlossarySave()}
+	                      spellcheck="true"
+	                    ></textarea>
                   {:else}
                     <div class="chunk-glossary-preview">
                       {#if glossaryDraft.trim()}
@@ -7056,9 +7125,100 @@
                     </div>
                   {/if}
                 </div>
-              {:else if chunkTab === 'ai'}
-                <div class="chunk-ai-pane">
-                  <div class="chunk-ai-rewrite chunk-ai-rewrite-compact">
+	              {:else if chunkTab === 'ai'}
+	                <div class="chunk-ai-pane">
+	                  {#if chunkIsQuestion}
+	                    <section class="chunk-ai-marking">
+	                      <div class="chunk-ai-marking-header">
+	                        <strong>Mark my answer</strong>
+	                        <span>{chunkMarksDisplay ?? "?/?"}</span>
+	                      </div>
+	                      <div class="chunk-ai-marking-controls">
+	                        <button
+	                          class="chunk-ai-context-toggle"
+	                          class:active={includeQuestionMarkVisuals}
+	                          type="button"
+	                          aria-pressed={includeQuestionMarkVisuals}
+	                          onclick={() => includeQuestionMarkVisuals = !includeQuestionMarkVisuals}
+	                          disabled={questionMarkingLoading || questionMarkingApplying}
+	                        >
+	                          {includeQuestionMarkVisuals ? "Include visuals: On" : "Include visuals: Off"}
+	                        </button>
+	                        <button
+	                          class="chunk-ai-action chunk-ai-send"
+	                          type="button"
+	                          onclick={() => void runQuestionMarking()}
+	                          disabled={questionMarkingLoading || questionMarkingApplying}
+	                        >
+	                          {questionMarkingLoading ? "Marking..." : "Mark answer"}
+	                        </button>
+	                      </div>
+	                      {#if questionMarkingError}
+	                        <p class="chunk-ai-rewrite-error">{questionMarkingError}</p>
+	                      {/if}
+	                      {#if questionMarkingSuggestion}
+	                        <div class="chunk-ai-mark-suggestion">
+	                          <p class="chunk-ai-rewrite-field">
+	                            <span>Suggested mark:</span>
+	                            {formatQuestionMarksValue(questionMarkingSuggestion.achieved_marks)}
+	                            /
+	                            {chunkView.chunk.available_marks == null ? "?" : chunkView.chunk.available_marks}
+	                          </p>
+	                          <div class="chunk-ai-rewrite-body-preview rendered">
+	                            {@html questionMarkingSuggestionFeedbackHtml}
+	                          </div>
+	                          <div class="chunk-ai-rewrite-actions">
+	                            <button
+	                              class="chunk-ai-action chunk-ai-send"
+	                              type="button"
+	                              onclick={() => void applyQuestionMarkingSuggestion()}
+	                              disabled={questionMarkingApplying}
+	                            >
+	                              {questionMarkingApplying ? "Applying..." : "Apply"}
+	                            </button>
+	                            <button
+	                              class="chunk-ai-action chunk-ai-stop"
+	                              type="button"
+	                              onclick={() => {
+	                                questionMarkingSuggestion = null;
+	                                questionMarkingSuggestionIncludeVisuals = false;
+	                              }}
+	                              disabled={questionMarkingApplying}
+	                            >
+	                              Discard
+	                            </button>
+	                          </div>
+	                        </div>
+	                      {/if}
+	                      <div class="chunk-ai-mark-history">
+	                        <p class="chunk-ai-mark-history-title">Mark history</p>
+	                        {#if questionMarkAttempts.length === 0}
+	                          <p class="chunk-ai-mark-history-empty">No saved attempts yet.</p>
+	                        {:else}
+	                          <ul class="chunk-ai-mark-history-list">
+	                            {#each questionMarkAttempts as attempt (attempt.id)}
+	                              <li class="chunk-ai-mark-history-item">
+	                                <div class="chunk-ai-mark-history-meta">
+	                                  <span class="chunk-ai-mark-history-score">{formatQuestionAttemptScore(attempt)}</span>
+	                                  <span class="chunk-ai-mark-history-source">{attempt.source.toUpperCase()}</span>
+	                                  <span class="chunk-ai-mark-history-time">
+	                                    {formatQuestionAttemptTimestamp(attempt.created_at)}
+	                                  </span>
+	                                </div>
+	                                {#if attempt.feedback_md}
+	                                  <div class="chunk-ai-mark-history-feedback rendered">
+	                                    {@html renderQuestionAttemptFeedback(attempt.feedback_md)}
+	                                  </div>
+	                                {/if}
+	                              </li>
+	                            {/each}
+	                          </ul>
+	                        {/if}
+	                      </div>
+	                    </section>
+	                  {/if}
+
+	                  <div class="chunk-ai-rewrite chunk-ai-rewrite-compact">
                     <div class="chunk-ai-context-row">
                       <button
                         class="chunk-ai-context-toggle"
@@ -7077,13 +7237,13 @@
                       </span>
                     </div>
                     <div class="chunk-ai-rewrite-header">
-                      <strong>Rewrite</strong>
-                      <span>
-                        {chunkAiRewriteTab === 'body'
-                          ? 'Drafts title/body markdown'
-                          : 'Drafts glossary markdown'}
-                      </span>
-                    </div>
+	                      <strong>Rewrite</strong>
+	                      <span>
+	                        {chunkAiRewriteTab === 'body'
+	                          ? 'Drafts title/body markdown'
+	                          : chunkIsQuestion ? 'Drafts answer markdown' : 'Drafts glossary markdown'}
+	                      </span>
+	                    </div>
                     <div class="chunk-ai-rewrite-tabs" role="tablist" aria-label="Rewrite target">
                       <button
                         class="chunk-ai-rewrite-tab"
@@ -7103,10 +7263,10 @@
                         role="tab"
                         aria-selected={chunkAiRewriteTab === 'glossary'}
                         onclick={() => chunkAiRewriteTab = 'glossary'}
-                        disabled={chunkRewriteLoading || chunkRewriteApplying || glossaryRewriteLoading || glossaryRewriteApplying}
-                      >
-                        Glossary
-                      </button>
+	                        disabled={chunkRewriteLoading || chunkRewriteApplying || glossaryRewriteLoading || glossaryRewriteApplying}
+	                      >
+	                        {chunkIsQuestion ? "Answer" : "Glossary"}
+	                      </button>
                     </div>
 
                     {#if chunkAiRewriteTab === 'body'}
@@ -7219,11 +7379,11 @@
                   </div>
 
                   <div class="chunk-ai-transcript" bind:this={chunkChatTranscript} use:chunkChatCodeCopy>
-                    {#if chunkChatMessages.length === 0}
-                      <div class="chunk-ai-empty">
-                        <p>Ask about this chunk.</p>
-                        <p>The AI sees the book title, chunk body, glossary entries, aliases, linked chunks, and references.</p>
-                      </div>
+	                    {#if chunkChatMessages.length === 0}
+	                      <div class="chunk-ai-empty">
+	                        <p>Ask about this chunk.</p>
+	                        <p>The AI sees the book title, chunk body, {chunkIsQuestion ? "answer entries" : "glossary entries"}, aliases, linked chunks, and references.</p>
+	                      </div>
                     {:else}
                       {#each chunkChatMessages as message (message.id)}
                         <article
@@ -7605,26 +7765,39 @@
     <div class="library">
       <div class="library-header">
         <h1>Gloss</h1>
-        <div class="library-actions">
-          <button
-            class="ai-settings-btn"
-            onclick={() => openAiKeySettings(false)}
-            type="button"
-          >
-            AI settings
-          </button>
-          <button onclick={() => void importPdf()} disabled={importing} class="import-btn">
-            {importing ? "Importingâ€¦" : "Import PDF"}
-          </button>
-        </div>
-      </div>
+	        <div class="library-actions">
+	          <button
+	            class="ai-settings-btn"
+	            onclick={() => openAiKeySettings(false)}
+	            type="button"
+	          >
+	            AI settings
+	          </button>
+	          <div class="import-mode-group">
+	            <button
+	              onclick={() => void importPdf("textbook")}
+	              disabled={importing}
+	              class="import-btn import-btn-secondary"
+	            >
+	              {importing ? "Importingâ€¦" : "Import Textbook"}
+	            </button>
+	            <button
+	              onclick={() => void importPdf("past_paper")}
+	              disabled={importing}
+	              class="import-btn"
+	            >
+	              {importing ? "Importingâ€¦" : "Import Past Paper"}
+	            </button>
+	          </div>
+	        </div>
+	      </div>
 
       {#if error}
         <p class="error">{error}</p>
       {/if}
 
-      {#if sourceDocuments.length === 0}
-        <p class="empty">No books yet. Import a PDF to get started.</p>
+	      {#if sourceDocuments.length === 0}
+	        <p class="empty">No documents yet. Import a textbook or past paper to get started.</p>
       {:else}
         <ul>
           {#each sourceDocuments as book (book.id)}
@@ -8075,12 +8248,35 @@
     transition: background 0.15s;
   }
 
+  .import-mode-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .import-btn-secondary {
+    background: #eef2f8;
+    color: #243149;
+    border: 1px solid #d4dce8;
+  }
+
+  .import-btn-secondary:hover:not(:disabled) {
+    background: #e5ebf5;
+  }
+
   .import-btn:hover:not(:disabled) {
     background: #333;
   }
 
   .import-btn:disabled {
     background: #888;
+  }
+
+  .import-btn-secondary:disabled {
+    background: #eff3f8;
+    color: #8a96aa;
   }
 
   .ai-settings-btn {
@@ -8097,6 +8293,27 @@
   .ai-settings-btn:hover:not(:disabled) {
     background: #eceff5 !important;
     border-color: #c9d2df;
+  }
+
+  @media (max-width: 720px) {
+    .library-header {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+
+    .library-actions {
+      width: 100%;
+      justify-content: flex-start;
+    }
+
+    .import-mode-group {
+      width: 100%;
+    }
+
+    .import-btn {
+      flex: 1;
+      text-align: center;
+    }
   }
 
   .error {
@@ -9102,6 +9319,116 @@
     color: #111827;
   }
 
+  .cpl-question-meta {
+    margin: 0 10px 8px;
+    padding: 8px 9px;
+    border-radius: 8px;
+    border: 1px solid color-mix(in oklch, var(--chunk-accent) 26%, #cbd5e1);
+    background: color-mix(in oklch, var(--chunk-tint) 66%, white);
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    flex-shrink: 0;
+  }
+
+  .cpl-question-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .cpl-question-label {
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #6b7280;
+    font-family: Inter, system-ui, sans-serif;
+  }
+
+  .cpl-question-value {
+    font-size: 12px;
+    color: #111827;
+    font-family: Inter, system-ui, sans-serif;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  .cpl-question-entry {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .cpl-question-input {
+    min-width: 0;
+    flex: 1;
+    height: 30px;
+    padding: 0 9px;
+    border-radius: 7px;
+    border: 1px solid rgba(148, 163, 184, 0.62);
+    background: #fff;
+    color: #111827;
+    font-size: 12px;
+    font-family: Inter, system-ui, sans-serif;
+  }
+
+  .cpl-question-input:focus {
+    outline: none;
+    border-color: color-mix(in oklch, var(--chunk-accent) 56%, white);
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--chunk-accent) 16%, transparent);
+  }
+
+  .cpl-question-save,
+  .cpl-question-source {
+    height: 30px;
+    padding: 0 10px;
+    border-radius: 7px;
+    font-size: 11.5px;
+    font-weight: 600;
+    font-family: Inter, system-ui, sans-serif;
+    transition: background 0.12s, border-color 0.12s, transform 0.12s;
+  }
+
+  .cpl-question-save {
+    background: var(--chunk-accent);
+    color: #fff;
+  }
+
+  .cpl-question-source {
+    border: 1px solid color-mix(in oklch, var(--chunk-accent) 32%, #cbd5e1);
+    background: #fff;
+    color: #334155;
+  }
+
+  .cpl-question-save:hover:not(:disabled),
+  .cpl-question-source:hover:not(:disabled) {
+    transform: translateY(-1px);
+  }
+
+  .cpl-question-source-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .cpl-question-source-count {
+    font-size: 10.5px;
+    color: #64748b;
+    font-family: Inter, system-ui, sans-serif;
+  }
+
+  .cpl-question-error {
+    margin: 0;
+    color: #b91c1c;
+    font-size: 11px;
+    line-height: 1.4;
+    font-family: Inter, system-ui, sans-serif;
+  }
+
   .cpl-linked {
     margin: 0 10px 8px;
     border-radius: 8px;
@@ -9729,6 +10056,149 @@
     background: linear-gradient(180deg, #fbfcfe 0%, #f4f7fb 100%);
   }
 
+  .chunk-ai-marking {
+    padding: 10px 14px 8px;
+    border-bottom: 1px solid rgba(203, 213, 225, 0.72);
+    background: rgba(255, 255, 255, 0.88);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  .chunk-ai-marking-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    font-family: Inter, system-ui, sans-serif;
+  }
+
+  .chunk-ai-marking-header strong {
+    font-size: 12px;
+    color: #1f2937;
+  }
+
+  .chunk-ai-marking-header span {
+    font-size: 12px;
+    color: #334155;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  .chunk-ai-marking-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .chunk-ai-mark-suggestion {
+    border: 1px solid rgba(148, 163, 184, 0.45);
+    border-radius: 10px;
+    padding: 9px 10px;
+    background: #f8fafc;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .chunk-ai-mark-history {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .chunk-ai-mark-history-title {
+    margin: 0;
+    color: #6b7280;
+    font-size: 10.5px;
+    font-family: Inter, system-ui, sans-serif;
+    font-weight: 800;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+  }
+
+  .chunk-ai-mark-history-empty {
+    margin: 0;
+    color: #94a3b8;
+    font-size: 12px;
+    font-style: italic;
+    font-family: Georgia, 'Times New Roman', serif;
+  }
+
+  .chunk-ai-mark-history-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .chunk-ai-mark-history-item {
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    border-radius: 8px;
+    background: #fff;
+    padding: 7px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .chunk-ai-mark-history-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-family: Inter, system-ui, sans-serif;
+    color: #475569;
+    font-size: 11px;
+  }
+
+  .chunk-ai-mark-history-score {
+    font-weight: 700;
+    color: #0f172a;
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  .chunk-ai-mark-history-source {
+    border-radius: 999px;
+    padding: 1px 7px;
+    background: #eef2f7;
+    color: #475569;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    font-size: 10px;
+  }
+
+  .chunk-ai-mark-history-time {
+    color: #64748b;
+    font-size: 10.5px;
+  }
+
+  .chunk-ai-mark-history-feedback {
+    margin: 0;
+    padding: 7px 8px;
+    border-radius: 7px;
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    background: #f8fafc;
+    font-size: 12px;
+    line-height: 1.5;
+    color: #334155;
+    font-family: Georgia, 'Times New Roman', serif;
+  }
+
+  .chunk-ai-mark-history-feedback :global(p) {
+    margin: 0;
+  }
+
+  .chunk-ai-mark-history-feedback :global(p + p) {
+    margin-top: 0.65em;
+  }
+
   .chunk-ai-rewrite {
     padding: 12px 14px 10px;
     border-bottom: 1px solid rgba(203, 213, 225, 0.7);
@@ -10343,6 +10813,17 @@
     .chunk-panel-resizer { display: none; }
     .chunk-panel-left { width: 100%; max-height: 180px; border-right: none; border-bottom: 1px solid rgba(0,0,0,0.07); border-left: none; border-top: 3px solid var(--chunk-accent); }
     .cpl-title-input { margin-bottom: 6px; }
+    .cpl-question-meta {
+      margin-bottom: 6px;
+      padding: 7px 8px;
+      gap: 6px;
+    }
+    .cpl-question-entry {
+      flex-wrap: wrap;
+    }
+    .cpl-question-input {
+      min-width: 120px;
+    }
     .cpl-linked {
       margin-bottom: 6px;
     }
@@ -10364,6 +10845,13 @@
     }
     .chunk-ai-rewrite-body-preview {
       max-height: 120px;
+    }
+    .chunk-ai-marking {
+      padding-left: 10px;
+      padding-right: 10px;
+    }
+    .chunk-ai-mark-history-item {
+      padding: 6px 7px;
     }
   }
 
