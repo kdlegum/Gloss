@@ -110,7 +110,11 @@ pub struct ChunkRewritePrompt<'a> {
 pub struct ChunkChatMessage {
     pub role: String,
     pub content: String,
-    #[serde(default, alias = "imageBase64", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "imageBase64",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub image_base64: Option<String>,
 }
 

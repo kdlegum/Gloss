@@ -25,6 +25,7 @@ use log::{debug, error, info, warn};
 use pdfium_render::prelude::*;
 use serde::Serialize;
 use sqlx::{Row, SqlitePool};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
@@ -67,7 +68,45 @@ const ALLOWED_TYPES: &[&str] = &[
     "example",
     "explanation",
     "noise",
+    "question",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentMode {
+    Textbook,
+    PastPaper,
+}
+
+impl DocumentMode {
+    fn from_db(value: &str) -> Self {
+        if value.trim().eq_ignore_ascii_case("past_paper") {
+            Self::PastPaper
+        } else {
+            Self::Textbook
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DocumentBlock {
+    id: i64,
+    page_id: i64,
+    page_number: i64,
+    order_idx: i32,
+    bbox_x: f32,
+    bbox_y: f32,
+    bbox_w: f32,
+    bbox_h: f32,
+    text: String,
+    transcribed_text: Option<String>,
+}
+
+#[derive(Clone)]
+struct QuestionChunkCandidate {
+    label: String,
+    available_marks: Option<i64>,
+    block_ids: Vec<i64>,
+}
 
 // ── Top-level orchestrator ──────────────────────────────────────────────────
 
@@ -143,20 +182,27 @@ async fn run_inner(
 
     // Resolve absolute path.
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let row = sqlx::query("SELECT file_path FROM source_documents WHERE id = ?")
+    let row = sqlx::query("SELECT file_path, document_mode FROM source_documents WHERE id = ?")
         .bind(doc_id)
         .fetch_one(pool)
         .await
         .map_err(|e| e.to_string())?;
     let relative_path: String = row.get("file_path");
+    let document_mode = DocumentMode::from_db(row.get::<String, _>("document_mode").as_str());
     let abs_path = data_dir.join(&relative_path);
     info!(
         target: "gloss_lib::chunking",
-        "doc_id={} page={} resolved path to {}",
+        "doc_id={} page={} mode={:?} resolved path to {}",
         doc_id,
         page_number,
+        document_mode,
         abs_path.display()
     );
+
+    if document_mode == DocumentMode::PastPaper {
+        return run_past_paper_document(pool, pdfium, app, doc_id, page_number, &abs_path, false)
+            .await;
+    }
 
     let page_id = get_or_create_page(pool, doc_id, page_number).await?;
     let page_index = (page_number - 1) as usize;
@@ -188,16 +234,12 @@ async fn run_inner(
         let blocks = pdfium
             .run(move |pdfium| extract_blocks_from_page(pdfium, &p, page_index))
             .await
-            .unwrap_or_else(|e| {
-                warn!(
-                    target: "gloss_lib::chunking",
-                    "doc_id={} page={} extraction failed: {}",
-                    doc_id,
-                    page_number,
-                    e
-                );
-                Vec::new()
-            });
+            .map_err(|e| {
+                format!(
+                    "doc_id={} page={} failed to extract text blocks: {}",
+                    doc_id, page_number, e
+                )
+            })?;
 
         persist_blocks(pool, page_id, &blocks).await?;
         info!(
@@ -352,8 +394,512 @@ async fn run_inner(
     Ok(())
 }
 
+async fn run_past_paper_document(
+    pool: &SqlitePool,
+    pdfium: &PdfiumWorker,
+    app: &AppHandle,
+    doc_id: i64,
+    requested_page: i64,
+    abs_path: &PathBuf,
+    force_rebuild: bool,
+) -> Result<(), String> {
+    set_status(pool, doc_id, "extracting").await?;
+    let blocks = extract_or_load_document_blocks(pool, pdfium, abs_path, doc_id).await?;
+    emit_progress(app, doc_id, requested_page, "extracted");
+
+    if blocks.is_empty() {
+        warn!(
+            target: "gloss_lib::chunking",
+            "doc_id={} past-paper extraction produced no text blocks",
+            doc_id
+        );
+        set_status(pool, doc_id, "done").await?;
+        return Ok(());
+    }
+
+    set_status(pool, doc_id, "grouping").await?;
+
+    let existing_questions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE source_document_id = ?")
+            .bind(doc_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    if existing_questions > 0 && !force_rebuild {
+        info!(
+            target: "gloss_lib::chunking",
+            "doc_id={} skipping past-paper regroup; existing chunks={}",
+            doc_id,
+            existing_questions
+        );
+        set_status(pool, doc_id, "done").await?;
+        return Ok(());
+    }
+
+    let grouped = group_document_questions(&blocks);
+    if grouped.is_empty() {
+        warn!(
+            target: "gloss_lib::chunking",
+            "doc_id={} no question boundaries detected; creating single fallback question",
+            doc_id
+        );
+    }
+
+    persist_document_question_chunks(pool, doc_id, &blocks, &grouped).await?;
+    if let Err(e) = references::reindex_document_references(pool, doc_id).await {
+        warn!(
+            target: "gloss_lib::chunking",
+            "doc_id={} past-paper reference reindex failed: {}",
+            doc_id,
+            e
+        );
+    }
+
+    emit_progress(app, doc_id, requested_page, "grouped");
+    set_status(pool, doc_id, "done").await?;
+    Ok(())
+}
+
+async fn extract_or_load_document_blocks(
+    pool: &SqlitePool,
+    pdfium: &PdfiumWorker,
+    abs_path: &PathBuf,
+    doc_id: i64,
+) -> Result<Vec<DocumentBlock>, String> {
+    let path_for_count = abs_path.clone();
+    let page_count = pdfium
+        .run(move |pdfium| {
+            let doc = pdfium
+                .load_pdf_from_file(&path_for_count, None)
+                .map_err(|e| e.to_string())?;
+            Ok(doc.pages().len() as i64)
+        })
+        .await?;
+    if page_count <= 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut out: Vec<DocumentBlock> = Vec::new();
+    for page_number in 1..=page_count {
+        let page_id = get_or_create_page(pool, doc_id, page_number).await?;
+        let existing_blocks: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM text_blocks WHERE page_id = ?")
+                .bind(page_id)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        if existing_blocks == 0 {
+            let path_for_extract = abs_path.clone();
+            let page_index = (page_number - 1) as usize;
+            let blocks = pdfium
+                .run(move |pdfium| extract_blocks_from_page(pdfium, &path_for_extract, page_index))
+                .await
+                .map_err(|e| {
+                    format!(
+                        "doc_id={} page={} failed to extract text blocks: {}",
+                        doc_id, page_number, e
+                    )
+                })?;
+            persist_blocks(pool, page_id, &blocks).await?;
+        }
+
+        out.extend(load_document_blocks_for_page(pool, page_id, page_number).await?);
+    }
+
+    out.sort_by(|a, b| {
+        a.page_number
+            .cmp(&b.page_number)
+            .then_with(|| a.order_idx.cmp(&b.order_idx))
+    });
+    Ok(out)
+}
+
+async fn load_document_blocks_for_page(
+    pool: &SqlitePool,
+    page_id: i64,
+    page_number: i64,
+) -> Result<Vec<DocumentBlock>, String> {
+    let rows = sqlx::query(
+        "SELECT id, order_idx, text, transcribed_text, bbox_x, bbox_y, bbox_w, bbox_h \
+         FROM text_blocks WHERE page_id = ? ORDER BY order_idx",
+    )
+    .bind(page_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| DocumentBlock {
+            id: r.get("id"),
+            page_id,
+            page_number,
+            order_idx: r.get("order_idx"),
+            bbox_x: r.get("bbox_x"),
+            bbox_y: r.get("bbox_y"),
+            bbox_w: r.get("bbox_w"),
+            bbox_h: r.get("bbox_h"),
+            text: r.get("text"),
+            transcribed_text: r.get("transcribed_text"),
+        })
+        .collect())
+}
+
+fn group_document_questions(blocks: &[DocumentBlock]) -> Vec<QuestionChunkCandidate> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+
+    let front_page_marks = extract_front_page_marks(blocks);
+    let mut grouped: Vec<QuestionChunkCandidate> = Vec::new();
+    let mut current: Option<QuestionChunkCandidate> = None;
+
+    for block in blocks {
+        let source = block
+            .transcribed_text
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(block.text.as_str());
+
+        if let Some(label) = detect_question_label(source) {
+            if let Some(existing) = current.take() {
+                if !existing.block_ids.is_empty() {
+                    grouped.push(existing);
+                }
+            }
+            let available_marks =
+                extract_marks(source).or_else(|| front_page_marks.get(&label).copied());
+            current = Some(QuestionChunkCandidate {
+                label,
+                available_marks,
+                block_ids: vec![block.id],
+            });
+            continue;
+        }
+
+        if let Some(active) = current.as_mut() {
+            active.block_ids.push(block.id);
+            if active.available_marks.is_none() {
+                active.available_marks = extract_marks(source)
+                    .or_else(|| front_page_marks.get(&active.label).copied());
+            }
+        }
+    }
+
+    if let Some(existing) = current.take() {
+        if !existing.block_ids.is_empty() {
+            grouped.push(existing);
+        }
+    }
+
+    if grouped.is_empty() {
+        grouped.push(QuestionChunkCandidate {
+            label: "1".to_string(),
+            available_marks: front_page_marks.get("1").copied(),
+            block_ids: blocks.iter().map(|block| block.id).collect(),
+        });
+    }
+
+    grouped
+}
+
+fn extract_front_page_marks(blocks: &[DocumentBlock]) -> HashMap<String, i64> {
+    let mut out = HashMap::new();
+    for block in blocks.iter().filter(|block| block.page_number == 1) {
+        for raw_line in block.text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some(label) = detect_question_label(line) else {
+                continue;
+            };
+            let Some(marks) = extract_marks(line) else {
+                continue;
+            };
+            out.entry(label).or_insert(marks);
+        }
+    }
+    out
+}
+
+fn detect_question_label(source: &str) -> Option<String> {
+    let line = source
+        .lines()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or_else(|| source.trim());
+    if line.is_empty() {
+        return None;
+    }
+
+    let lower = line.to_lowercase();
+    if lower.starts_with("question") {
+        let mut rest = &line["question".len()..];
+        rest = rest.trim_start_matches([' ', '\t', ':', '.', '-', ')']);
+        if let Some((value, _)) = parse_leading_number(rest) {
+            if (1..=300).contains(&value) {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    let (value, consumed) = parse_leading_number(line)?;
+    if !(1..=300).contains(&value) {
+        return None;
+    }
+    let trailing = line[consumed..].trim_start();
+    if trailing.is_empty() {
+        return Some(value.to_string());
+    }
+    let first = trailing.chars().next()?;
+    if matches!(first, ')' | '.' | ':' | '-' | ']') {
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn parse_leading_number(source: &str) -> Option<(i64, usize)> {
+    let mut end = 0usize;
+    for (idx, ch) in source.char_indices() {
+        if ch.is_ascii_digit() {
+            end = idx + ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    if end == 0 {
+        return None;
+    }
+    let value = source[..end].parse::<i64>().ok()?;
+    Some((value, end))
+}
+
+fn extract_marks(source: &str) -> Option<i64> {
+    let compact = source.trim();
+    if compact.is_empty() {
+        return None;
+    }
+
+    // Common exam style: [6]
+    let chars: Vec<char> = compact.chars().collect();
+    for i in 0..chars.len() {
+        if chars[i] != '[' {
+            continue;
+        }
+        let mut j = i + 1;
+        let mut digits = String::new();
+        while j < chars.len() && chars[j].is_ascii_digit() {
+            digits.push(chars[j]);
+            j += 1;
+        }
+        if j < chars.len() && chars[j] == ']' && !digits.is_empty() {
+            if let Ok(value) = digits.parse::<i64>() {
+                return Some(value);
+            }
+        }
+    }
+
+    // Phrase style: "6 marks"
+    let lower = compact.to_lowercase();
+    let mut search_start = 0usize;
+    while let Some(rel_idx) = lower[search_start..].find("mark") {
+        let idx = search_start + rel_idx;
+        let prefix = &lower[..idx];
+        let digits: String = prefix
+            .chars()
+            .rev()
+            .take_while(|ch| ch.is_ascii_digit() || ch.is_whitespace() || matches!(ch, ')' | '(' | ']'))
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        let value: String = digits.chars().filter(|ch| ch.is_ascii_digit()).collect();
+        if !value.is_empty() {
+            if let Ok(parsed) = value.parse::<i64>() {
+                return Some(parsed);
+            }
+        }
+        search_start = idx + 4;
+        if search_start >= lower.len() {
+            break;
+        }
+    }
+
+    None
+}
+
+async fn persist_document_question_chunks(
+    pool: &SqlitePool,
+    doc_id: i64,
+    blocks: &[DocumentBlock],
+    grouped: &[QuestionChunkCandidate],
+) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let by_id: HashMap<i64, &DocumentBlock> = blocks.iter().map(|block| (block.id, block)).collect();
+
+    sqlx::query(
+        "UPDATE text_blocks SET chunk_id = NULL \
+         WHERE page_id IN (SELECT id FROM pages WHERE source_document_id = ?)",
+    )
+    .bind(doc_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM chunks WHERE source_document_id = ?")
+        .bind(doc_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    for candidate in grouped {
+        let mut members: Vec<&DocumentBlock> = candidate
+            .block_ids
+            .iter()
+            .filter_map(|id| by_id.get(id).copied())
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        members.sort_by(|a, b| {
+            a.page_number
+                .cmp(&b.page_number)
+                .then_with(|| a.order_idx.cmp(&b.order_idx))
+        });
+
+        let mut page_slices: BTreeMap<i64, (i64, (f32, f32, f32, f32))> = BTreeMap::new();
+        let mut body_segments = Vec::new();
+        let mut ocr_segments = Vec::new();
+        for member in &members {
+            let key = member.page_number;
+            let bbox = (member.bbox_x, member.bbox_y, member.bbox_w, member.bbox_h);
+            page_slices
+                .entry(key)
+                .and_modify(|(_, existing)| *existing = merge_bbox(*existing, bbox))
+                .or_insert((member.page_id, bbox));
+
+            if let Some(text) = member
+                .transcribed_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                body_segments.push(text.to_string());
+            } else {
+                let text = member.text.as_str().trim();
+                if !text.is_empty() {
+                    body_segments.push(text.to_string());
+                }
+            }
+            let text = member.text.as_str().trim();
+            if !text.is_empty() {
+                ocr_segments.push(text.to_string());
+            }
+        }
+
+        let first = members[0];
+        let anchor_bbox = page_slices
+            .get(&first.page_number)
+            .map(|(_, bbox)| *bbox)
+            .unwrap_or((first.bbox_x, first.bbox_y, first.bbox_w, first.bbox_h));
+
+        let ocr_text = if ocr_segments.is_empty() {
+            None
+        } else {
+            Some(ocr_segments.join("\n\n"))
+        };
+        let formatted_body = if body_segments.is_empty() {
+            ocr_text.clone()
+        } else {
+            Some(body_segments.join("\n\n"))
+        };
+        let title = format!("Question {}", candidate.label);
+
+        let row = sqlx::query(
+            "INSERT INTO chunks \
+             (source_document_id, page_id, chunk_type, bbox_x, bbox_y, bbox_w, bbox_h, ocr_text, \
+              formatted_body_md, title, question_label, available_marks, ai_suggested) \
+             VALUES (?, ?, 'question', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1) RETURNING id",
+        )
+        .bind(doc_id)
+        .bind(first.page_id)
+        .bind(anchor_bbox.0)
+        .bind(anchor_bbox.1)
+        .bind(anchor_bbox.2)
+        .bind(anchor_bbox.3)
+        .bind(ocr_text.as_deref())
+        .bind(formatted_body.as_deref())
+        .bind(&title)
+        .bind(&candidate.label)
+        .bind(candidate.available_marks)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        let chunk_id: i64 = row.get("id");
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO chunk_aliases (chunk_id, alias, alias_kind) \
+             VALUES (?, ?, 'numeric_label')",
+        )
+        .bind(chunk_id)
+        .bind(&candidate.label)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO chunk_aliases (chunk_id, alias, alias_kind) \
+             VALUES (?, ?, 'canonical_name')",
+        )
+        .bind(chunk_id)
+        .bind(&title)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        for block_id in &candidate.block_ids {
+            sqlx::query("UPDATE text_blocks SET chunk_id = ? WHERE id = ?")
+                .bind(chunk_id)
+                .bind(block_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        for (slice_order, (_page_number, (page_id, bbox))) in page_slices.into_iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO question_page_slices \
+                 (chunk_id, page_id, bbox_x, bbox_y, bbox_w, bbox_h, slice_order) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(chunk_id)
+            .bind(page_id)
+            .bind(bbox.0)
+            .bind(bbox.1)
+            .bind(bbox.2)
+            .bind(bbox.3)
+            .bind(slice_order as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn merge_bbox(current: (f32, f32, f32, f32), next: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+    let x0 = current.0.min(next.0);
+    let y0 = current.1.min(next.1);
+    let x1 = (current.0 + current.2).max(next.0 + next.2);
+    let y1 = (current.1 + current.3).max(next.1 + next.3);
+    (x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
+}
+
 pub async fn rechunk_page(
     pool: &SqlitePool,
+    pdfium: &PdfiumWorker,
     app: &AppHandle,
     doc_id: i64,
     page_number: i64,
@@ -367,7 +913,7 @@ pub async fn rechunk_page(
         page_number,
         provider
     );
-    match rechunk_inner(pool, app, doc_id, page_number, provider, model_override).await {
+    match rechunk_inner(pool, pdfium, app, doc_id, page_number, provider, model_override).await {
         Ok(()) => {
             info!(
                 target: "gloss_lib::chunking",
@@ -396,6 +942,7 @@ pub async fn rechunk_page(
 
 async fn rechunk_inner(
     pool: &SqlitePool,
+    pdfium: &PdfiumWorker,
     app: &AppHandle,
     doc_id: i64,
     page_number: i64,
@@ -404,6 +951,20 @@ async fn rechunk_inner(
 ) -> Result<(), String> {
     if page_number < 1 {
         return Err(format!("invalid page number {}", page_number));
+    }
+
+    let row = sqlx::query("SELECT file_path, document_mode FROM source_documents WHERE id = ?")
+        .bind(doc_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let document_mode = DocumentMode::from_db(row.get::<String, _>("document_mode").as_str());
+    if document_mode == DocumentMode::PastPaper {
+        let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        let relative_path: String = row.get("file_path");
+        let abs_path = data_dir.join(relative_path);
+        return run_past_paper_document(pool, pdfium, app, doc_id, page_number, &abs_path, true)
+            .await;
     }
 
     let page_id = get_or_create_page(pool, doc_id, page_number).await?;
@@ -982,32 +1543,36 @@ async fn transcribe_blocks_for_page(
 
     let crops: Vec<(i64, Result<String, String>)> = blocks
         .iter()
-        .map(|b| (b.id, crop_and_encode_block(&rgba_bytes, page_w_px, page_h_px, b)))
+        .map(|b| {
+            (
+                b.id,
+                crop_and_encode_block(&rgba_bytes, page_w_px, page_h_px, b),
+            )
+        })
         .collect();
 
-    let transcriptions: Vec<(i64, Result<String, String>)> =
-        futures::stream::iter(crops)
-            .map(|(id, crop_result)| {
-                let zai = zai.clone();
-                let zai_transcription_semaphore = Arc::clone(&zai_transcription_semaphore);
-                async move {
-                    match crop_result {
-                        Err(e) => (id, Err(e)),
-                        Ok(crop_b64) => match zai_transcription_semaphore.acquire_owned().await {
-                            Ok(_permit) => (
-                                id,
-                                zai.transcribe_block_image(&crop_b64)
-                                    .await
-                                    .map_err(|e| e.to_string()),
-                            ),
-                            Err(_) => (id, Err("ZAI transcription limiter closed".to_string())),
-                        },
-                    }
+    let transcriptions: Vec<(i64, Result<String, String>)> = futures::stream::iter(crops)
+        .map(|(id, crop_result)| {
+            let zai = zai.clone();
+            let zai_transcription_semaphore = Arc::clone(&zai_transcription_semaphore);
+            async move {
+                match crop_result {
+                    Err(e) => (id, Err(e)),
+                    Ok(crop_b64) => match zai_transcription_semaphore.acquire_owned().await {
+                        Ok(_permit) => (
+                            id,
+                            zai.transcribe_block_image(&crop_b64)
+                                .await
+                                .map_err(|e| e.to_string()),
+                        ),
+                        Err(_) => (id, Err("ZAI transcription limiter closed".to_string())),
+                    },
                 }
-            })
-            .buffer_unordered(MAX_ZAI_CONCURRENT)
-            .collect()
-            .await;
+            }
+        })
+        .buffer_unordered(MAX_ZAI_CONCURRENT)
+        .collect()
+        .await;
 
     let mut updated = blocks.to_vec();
     for (id, result) in transcriptions {
@@ -1141,7 +1706,10 @@ fn crop_and_encode_block(
         )
         .map_err(|e| e.to_string())?;
 
-    Ok(format!("data:image/jpeg;base64,{}", STANDARD.encode(&jpeg_bytes)))
+    Ok(format!(
+        "data:image/jpeg;base64,{}",
+        STANDARD.encode(&jpeg_bytes)
+    ))
 }
 
 /// After chunking, populates `formatted_body_md` for every non-noise chunk on the page
@@ -1150,13 +1718,12 @@ async fn populate_formatted_body_from_transcriptions(
     pool: &SqlitePool,
     page_id: i64,
 ) -> Result<(), String> {
-    let chunk_ids: Vec<i64> = sqlx::query_scalar(
-        "SELECT id FROM chunks WHERE page_id = ? AND chunk_type != 'noise'",
-    )
-    .bind(page_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    let chunk_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM chunks WHERE page_id = ? AND chunk_type != 'noise'")
+            .bind(page_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
 
     for chunk_id in chunk_ids {
         let rows = sqlx::query(
@@ -1286,7 +1853,40 @@ fn extract_blocks_from_page(
     if lines.is_empty() {
         debug!(
             target: "gloss_lib::chunking",
-            "page={} extraction produced no text segments",
+            "page={} extraction produced no text segments; trying char-level fallback",
+            page_num + 1
+        );
+        lines = extract_lines_from_chars(&text, page_w, page_h);
+    }
+
+    if lines.is_empty() {
+        let all_text = text.all();
+        let compact_text = all_text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string();
+        if !compact_text.is_empty() {
+            debug!(
+                target: "gloss_lib::chunking",
+                "page={} char fallback produced no bounded glyphs; using full-page text fallback",
+                page_num + 1
+            );
+            lines.push(Line {
+                left: 0.0,
+                right: 1.0,
+                top: 0.0,
+                bottom: 1.0,
+                text: compact_text,
+            });
+        }
+    }
+
+    if lines.is_empty() {
+        debug!(
+            target: "gloss_lib::chunking",
+            "page={} extraction produced no text",
             page_num + 1
         );
         return Ok(Vec::new());
@@ -1332,6 +1932,153 @@ struct Line {
     top: f32,
     bottom: f32,
     text: String,
+}
+
+struct Glyph {
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+    ch: char,
+}
+
+fn extract_lines_from_chars(text: &PdfPageText<'_>, page_w: f32, page_h: f32) -> Vec<Line> {
+    let mut glyphs: Vec<Glyph> = Vec::new();
+
+    for c in text.chars().iter() {
+        let Some(ch) = c.unicode_char() else {
+            continue;
+        };
+        if ch == '\n' || ch == '\r' {
+            continue;
+        }
+        if ch.is_control() && !ch.is_whitespace() {
+            continue;
+        }
+
+        let bounds = c.tight_bounds().or_else(|_| c.loose_bounds());
+        let Ok(bounds) = bounds else {
+            continue;
+        };
+
+        let left = (bounds.left().value / page_w).clamp(0.0, 1.0);
+        let right = (bounds.right().value / page_w).clamp(0.0, 1.0);
+        let top = ((page_h - bounds.top().value) / page_h).clamp(0.0, 1.0);
+        let bottom = ((page_h - bounds.bottom().value) / page_h).clamp(0.0, 1.0);
+        if right <= left || bottom <= top {
+            continue;
+        }
+
+        glyphs.push(Glyph {
+            left,
+            right,
+            top,
+            bottom,
+            ch,
+        });
+    }
+
+    if glyphs.is_empty() {
+        return Vec::new();
+    }
+
+    glyphs.sort_by(|a, b| {
+        a.top
+            .partial_cmp(&b.top)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.left.partial_cmp(&b.left).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let mut grouped: Vec<Vec<Glyph>> = Vec::new();
+    for glyph in glyphs {
+        let glyph_center = (glyph.top + glyph.bottom) * 0.5;
+        let glyph_h = (glyph.bottom - glyph.top).max(1e-4);
+        let target_line = grouped.iter().position(|line| {
+            let line_center = line.iter().map(|g| (g.top + g.bottom) * 0.5).sum::<f32>()
+                / line.len() as f32;
+            let line_h = line
+                .iter()
+                .map(|g| (g.bottom - g.top).max(1e-4))
+                .sum::<f32>()
+                / line.len() as f32;
+            (line_center - glyph_center).abs() <= glyph_h.min(line_h) * 0.8
+        });
+
+        if let Some(index) = target_line {
+            grouped[index].push(glyph);
+        } else {
+            grouped.push(vec![glyph]);
+        }
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    for mut line in grouped {
+        line.sort_by(|a, b| {
+            a.left
+                .partial_cmp(&b.left)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut left = line[0].left;
+        let mut right = line[0].right;
+        let mut top = line[0].top;
+        let mut bottom = line[0].bottom;
+        let avg_glyph_w = line
+            .iter()
+            .map(|g| (g.right - g.left).max(1e-4))
+            .sum::<f32>()
+            / line.len() as f32;
+        let mut prev_right: Option<f32> = None;
+        let mut text = String::new();
+
+        for glyph in line {
+            if let Some(prev) = prev_right {
+                let gap = glyph.left - prev;
+                if gap > avg_glyph_w * 0.6 && !text.ends_with(' ') && !text.is_empty() {
+                    text.push(' ');
+                }
+            }
+
+            if glyph.ch.is_whitespace() {
+                if !text.ends_with(' ') && !text.is_empty() {
+                    text.push(' ');
+                }
+            } else {
+                text.push(glyph.ch);
+            }
+
+            left = left.min(glyph.left);
+            right = right.max(glyph.right);
+            top = top.min(glyph.top);
+            bottom = bottom.max(glyph.bottom);
+            prev_right = Some(glyph.right);
+        }
+
+        let compact_text = text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string();
+        if compact_text.is_empty() {
+            continue;
+        }
+
+        lines.push(Line {
+            left,
+            right,
+            top,
+            bottom,
+            text: compact_text,
+        });
+    }
+
+    lines.sort_by(|a, b| {
+        a.top
+            .partial_cmp(&b.top)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    lines
 }
 
 fn merge_into_lines(segments: Vec<Line>) -> Vec<Line> {

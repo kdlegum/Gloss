@@ -160,7 +160,13 @@ struct AppState {
 #[derive(Clone)]
 struct ChatStreamHandle {
     cancelled: Arc<AtomicBool>,
-    chunk_id: i64,
+    context: ChatStreamContext,
+}
+
+#[derive(Clone)]
+enum ChatStreamContext {
+    Chunk(i64),
+    Page(i64),
 }
 
 fn spawn_chunking_job(
@@ -230,7 +236,7 @@ fn finish_chunking_job(
 fn begin_chat_stream(
     state: &AppState,
     request_id: &str,
-    chunk_id: i64,
+    context: ChatStreamContext,
 ) -> Result<Arc<AtomicBool>, String> {
     let mut streams = state.chat_streams.lock().map_err(|e| e.to_string())?;
     if streams.contains_key(request_id) {
@@ -242,7 +248,7 @@ fn begin_chat_stream(
         request_id.to_string(),
         ChatStreamHandle {
             cancelled: Arc::clone(&cancelled),
-            chunk_id,
+            context,
         },
     );
     Ok(cancelled)
@@ -273,7 +279,9 @@ fn cancel_chat_stream(
 #[derive(serde::Serialize, Clone)]
 struct ChunkAiStreamEvent {
     request_id: String,
-    chunk_id: i64,
+    context_kind: &'static str,
+    chunk_id: Option<i64>,
+    page_id: Option<i64>,
     phase: &'static str,
     delta: Option<String>,
     error: Option<String>,
@@ -282,16 +290,22 @@ struct ChunkAiStreamEvent {
 fn emit_chunk_ai_stream(
     app: &tauri::AppHandle,
     request_id: &str,
-    chunk_id: i64,
+    context: &ChatStreamContext,
     phase: &'static str,
     delta: Option<String>,
     error: Option<String>,
 ) {
+    let (context_kind, chunk_id, page_id) = match context {
+        ChatStreamContext::Chunk(chunk_id) => ("chunk", Some(*chunk_id), None),
+        ChatStreamContext::Page(page_id) => ("page", None, Some(*page_id)),
+    };
     let _ = app.emit(
         "chunk_ai_stream",
         ChunkAiStreamEvent {
             request_id: request_id.to_string(),
+            context_kind,
             chunk_id,
+            page_id,
             phase,
             delta,
             error,
@@ -464,6 +478,7 @@ struct SourceDocument {
     id: i64,
     title: String,
     file_path: String,
+    document_mode: String,
 }
 
 fn stroke_bounds(points: &[Point]) -> Result<StrokeBounds, String> {
@@ -568,6 +583,9 @@ struct ChunkInfo {
     ocr_text: Option<String>,
     formatted_body_md: Option<String>,
     glossary_md: Option<String>,
+    question_label: Option<String>,
+    available_marks: Option<i64>,
+    achieved_marks: Option<f64>,
 }
 
 #[derive(serde::Serialize)]
@@ -587,6 +605,9 @@ struct ChunkForTranscription {
     ocr_text: Option<String>,
     formatted_body_md: Option<String>,
     glossary_md: Option<String>,
+    question_label: Option<String>,
+    available_marks: Option<i64>,
+    achieved_marks: Option<f64>,
 }
 
 #[tauri::command]
@@ -595,10 +616,22 @@ async fn get_chunks_for_page(
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<Vec<ChunkInfo>, String> {
     let rows = sqlx::query(
-        "SELECT id, chunk_type, bbox_x, bbox_y, bbox_w, bbox_h, status, \
-                title, subject, proves_chunk_id, ocr_text, formatted_body_md, glossary_md \
-         FROM chunks WHERE page_id = ? ORDER BY bbox_y, bbox_x",
+        "SELECT c.id, c.chunk_type, c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.status, \
+                c.title, c.subject, c.proves_chunk_id, c.ocr_text, c.formatted_body_md, c.glossary_md, \
+                c.question_label, c.available_marks, c.achieved_marks \
+         FROM chunks c \
+         WHERE c.page_id = ? \
+           AND (c.chunk_type != 'question' OR NOT EXISTS (SELECT 1 FROM question_page_slices qps WHERE qps.chunk_id = c.id)) \
+         UNION ALL \
+         SELECT c.id, c.chunk_type, qps.bbox_x, qps.bbox_y, qps.bbox_w, qps.bbox_h, c.status, \
+                c.title, c.subject, c.proves_chunk_id, c.ocr_text, c.formatted_body_md, c.glossary_md, \
+                c.question_label, c.available_marks, c.achieved_marks \
+         FROM question_page_slices qps \
+         JOIN chunks c ON c.id = qps.chunk_id \
+         WHERE qps.page_id = ? \
+         ORDER BY bbox_y, bbox_x",
     )
+    .bind(page_id)
     .bind(page_id)
     .fetch_all(pool.inner())
     .await
@@ -620,6 +653,9 @@ async fn get_chunks_for_page(
             ocr_text: r.get("ocr_text"),
             formatted_body_md: r.get("formatted_body_md"),
             glossary_md: r.get("glossary_md"),
+            question_label: r.get("question_label"),
+            available_marks: r.get("available_marks"),
+            achieved_marks: r.get("achieved_marks"),
         })
         .collect())
 }
@@ -702,7 +738,7 @@ async fn get_chunk_for_transcription(
         "SELECT c.id, c.source_document_id, p.page_number, c.chunk_type, \
                 c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.status, \
                 c.title, c.subject, c.proves_chunk_id, c.ocr_text, c.formatted_body_md, \
-                c.glossary_md \
+                c.glossary_md, c.question_label, c.available_marks, c.achieved_marks \
          FROM chunks c \
          JOIN pages p ON p.id = c.page_id \
          WHERE c.id = ?",
@@ -729,6 +765,9 @@ async fn get_chunk_for_transcription(
         ocr_text: r.get("ocr_text"),
         formatted_body_md: r.get("formatted_body_md"),
         glossary_md: r.get("glossary_md"),
+        question_label: r.get("question_label"),
+        available_marks: r.get("available_marks"),
+        achieved_marks: r.get("achieved_marks"),
     })
 }
 
@@ -984,6 +1023,9 @@ struct ChunkChatContext {
     chunk_type: String,
     title: Option<String>,
     subject: Option<String>,
+    question_label: Option<String>,
+    available_marks: Option<i64>,
+    achieved_marks: Option<f64>,
     body_markdown: String,
     glossary_markdown: Option<String>,
     aliases: Vec<ChunkAliasContext>,
@@ -993,6 +1035,28 @@ struct ChunkChatContext {
 fn compose_chunk_chat_body(context: &ChunkChatContext) -> String {
     let mut body = context.body_markdown.trim().to_string();
     let mut extras = String::new();
+
+    if context.chunk_type == "question" {
+        extras.push_str("Question metadata:\n");
+        extras.push_str(&format!(
+            "- label: {}\n",
+            context.question_label.as_deref().unwrap_or("unknown")
+        ));
+        extras.push_str(&format!(
+            "- available_marks: {}\n",
+            context
+                .available_marks
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+        extras.push_str(&format!(
+            "- achieved_marks: {}\n",
+            context
+                .achieved_marks
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+    }
 
     if let Some(glossary) = context
         .glossary_markdown
@@ -1075,7 +1139,9 @@ fn compose_chunk_chat_body(context: &ChunkChatContext) -> String {
     }
 
     if !extras.trim().is_empty() {
-        body.push_str("\n\nSupplemental context (glossary, aliases, linked chunks, and references):\n---\n");
+        body.push_str(
+            "\n\nSupplemental context (glossary, aliases, linked chunks, and references):\n---\n",
+        );
         body.push_str(extras.trim_end());
         body.push_str("\n---\n");
     }
@@ -1105,7 +1171,10 @@ async fn load_chunk_alias_context(
         .collect())
 }
 
-async fn load_related_chunk_aliases(pool: &SqlitePool, chunk_id: i64) -> Result<Vec<String>, String> {
+async fn load_related_chunk_aliases(
+    pool: &SqlitePool,
+    chunk_id: i64,
+) -> Result<Vec<String>, String> {
     let rows = sqlx::query(
         "SELECT alias FROM chunk_aliases WHERE chunk_id = ? ORDER BY alias_kind, alias LIMIT 6",
     )
@@ -1201,6 +1270,7 @@ async fn load_chunk_chat_context(
 ) -> Result<ChunkChatContext, String> {
     let row = sqlx::query(
         "SELECT sd.title AS book_title, c.source_document_id, c.chunk_type, c.title, c.subject, c.proves_chunk_id, \
+                c.question_label, c.available_marks, c.achieved_marks, \
                 COALESCE(NULLIF(TRIM(c.formatted_body_md), ''), NULLIF(TRIM(c.ocr_text), '')) AS body_markdown, \
                 NULLIF(TRIM(c.glossary_md), '') AS glossary_markdown \
          FROM chunks c \
@@ -1222,7 +1292,11 @@ async fn load_chunk_chat_context(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     let body_markdown = body_markdown
-        .or_else(|| glossary_markdown.as_ref().map(|_| "No chunk body text is available for this chunk.".to_string()))
+        .or_else(|| {
+            glossary_markdown
+                .as_ref()
+                .map(|_| "No chunk body text is available for this chunk.".to_string())
+        })
         .ok_or_else(|| "No chunk text is available for AI chat yet.".to_string())?;
 
     let source_document_id: i64 = row.get("source_document_id");
@@ -1338,6 +1412,9 @@ async fn load_chunk_chat_context(
         chunk_type,
         title: row.get("title"),
         subject: row.get("subject"),
+        question_label: row.get("question_label"),
+        available_marks: row.get("available_marks"),
+        achieved_marks: row.get("achieved_marks"),
         body_markdown,
         glossary_markdown,
         aliases,
@@ -1345,32 +1422,142 @@ async fn load_chunk_chat_context(
     })
 }
 
-async fn run_chunk_ai_stream(
+struct PageChatContext {
+    book_title: String,
+    page_number: i64,
+    body_markdown: String,
+}
+
+async fn load_page_chat_context(
+    pool: &SqlitePool,
+    page_id: i64,
+) -> Result<PageChatContext, String> {
+    let page_row = sqlx::query(
+        "SELECT p.page_number, sd.title AS book_title \
+         FROM pages p \
+         JOIN source_documents sd ON sd.id = p.source_document_id \
+         WHERE p.id = ?",
+    )
+    .bind(page_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("page {} not found", page_id))?;
+
+    let page_number: i64 = page_row.get("page_number");
+    let book_title: String = page_row.get("book_title");
+
+    let block_rows = sqlx::query(
+        "SELECT COALESCE(NULLIF(TRIM(transcribed_text), ''), NULLIF(TRIM(text), '')) AS body \
+         FROM text_blocks WHERE page_id = ? ORDER BY order_idx",
+    )
+    .bind(page_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let block_body = block_rows
+        .into_iter()
+        .filter_map(|row| row.get::<Option<String>, _>("body"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let chunk_rows = sqlx::query(
+        "SELECT chunk_type, title, subject, \
+                COALESCE(NULLIF(TRIM(formatted_body_md), ''), NULLIF(TRIM(ocr_text), '')) AS body_markdown \
+         FROM chunks \
+         WHERE page_id = ? AND chunk_type != 'noise' \
+         ORDER BY bbox_y, bbox_x",
+    )
+    .bind(page_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut chunk_sections = Vec::new();
+    for (idx, row) in chunk_rows.into_iter().enumerate() {
+        let chunk_type: String = row.get("chunk_type");
+        let title = row
+            .get::<Option<String>, _>("title")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let subject = row
+            .get::<Option<String>, _>("subject")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let body = row
+            .get::<Option<String>, _>("body_markdown")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        let mut heading = format!("{}. [{}]", idx + 1, chunk_type);
+        if let Some(value) = title {
+            heading.push_str(&format!(" title: {value}"));
+        }
+        if let Some(value) = subject {
+            heading.push_str(&format!(" subject: {value}"));
+        }
+        if let Some(value) = body {
+            heading.push_str("\n");
+            heading.push_str(&value);
+        }
+        chunk_sections.push(heading);
+    }
+    let chunk_body = chunk_sections.join("\n\n");
+
+    if block_body.is_empty() && chunk_body.is_empty() {
+        return Err("No page text is available for AI chat yet.".to_string());
+    }
+
+    let mut page_context = String::new();
+    page_context.push_str(&format!("Page number: {}\n", page_number));
+    if !block_body.is_empty() {
+        page_context.push_str("\nExtracted page text (reading order):\n---\n");
+        page_context.push_str(&block_body);
+        page_context.push_str("\n---\n");
+    }
+    if !chunk_body.is_empty() {
+        page_context.push_str("\nChunk summaries on this page:\n---\n");
+        page_context.push_str(&chunk_body);
+        page_context.push_str("\n---\n");
+    }
+
+    Ok(PageChatContext {
+        book_title,
+        page_number,
+        body_markdown: page_context.trim().to_string(),
+    })
+}
+
+async fn run_page_ai_stream(
     app: tauri::AppHandle,
     pool: SqlitePool,
     chat_streams: Arc<Mutex<HashMap<String, ChatStreamHandle>>>,
     request_id: String,
-    chunk_id: i64,
+    page_id: i64,
     provider: LlmProvider,
     model_override: Option<String>,
     history: Vec<ChunkChatMessage>,
     cancelled: Arc<AtomicBool>,
 ) {
+    let stream_context = ChatStreamContext::Page(page_id);
     let result = async {
         if cancelled.load(Ordering::Relaxed) {
             return Err(LlmError::Cancelled);
         }
 
-        let context = load_chunk_chat_context(&pool, chunk_id)
+        let context = load_page_chat_context(&pool, page_id)
             .await
             .map_err(LlmError::Config)?;
-        let prompt_body = compose_chunk_chat_body(&context);
+        let page_title = format!("Page {}", context.page_number);
         let prompt = ChunkChatPrompt {
             book_title: &context.book_title,
-            chunk_type: &context.chunk_type,
-            title: context.title.as_deref(),
-            subject: context.subject.as_deref(),
-            body_markdown: &prompt_body,
+            chunk_type: "page",
+            title: Some(page_title.as_str()),
+            subject: None,
+            body_markdown: &context.body_markdown,
         };
         let configured_api_key = settings::api_key_for_provider(&pool, provider)
             .await
@@ -1383,7 +1570,7 @@ async fn run_chunk_ai_stream(
             emit_chunk_ai_stream(
                 &app,
                 &request_id,
-                chunk_id,
+                &stream_context,
                 "delta",
                 Some(delta.to_string()),
                 None,
@@ -1423,12 +1610,12 @@ async fn run_chunk_ai_stream(
     match result {
         Ok(_) => {
             if finish_chat_stream(&chat_streams, &request_id).is_some() {
-                emit_chunk_ai_stream(&app, &request_id, chunk_id, "completed", None, None);
+                emit_chunk_ai_stream(&app, &request_id, &stream_context, "completed", None, None);
             }
         }
         Err(LlmError::Cancelled) => {
             if finish_chat_stream(&chat_streams, &request_id).is_some() {
-                emit_chunk_ai_stream(&app, &request_id, chunk_id, "cancelled", None, None);
+                emit_chunk_ai_stream(&app, &request_id, &stream_context, "cancelled", None, None);
             }
         }
         Err(err) => {
@@ -1436,7 +1623,109 @@ async fn run_chunk_ai_stream(
                 emit_chunk_ai_stream(
                     &app,
                     &request_id,
-                    chunk_id,
+                    &stream_context,
+                    "error",
+                    None,
+                    Some(err.to_string()),
+                );
+            }
+        }
+    }
+}
+
+async fn run_chunk_ai_stream(
+    app: tauri::AppHandle,
+    pool: SqlitePool,
+    chat_streams: Arc<Mutex<HashMap<String, ChatStreamHandle>>>,
+    request_id: String,
+    chunk_id: i64,
+    provider: LlmProvider,
+    model_override: Option<String>,
+    history: Vec<ChunkChatMessage>,
+    cancelled: Arc<AtomicBool>,
+) {
+    let stream_context = ChatStreamContext::Chunk(chunk_id);
+    let result = async {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(LlmError::Cancelled);
+        }
+
+        let context = load_chunk_chat_context(&pool, chunk_id)
+            .await
+            .map_err(LlmError::Config)?;
+        let prompt_body = compose_chunk_chat_body(&context);
+        let prompt = ChunkChatPrompt {
+            book_title: &context.book_title,
+            chunk_type: &context.chunk_type,
+            title: context.title.as_deref(),
+            subject: context.subject.as_deref(),
+            body_markdown: &prompt_body,
+        };
+        let configured_api_key = settings::api_key_for_provider(&pool, provider)
+            .await
+            .map_err(LlmError::Config)?;
+
+        let emit_delta = |delta: &str| -> Result<(), LlmError> {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(LlmError::Cancelled);
+            }
+            emit_chunk_ai_stream(
+                &app,
+                &request_id,
+                &stream_context,
+                "delta",
+                Some(delta.to_string()),
+                None,
+            );
+            Ok(())
+        };
+        let should_cancel = || cancelled.load(Ordering::Relaxed);
+
+        match provider {
+            LlmProvider::Ollama => {
+                OllamaClient::with_text_model(model_override.clone())
+                    .stream_chunk_chat(&prompt, &history, emit_delta, should_cancel)
+                    .await
+            }
+            LlmProvider::OpenAI => {
+                OpenAiClient::with_api_key_and_model(configured_api_key, model_override.clone())
+                    .stream_chunk_chat(&prompt, &history, emit_delta, should_cancel)
+                    .await
+            }
+            LlmProvider::Gemini => {
+                GeminiClient::with_api_key_and_model(configured_api_key, model_override.clone())
+                    .stream_chunk_chat(&prompt, &history, emit_delta, should_cancel)
+                    .await
+            }
+            LlmProvider::DeepSeek => {
+                DeepSeekClient::with_api_key_and_model(configured_api_key, model_override.clone())
+                    .stream_chunk_chat(&prompt, &history, emit_delta, should_cancel)
+                    .await
+            }
+            LlmProvider::Zai => Err(LlmError::Config(
+                "provider zai does not support chat".to_string(),
+            )),
+        }
+    }
+    .await;
+
+    match result {
+        Ok(_) => {
+            if finish_chat_stream(&chat_streams, &request_id).is_some() {
+                emit_chunk_ai_stream(&app, &request_id, &stream_context, "completed", None, None);
+            }
+        }
+        Err(LlmError::Cancelled) => {
+            if finish_chat_stream(&chat_streams, &request_id).is_some() {
+                emit_chunk_ai_stream(&app, &request_id, &stream_context, "cancelled", None, None);
+            }
+        }
+        Err(err) => {
+            if finish_chat_stream(&chat_streams, &request_id).is_some() {
+                emit_chunk_ai_stream(
+                    &app,
+                    &request_id,
+                    &stream_context,
                     "error",
                     None,
                     Some(err.to_string()),
@@ -1471,12 +1760,10 @@ async fn run_chunk_rewrite_request(
                 .await
                 .map_err(|e| e.to_string())?
         }
-        LlmProvider::DeepSeek => {
-            DeepSeekClient::with_api_key_and_model(configured_api_key, model)
-                .rewrite_chunk_with_prompt(rewrite_prompt)
-                .await
-                .map_err(|e| e.to_string())?
-        }
+        LlmProvider::DeepSeek => DeepSeekClient::with_api_key_and_model(configured_api_key, model)
+            .rewrite_chunk_with_prompt(rewrite_prompt)
+            .await
+            .map_err(|e| e.to_string())?,
         LlmProvider::Zai => {
             return Err("provider zai does not support chat".to_string());
         }
@@ -1589,9 +1876,7 @@ async fn rewrite_chunk_glossary_with_prompt(
          Current glossary markdown:\n---\n{}\n---\n\n\
          Chunk body reference (for context only):\n---\n{}\n---\n\n\
          User glossary edit instruction:\n{}",
-        glossary_markdown,
-        chunk_body_markdown,
-        prompt
+        glossary_markdown, chunk_body_markdown, prompt
     );
 
     let rewrite_prompt = ChunkRewritePrompt {
@@ -1636,7 +1921,11 @@ async fn start_chunk_ai_stream(
     validate_chat_provider(provider)?;
     let model = normalize_model_override(model);
     let history = sanitize_chunk_chat_history(history)?;
-    let cancelled = begin_chat_stream(state.inner(), &request_id, chunk_id)?;
+    let cancelled = begin_chat_stream(
+        state.inner(),
+        &request_id,
+        ChatStreamContext::Chunk(chunk_id),
+    )?;
     let chat_streams = Arc::clone(&state.chat_streams);
     let pool = pool.inner().clone();
 
@@ -1646,6 +1935,49 @@ async fn start_chunk_ai_stream(
         chat_streams,
         request_id,
         chunk_id,
+        provider,
+        model,
+        history,
+        cancelled,
+    ));
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_page_ai_stream(
+    request_id: String,
+    page_id: i64,
+    provider: String,
+    model: Option<String>,
+    history: Vec<ChunkChatMessage>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<(), String> {
+    let request_id = request_id.trim().to_string();
+    if request_id.is_empty() {
+        return Err("request_id was empty".into());
+    }
+    if page_id < 1 {
+        return Err(format!("invalid page_id {}", page_id));
+    }
+
+    let provider = provider.parse::<LlmProvider>()?;
+    validate_chat_provider(provider)?;
+    let model = normalize_model_override(model);
+    let history = sanitize_chunk_chat_history(history)?;
+    let cancelled =
+        begin_chat_stream(state.inner(), &request_id, ChatStreamContext::Page(page_id))?;
+    let chat_streams = Arc::clone(&state.chat_streams);
+    let pool = pool.inner().clone();
+
+    tokio::spawn(run_page_ai_stream(
+        app,
+        pool,
+        chat_streams,
+        request_id,
+        page_id,
         provider,
         model,
         history,
@@ -1667,7 +1999,7 @@ async fn cancel_chunk_ai_stream(
     }
 
     if let Some(handle) = cancel_chat_stream(&state.chat_streams, &request_id)? {
-        emit_chunk_ai_stream(&app, &request_id, handle.chunk_id, "cancelled", None, None);
+        emit_chunk_ai_stream(&app, &request_id, &handle.context, "cancelled", None, None);
     }
     Ok(())
 }
@@ -1751,6 +2083,39 @@ struct ChunkPreview {
     glossary_preview: Option<String>,
     has_formatted_body: bool,
     has_self_explanation: bool,
+    question_label: Option<String>,
+    available_marks: Option<i64>,
+    achieved_marks: Option<f64>,
+}
+
+#[derive(serde::Serialize)]
+struct QuestionSourceSlice {
+    page_id: i64,
+    page_number: i64,
+    bbox_x: f32,
+    bbox_y: f32,
+    bbox_w: f32,
+    bbox_h: f32,
+    slice_order: i64,
+}
+
+#[derive(serde::Serialize)]
+struct QuestionMarkAttemptView {
+    id: i64,
+    source: String,
+    achieved_marks: Option<f64>,
+    available_marks_snapshot: Option<i64>,
+    feedback_md: Option<String>,
+    include_visuals: bool,
+    provider: Option<String>,
+    model: Option<String>,
+    created_at: String,
+}
+
+#[derive(serde::Serialize)]
+struct QuestionMarkSuggestion {
+    achieved_marks: Option<f64>,
+    feedback_md: String,
 }
 
 #[tauri::command]
@@ -1759,7 +2124,8 @@ async fn get_chunk_preview(
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<ChunkPreview, String> {
     let row = sqlx::query(
-        "SELECT id, chunk_type, title, subject, status, formatted_body_md, ocr_text, glossary_md \
+        "SELECT id, chunk_type, title, subject, status, formatted_body_md, ocr_text, glossary_md, \
+                question_label, available_marks, achieved_marks \
          FROM chunks WHERE id = ?",
     )
     .bind(chunk_id)
@@ -1797,7 +2163,318 @@ async fn get_chunk_preview(
         glossary_preview,
         has_formatted_body,
         has_self_explanation: glossary_source.is_some(),
+        question_label: row.get("question_label"),
+        available_marks: row.get("available_marks"),
+        achieved_marks: row.get("achieved_marks"),
     })
+}
+
+#[tauri::command]
+async fn get_question_source_slices(
+    chunk_id: i64,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<Vec<QuestionSourceSlice>, String> {
+    let rows = sqlx::query(
+        "SELECT qps.page_id, p.page_number, qps.bbox_x, qps.bbox_y, qps.bbox_w, qps.bbox_h, qps.slice_order \
+         FROM question_page_slices qps \
+         JOIN pages p ON p.id = qps.page_id \
+         WHERE qps.chunk_id = ? \
+         ORDER BY p.page_number, qps.slice_order",
+    )
+    .bind(chunk_id)
+    .fetch_all(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| QuestionSourceSlice {
+            page_id: row.get("page_id"),
+            page_number: row.get("page_number"),
+            bbox_x: row.get("bbox_x"),
+            bbox_y: row.get("bbox_y"),
+            bbox_w: row.get("bbox_w"),
+            bbox_h: row.get("bbox_h"),
+            slice_order: row.get("slice_order"),
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn list_question_mark_attempts(
+    chunk_id: i64,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<Vec<QuestionMarkAttemptView>, String> {
+    let rows = sqlx::query(
+        "SELECT id, source, achieved_marks, available_marks_snapshot, feedback_md, \
+                include_visuals, provider, model, created_at \
+         FROM question_mark_attempts \
+         WHERE chunk_id = ? \
+         ORDER BY id DESC",
+    )
+    .bind(chunk_id)
+    .fetch_all(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| QuestionMarkAttemptView {
+            id: row.get("id"),
+            source: row.get("source"),
+            achieved_marks: row.get("achieved_marks"),
+            available_marks_snapshot: row.get("available_marks_snapshot"),
+            feedback_md: row.get("feedback_md"),
+            include_visuals: row.get::<i64, _>("include_visuals") != 0,
+            provider: row.get("provider"),
+            model: row.get("model"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
+fn validate_achieved_marks(
+    achieved_marks: Option<f64>,
+    available_marks: Option<i64>,
+) -> Result<(), String> {
+    if let Some(value) = achieved_marks {
+        if !value.is_finite() || value < 0.0 {
+            return Err("achieved_marks must be a non-negative number".to_string());
+        }
+        if let Some(max) = available_marks {
+            if value > max as f64 {
+                return Err(format!(
+                    "achieved_marks ({value}) cannot exceed available_marks ({max})"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn save_question_achieved_marks(
+    chunk_id: i64,
+    achieved_marks: Option<f64>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<(), String> {
+    let row = sqlx::query(
+        "SELECT chunk_type, available_marks FROM chunks WHERE id = ?",
+    )
+    .bind(chunk_id)
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("chunk {} not found", chunk_id))?;
+
+    let chunk_type: String = row.get("chunk_type");
+    if chunk_type != "question" {
+        return Err("achieved marks can only be saved for question chunks".to_string());
+    }
+    let available_marks: Option<i64> = row.get("available_marks");
+    validate_achieved_marks(achieved_marks, available_marks)?;
+
+    let mut tx = pool.inner().begin().await.map_err(|e| e.to_string())?;
+    sqlx::query(
+        "UPDATE chunks SET achieved_marks = ?, achieved_marks_updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(achieved_marks)
+    .bind(chunk_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "INSERT INTO question_mark_attempts \
+         (chunk_id, source, achieved_marks, available_marks_snapshot, feedback_md, include_visuals) \
+         VALUES (?, 'manual', ?, ?, NULL, 0)",
+    )
+    .bind(chunk_id)
+    .bind(achieved_marks)
+    .bind(available_marks)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn mark_question_answer_with_ai(
+    chunk_id: i64,
+    provider: String,
+    model: Option<String>,
+    include_visuals: Option<bool>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<QuestionMarkSuggestion, String> {
+    let provider = provider.parse::<LlmProvider>()?;
+    validate_chat_provider(provider)?;
+    let model = normalize_model_override(model);
+    let include_visuals = include_visuals.unwrap_or(false);
+
+    let row = sqlx::query(
+        "SELECT sd.title AS book_title, c.chunk_type, c.question_label, c.available_marks, \
+                COALESCE(NULLIF(TRIM(c.formatted_body_md), ''), NULLIF(TRIM(c.ocr_text), '')) AS question_body, \
+                NULLIF(TRIM(c.glossary_md), '') AS answer_body \
+         FROM chunks c \
+         JOIN source_documents sd ON sd.id = c.source_document_id \
+         WHERE c.id = ?",
+    )
+    .bind(chunk_id)
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("chunk {} not found", chunk_id))?;
+
+    let chunk_type: String = row.get("chunk_type");
+    if chunk_type != "question" {
+        return Err("AI marking is only available for question chunks".to_string());
+    }
+
+    let book_title: String = row.get("book_title");
+    let question_label: Option<String> = row.get("question_label");
+    let available_marks: Option<i64> = row.get("available_marks");
+    let question_body = row
+        .get::<Option<String>, _>("question_body")
+        .unwrap_or_default();
+    let answer_body = row
+        .get::<Option<String>, _>("answer_body")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "No answer text found. Add answer content before marking.".to_string())?;
+
+    let user_prompt = format!(
+        "Mark the student's answer to this exam question.\n\
+         Return JSON with this schema:\n\
+         - title: numeric achieved marks only (string), or null if cannot score\n\
+         - body_markdown: concise feedback in markdown\n\n\
+         Marking requirements:\n\
+         1. Score against available marks when provided.\n\
+         2. Keep feedback actionable and specific.\n\
+         3. If score is uncertain, set title to null and explain what is missing.\n\
+         4. Do not include headings in feedback.\n\n\
+         Question label: {}\n\
+         Available marks: {}\n\
+         Include visuals hint: {}\n\n\
+         Question text:\n---\n{}\n---\n\n\
+         Student answer:\n---\n{}\n---",
+        question_label.as_deref().unwrap_or("unknown"),
+        available_marks
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        if include_visuals { "on" } else { "off" },
+        question_body.trim(),
+        answer_body.trim(),
+    );
+
+    let rewrite_prompt = ChunkRewritePrompt {
+        book_title: book_title.trim(),
+        chunk_type: "question",
+        title: question_label.as_deref(),
+        subject: None,
+        body_markdown: question_body.trim(),
+        user_prompt: &user_prompt,
+    };
+    let result = run_chunk_rewrite_request(pool.inner(), provider, model, &rewrite_prompt).await?;
+
+    let achieved_marks = result
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<f64>().ok());
+    validate_achieved_marks(achieved_marks, available_marks)?;
+
+    let feedback_md = result
+        .body_markdown
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "No feedback was generated.".to_string());
+
+    Ok(QuestionMarkSuggestion {
+        achieved_marks,
+        feedback_md,
+    })
+}
+
+#[tauri::command]
+async fn apply_question_mark_attempt(
+    chunk_id: i64,
+    source: String,
+    achieved_marks: Option<f64>,
+    feedback_md: Option<String>,
+    include_visuals: Option<bool>,
+    provider: Option<String>,
+    model: Option<String>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<(), String> {
+    let source = source.trim().to_lowercase();
+    if source != "ai" && source != "manual" {
+        return Err("source must be 'ai' or 'manual'".to_string());
+    }
+    let include_visuals = include_visuals.unwrap_or(false);
+    let feedback_md = feedback_md
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let provider = provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let model = model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    let row = sqlx::query(
+        "SELECT chunk_type, available_marks FROM chunks WHERE id = ?",
+    )
+    .bind(chunk_id)
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("chunk {} not found", chunk_id))?;
+
+    let chunk_type: String = row.get("chunk_type");
+    if chunk_type != "question" {
+        return Err("mark attempts can only be saved for question chunks".to_string());
+    }
+    let available_marks: Option<i64> = row.get("available_marks");
+    validate_achieved_marks(achieved_marks, available_marks)?;
+
+    let mut tx = pool.inner().begin().await.map_err(|e| e.to_string())?;
+    sqlx::query(
+        "UPDATE chunks SET achieved_marks = ?, achieved_marks_updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(achieved_marks)
+    .bind(chunk_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "INSERT INTO question_mark_attempts \
+         (chunk_id, source, achieved_marks, available_marks_snapshot, feedback_md, include_visuals, provider, model) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(chunk_id)
+    .bind(&source)
+    .bind(achieved_marks)
+    .bind(available_marks)
+    .bind(feedback_md.as_deref())
+    .bind(if include_visuals { 1 } else { 0 })
+    .bind(provider.as_deref())
+    .bind(model.as_deref())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1983,9 +2660,27 @@ async fn is_chunking_page_active(
     source_document_id: i64,
     page_number: i64,
     state: tauri::State<'_, AppState>,
+    pool: tauri::State<'_, SqlitePool>,
 ) -> Result<bool, String> {
+    let mode_row = sqlx::query("SELECT document_mode FROM source_documents WHERE id = ?")
+        .bind(source_document_id)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+    let is_past_paper = mode_row
+        .as_ref()
+        .map(|row| {
+            row.get::<String, _>("document_mode")
+                .eq_ignore_ascii_case("past_paper")
+        })
+        .unwrap_or(false);
+
     let jobs = state.chunking_jobs.lock().map_err(|e| e.to_string())?;
-    Ok(jobs.contains(&(source_document_id, page_number)))
+    if is_past_paper {
+        Ok(jobs.iter().any(|(doc_id, _)| *doc_id == source_document_id))
+    } else {
+        Ok(jobs.contains(&(source_document_id, page_number)))
+    }
 }
 
 #[tauri::command]
@@ -2001,35 +2696,55 @@ async fn ensure_chunking_for_page(
     if page_number < 1 {
         return Err(format!("invalid page number {}", page_number));
     }
+    let mode_row = sqlx::query("SELECT document_mode FROM source_documents WHERE id = ?")
+        .bind(source_document_id)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("source document {} not found", source_document_id))?;
+    let is_past_paper = mode_row
+        .get::<String, _>("document_mode")
+        .eq_ignore_ascii_case("past_paper");
+    let effective_page = if is_past_paper { 1 } else { page_number };
+
     let provider = provider.parse::<LlmProvider>()?;
     validate_chunking_provider(provider)?;
     let model = normalize_model_override(model);
 
     sqlx::query("INSERT OR IGNORE INTO pages (source_document_id, page_number) VALUES (?, ?)")
         .bind(source_document_id)
-        .bind(page_number)
+        .bind(effective_page)
         .execute(pool.inner())
         .await
         .map_err(|e| e.to_string())?;
     let page_row =
         sqlx::query("SELECT id FROM pages WHERE source_document_id = ? AND page_number = ?")
             .bind(source_document_id)
-            .bind(page_number)
+            .bind(effective_page)
             .fetch_one(pool.inner())
             .await
             .map_err(|e| e.to_string())?;
     let page_id: i64 = page_row.get("id");
-    let existing_chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE page_id = ?")
-        .bind(page_id)
-        .fetch_one(pool.inner())
-        .await
-        .map_err(|e| e.to_string())?;
+    let existing_chunks: i64 = if is_past_paper {
+        sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE source_document_id = ?")
+            .bind(source_document_id)
+            .fetch_one(pool.inner())
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE page_id = ?")
+            .bind(page_id)
+            .fetch_one(pool.inner())
+            .await
+            .map_err(|e| e.to_string())?
+    };
     if existing_chunks > 0 {
         info!(
             target: "gloss_lib::chunking",
-            "not starting chunking for doc_id={} page={} because {} chunks already exist",
+            "not starting chunking for doc_id={} requested_page={} effective_page={} because {} chunks already exist",
             source_document_id,
             page_number,
+            effective_page,
             existing_chunks
         );
         return Ok(false);
@@ -2040,7 +2755,7 @@ async fn ensure_chunking_for_page(
         pool.inner().clone(),
         state.inner(),
         source_document_id,
-        page_number,
+        effective_page,
         provider,
         model,
     )
@@ -2081,6 +2796,88 @@ async fn ensure_chunking_for_page_range(
     validate_chunking_provider(provider)?;
     let skip_chunked_pages = skip_chunked_pages.unwrap_or(true);
     let model = normalize_model_override(model);
+    let mode_row = sqlx::query("SELECT document_mode FROM source_documents WHERE id = ?")
+        .bind(source_document_id)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("source document {} not found", source_document_id))?;
+    let is_past_paper = mode_row
+        .get::<String, _>("document_mode")
+        .eq_ignore_ascii_case("past_paper");
+
+    if is_past_paper {
+        let existing_chunks: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE source_document_id = ?")
+                .bind(source_document_id)
+                .fetch_one(pool.inner())
+                .await
+                .map_err(|e| e.to_string())?;
+
+        let range_len = end_page - start_page + 1;
+        let mut skipped_pages = if range_len > 1 { range_len - 1 } else { 0 };
+        if skip_chunked_pages && existing_chunks > 0 {
+            skipped_pages += 1;
+            return Ok(EnsureChunkingRangeResult {
+                requested_start_page: start_page,
+                requested_end_page: end_page,
+                started_pages: 0,
+                started_page_numbers: Vec::new(),
+                skipped_pages,
+            });
+        }
+        if !begin_chunking_job(state.inner(), source_document_id, 1)? {
+            skipped_pages += 1;
+            return Ok(EnsureChunkingRangeResult {
+                requested_start_page: start_page,
+                requested_end_page: end_page,
+                started_pages: 0,
+                started_page_numbers: Vec::new(),
+                skipped_pages,
+            });
+        }
+
+        let chunking_jobs = Arc::clone(&state.chunking_jobs);
+        let pdfium = state.pdfium.clone();
+        let zai_transcription_semaphore = Arc::clone(&state.zai_transcription_semaphore);
+        let pool = pool.inner().clone();
+        let app_for_tasks = app.clone();
+        tokio::spawn(async move {
+            if existing_chunks > 0 {
+                let _ = chunking::rechunk_page(
+                    &pool,
+                    &pdfium,
+                    &app_for_tasks,
+                    source_document_id,
+                    1,
+                    provider,
+                    model.clone(),
+                )
+                .await;
+            } else {
+                chunking::run_for_page(
+                    pool.clone(),
+                    pdfium.clone(),
+                    app_for_tasks.clone(),
+                    source_document_id,
+                    1,
+                    provider,
+                    model.clone(),
+                    Arc::clone(&zai_transcription_semaphore),
+                )
+                .await;
+            }
+            finish_chunking_job(&chunking_jobs, source_document_id, 1);
+        });
+
+        return Ok(EnsureChunkingRangeResult {
+            requested_start_page: start_page,
+            requested_end_page: end_page,
+            started_pages: 1,
+            started_page_numbers: vec![1],
+            skipped_pages,
+        });
+    }
 
     let row = sqlx::query("SELECT file_path FROM source_documents WHERE id = ?")
         .bind(source_document_id)
@@ -2155,6 +2952,7 @@ async fn ensure_chunking_for_page_range(
                 if has_existing_chunks {
                     let _ = chunking::rechunk_page(
                         &pool,
+                        &pdfium,
                         &app_for_tasks,
                         source_document_id,
                         page_number,
@@ -2202,28 +3000,41 @@ async fn rechunk_page(
     if page_number < 1 {
         return Err(format!("invalid page number {}", page_number));
     }
+    let mode_row = sqlx::query("SELECT document_mode FROM source_documents WHERE id = ?")
+        .bind(source_document_id)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("source document {} not found", source_document_id))?;
+    let is_past_paper = mode_row
+        .get::<String, _>("document_mode")
+        .eq_ignore_ascii_case("past_paper");
+    let effective_page = if is_past_paper { 1 } else { page_number };
+
     let provider = provider.parse::<LlmProvider>()?;
     validate_chunking_provider(provider)?;
     let model = normalize_model_override(model);
-    if !begin_chunking_job(state.inner(), source_document_id, page_number)? {
+    if !begin_chunking_job(state.inner(), source_document_id, effective_page)? {
         return Err("chunking already active for this page".into());
     }
 
     let result = chunking::rechunk_page(
         pool.inner(),
+        &state.pdfium,
         &app,
         source_document_id,
-        page_number,
+        effective_page,
         provider,
         model,
     )
     .await;
-    finish_chunking_job(&state.chunking_jobs, source_document_id, page_number);
+    finish_chunking_job(&state.chunking_jobs, source_document_id, effective_page);
     result
 }
 
 #[tauri::command]
 async fn import_pdf(
+    document_mode: Option<String>,
     app: tauri::AppHandle,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<SourceDocument, String> {
@@ -2305,13 +3116,24 @@ async fn import_pdf(
         .to_string_lossy()
         .to_string();
 
-    let row =
-        sqlx::query("INSERT INTO source_documents (title, file_path) VALUES (?, ?) RETURNING id")
-            .bind(&title)
-            .bind(&relative_path)
-            .fetch_one(pool.inner())
-            .await
-            .map_err(|e| e.to_string())?;
+    let document_mode = match document_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) if value.eq_ignore_ascii_case("past_paper") => "past_paper",
+        _ => "textbook",
+    };
+
+    let row = sqlx::query(
+        "INSERT INTO source_documents (title, file_path, document_mode) VALUES (?, ?, ?) RETURNING id",
+    )
+    .bind(&title)
+    .bind(&relative_path)
+    .bind(document_mode)
+    .fetch_one(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
 
     let id: i64 = row.get("id");
     info!(
@@ -2326,6 +3148,7 @@ async fn import_pdf(
         id,
         title,
         file_path: relative_path,
+        document_mode: document_mode.to_string(),
     })
 }
 
@@ -2338,7 +3161,9 @@ async fn get_pdf_path(app: tauri::AppHandle, relative_path: String) -> Result<St
 
 #[tauri::command]
 async fn list_textbooks(pool: tauri::State<'_, SqlitePool>) -> Result<Vec<SourceDocument>, String> {
-    let rows = sqlx::query("SELECT id, title, file_path FROM source_documents ORDER BY id DESC")
+    let rows = sqlx::query(
+        "SELECT id, title, file_path, document_mode FROM source_documents ORDER BY id DESC",
+    )
         .fetch_all(pool.inner())
         .await
         .map_err(|e| e.to_string())?;
@@ -2349,6 +3174,7 @@ async fn list_textbooks(pool: tauri::State<'_, SqlitePool>) -> Result<Vec<Source
             id: r.get("id"),
             title: r.get("title"),
             file_path: r.get("file_path"),
+            document_mode: r.get("document_mode"),
         })
         .collect())
 }
@@ -2755,10 +3581,16 @@ pub fn run() {
             rewrite_chunk_text_with_prompt,
             rewrite_chunk_glossary_with_prompt,
             start_chunk_ai_stream,
+            start_page_ai_stream,
             cancel_chunk_ai_stream,
             get_chunk_references,
             get_chunk_preview,
+            get_question_source_slices,
             get_proof_chunk_for_target,
+            save_question_achieved_marks,
+            list_question_mark_attempts,
+            mark_question_answer_with_ai,
+            apply_question_mark_attempt,
             reindex_document_references,
             debug_references,
             get_chunking_status,

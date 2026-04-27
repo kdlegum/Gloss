@@ -1,6 +1,18 @@
 ﻿<script lang="ts">
   import "katex/dist/katex.min.css";
   import { invoke } from "@tauri-apps/api/core";
+  import {
+    type Point,
+    type Stroke,
+    type Rect,
+    type ShapeKind as InkShapeKind,
+    DEFAULT_PEN_COLOUR,
+    DEFAULT_PEN_THICKNESS,
+    computeBBox,
+    buildShapeStrokes,
+    shapeDragLengthWorld,
+    drawStrokePoints as drawStrokePointsFn,
+  } from "$lib/ink";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import {
     attachConsole,
@@ -13,10 +25,13 @@
   import { onMount, onDestroy, tick } from "svelte";
   import { fade } from "svelte/transition";
 
+  type DocumentMode = "textbook" | "past_paper";
+
   interface SourceDocument {
     id: number;
     title: string;
     file_path: string;
+    document_mode: DocumentMode;
   }
 
   interface AiSettingsState {
@@ -495,8 +510,15 @@
   }
 
   // â”€â”€ Tool mode â”€â”€
-  type Mode = 'draw' | 'erase' | 'select';
+  type Mode = 'draw' | 'shape' | 'erase' | 'select';
+  type ShapeKind = InkShapeKind;
+  interface ShapeDraft {
+    origin: Point;
+    current: Point;
+  }
+  const MIN_SHAPE_DRAG_WORLD = 4;
   let mode = $state<Mode>('draw');
+  // Point, Stroke, Rect, pen defaults, bbox, and shape helpers are imported from $lib/ink.
   const PEN_COLOURS = [
     "#ec9fba",
     "#efbf93",
@@ -514,34 +536,34 @@
     "#118ab2",
     "#2351d1",
   ];
-  const DEFAULT_PEN_COLOUR = "#2351d1";
-  const DEFAULT_PEN_THICKNESS = 3;
+  const SHAPE_OPTIONS: Array<{ value: ShapeKind; label: string; hint: string }> = [
+    { value: "circle", label: "Circle", hint: "Center at press point." },
+    { value: "graph_full", label: "Graph ±", hint: "Axes in positive and negative directions." },
+    { value: "graph_positive", label: "Graph +", hint: "Axes from origin to positive directions." },
+  ];
   let penColour = $state(DEFAULT_PEN_COLOUR);
   let penThickness = $state(DEFAULT_PEN_THICKNESS);
   let showPenOptions = $state(false);
+  let shapeKind = $state<ShapeKind>("circle");
+  let showShapeOptions = $state(false);
+  let shapeDraft = $state<ShapeDraft | null>(null);
 
   // â”€â”€ Select state â”€â”€
-  type Rect = { x: number; y: number; w: number; h: number }; // normalised page space
   let selectOrigin = $state<{ x: number; y: number } | null>(null);
   let selectRect   = $state<Rect | null>(null);
   let selectedStrokes = $state<Set<Stroke>>(new Set());
   let selection = $state<{ x: number; y: number; width: number; height: number } | null>(null);
 
   // â”€â”€ Drawing state â”€â”€
-  type Point = { x: number; y: number; pressure: number };  // normalised page space
-  type BBox = { minX: number; minY: number; maxX: number; maxY: number };
-  type Stroke = {
-    id: number | null;
-    colour: string;
-    thickness: number;
-    points: Point[];
-    bbox: BBox;
-    chunkId: number | null;
-  };
-
   let isDrawing = $state(false);
   let currentStroke: Point[] = [];
   let lastDrawnStrokeIndex = 0;
+  // Predicted future pointer positions (from getPredictedEvents). Drawn on the
+  // wet layer as a lookahead to eliminate perceived latency; discarded each frame.
+  let predictedPoints: Point[] = [];
+  const MAX_PREDICTED_POINTS = 2;
+  const MAX_PREDICTED_STEP_PX = 24;
+  const MAX_PREDICTED_RANGE_PX = 36;
   let strokes = $state<Stroke[]>([]);
   let redoStack = $state<Stroke[][]>([]);
   let activePointerId: number | null = null;
@@ -557,8 +579,6 @@
   }
 
   let pendingChunkTap = $state<PendingChunkTap | null>(null);
-
-  const PRESSURE_WIDTH_THRESHOLD = 0.5;
 
   // â”€â”€ Infinite canvas state â”€â”€
   // camera is $state so the toolbar zoom% and disabled states stay in sync.
@@ -589,18 +609,31 @@
   let wetCtx:  CanvasRenderingContext2D | null = null;
 
   // rAF render loop
+  // dirtyWetOnly: only the wet (in-progress stroke) layer needs updating —
+  // set during active drawing so completed dry strokes are not re-rendered
+  // every frame. Any other change uses dirty=true which re-renders everything.
   let dirty = false;
+  let dirtyWetOnly = false;
   let rafId: number | null = null;
 
   function scheduleRender() {
     if (rafId !== null) return;
     rafId = requestAnimationFrame(() => {
       rafId = null;
-      if (dirty) { renderAll(); dirty = false; }
+      if (dirty) {
+        renderAll();
+        dirty = false;
+        dirtyWetOnly = false;
+      } else if (dirtyWetOnly) {
+        renderWetLayer();
+        dirtyWetOnly = false;
+      }
     });
   }
 
   function markDirty() { dirty = true; scheduleRender(); }
+  // Use during active drawing: skips the expensive dry-stroke re-render.
+  function markDirtyWet() { dirtyWetOnly = true; scheduleRender(); }
 
   // â”€â”€ PDF bitmap cache â”€â”€
   // Keyed by "pageNum:scaleKey". Stores rendered ImageBitmaps.
@@ -664,11 +697,14 @@
     return quantizePdfPixelWidth(previewPixelWidth);
   }
 
+  const PDF_UPGRADE_MAX_WIDTH = 3072;
+
   function getUpgradePdfPixelWidth() {
     if (!canvasContainer || !pageSize.w || !currentPdfPagePoints.w) return 0;
     const dpr = window.devicePixelRatio || 1;
     const screenWidth = pageSize.w * Math.max(1, camera.scale);
-    return quantizePdfPixelWidth(screenWidth * dpr * 1.15);
+    const raw = quantizePdfPixelWidth(screenWidth * dpr * 1.15);
+    return Math.min(raw, PDF_UPGRADE_MAX_WIDTH);
   }
 
   function hasEnoughPdfResolution(bitmap: ImageBitmap | null, desiredPixelWidth: number) {
@@ -800,9 +836,13 @@
     };
   }
 
+  // Cached bounding rect for the canvas container — invalidated on resize to
+  // avoid calling getBoundingClientRect() on every pointer event.
+  let cachedContainerRect: DOMRect | null = null;
+
   /** Convert a screen pointer to normalised page space [0,1]. */
   function pointerToNorm(clientX: number, clientY: number): { x: number; y: number } {
-    const rect = canvasContainer.getBoundingClientRect();
+    const rect = cachedContainerRect ??= canvasContainer.getBoundingClientRect();
     const sx = clientX - rect.left;
     const sy = clientY - rect.top;
     const wx = (sx - camera.x) / camera.scale;
@@ -830,16 +870,113 @@
     return e.pointerType === "pen" || e.pointerType === "mouse";
   }
 
-  function computeBBox(points: Point[]): BBox {
-    let minX = points[0].x, minY = points[0].y;
-    let maxX = minX, maxY = minY;
-    for (const p of points) {
-      if (p.x < minX) minX = p.x;
-      if (p.y < minY) minY = p.y;
-      if (p.x > maxX) maxX = p.x;
-      if (p.y > maxY) maxY = p.y;
+  // Skip points within ~1.5 screen pixels of the last recorded point to avoid
+  // bloating the stroke array during slow or stationary movements.
+  function shouldAddPoint(p: Point): boolean {
+    if (currentStroke.length === 0) return true;
+    const last = currentStroke[currentStroke.length - 1];
+    const dx = (p.x - last.x) * pageSize.w * camera.scale;
+    const dy = (p.y - last.y) * pageSize.h * camera.scale;
+    return dx * dx + dy * dy >= 2.25; // 1.5² px²
+  }
+
+  function clampNorm(v: number): number {
+    if (v < 0) return 0;
+    if (v > 1) return 1;
+    return v;
+  }
+
+  function screenDistanceSq(a: Point, b: Point): number {
+    const dx = (a.x - b.x) * pageSize.w * camera.scale;
+    const dy = (a.y - b.y) * pageSize.h * camera.scale;
+    return dx * dx + dy * dy;
+  }
+
+  function getSanitizedPredictedPoints(e: PointerEvent, anchor: Point | null): Point[] {
+    if (!anchor) return [];
+    const events = e.getPredictedEvents?.();
+    if (!events || events.length === 0) return [];
+
+    const out: Point[] = [];
+    const maxStepSq = MAX_PREDICTED_STEP_PX * MAX_PREDICTED_STEP_PX;
+    const maxRangeSq = MAX_PREDICTED_RANGE_PX * MAX_PREDICTED_RANGE_PX;
+    let prev = anchor;
+    const count = Math.min(events.length, MAX_PREDICTED_POINTS);
+
+    for (let i = 0; i < count; i++) {
+      const p = getPagePoint(events[i]);
+      const stepSq = screenDistanceSq(prev, p);
+      if (stepSq > maxStepSq) break;
+      if (screenDistanceSq(anchor, p) > maxRangeSq) break;
+      if (stepSq < 0.25) continue;
+      out.push(p);
+      prev = p;
     }
-    return { minX, minY, maxX, maxY };
+
+    return out;
+  }
+
+  function makeStrokeGroupId(): string {
+    return `shape-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  function getTrailingStrokeGroup(allStrokes: Stroke[]): Stroke[] {
+    if (allStrokes.length === 0) return [];
+    const last = allStrokes[allStrokes.length - 1];
+    const groupId = last.groupId;
+    if (!groupId) return [last];
+    let start = allStrokes.length - 1;
+    while (start > 0 && allStrokes[start - 1].groupId === groupId) start--;
+    return allStrokes.slice(start);
+  }
+
+  function getPageShapeStrokes(draft: ShapeDraft): Point[][] {
+    return buildShapeStrokes(
+      shapeKind,
+      draft.origin,
+      draft.current,
+      pageSize.w,
+      pageSize.h,
+      0.5,
+    );
+  }
+
+  function commitPageShape(draft: ShapeDraft) {
+    if (!pageSize.w || !pageSize.h) return;
+    const dragWorld = shapeDragLengthWorld(draft.origin, draft.current, pageSize.w, pageSize.h);
+    if (dragWorld < MIN_SHAPE_DRAG_WORLD) return;
+    const generated = getPageShapeStrokes(draft);
+    if (generated.length === 0) return;
+    const groupId = generated.length > 1 ? makeStrokeGroupId() : null;
+    const newStrokes: Stroke[] = generated
+      .filter((pts) => pts.length >= 2)
+      .map((pts) => ({
+        id: null,
+        colour: penColour,
+        thickness: penThickness,
+        points: pts,
+        bbox: computeBBox(pts),
+        chunkId: null,
+        groupId,
+      }));
+    if (newStrokes.length === 0) return;
+
+    strokes = [...strokes, ...newStrokes];
+    redoStack = [];
+    if (currentPageId !== null) {
+      cacheEvict(currentPageId);
+      for (const stroke of newStrokes) {
+        invoke<number>("save_stroke", {
+          pageId: currentPageId,
+          stroke: {
+            colour: stroke.colour,
+            thickness: stroke.thickness,
+            points: stroke.points.map(({ x, y }) => ({ x, y })),
+            chunkId: stroke.chunkId,
+          },
+        }).then(id => { stroke.id = id; }).catch(() => {});
+      }
+    }
   }
 
   function clearSelectionState() {
@@ -853,30 +990,47 @@
     clearSelectionState();
     selectOrigin = null;
     selectRect = null;
+    shapeDraft = null;
     showPenOptions = wasDrawMode ? !showPenOptions : true;
+    showShapeOptions = false;
+    markDirty();
+  }
+
+  function activateShapeTool() {
+    const wasShapeMode = mode === "shape";
+    mode = "shape";
+    clearSelectionState();
+    selectOrigin = null;
+    selectRect = null;
+    isDrawing = false;
+    currentStroke = [];
+    predictedPoints = [];
+    shapeDraft = null;
+    showPenOptions = false;
+    showShapeOptions = wasShapeMode ? !showShapeOptions : true;
     markDirty();
   }
 
   function activateEraseTool() {
     mode = 'erase';
     showPenOptions = false;
+    showShapeOptions = false;
     clearSelectionState();
     selectOrigin = null;
     selectRect = null;
+    shapeDraft = null;
     markDirty();
   }
 
   function activateSelectTool() {
     mode = 'select';
     showPenOptions = false;
+    showShapeOptions = false;
     clearSelectionState();
     selectOrigin = null;
     selectRect = null;
+    shapeDraft = null;
     markDirty();
-  }
-
-  function widthForPoint(thickness: number, pressure: number) {
-    return (thickness * (0.5 + pressure)) / camera.scale;
   }
 
   // â”€â”€ Erase eraser hit radius in world units â”€â”€
@@ -1015,9 +1169,24 @@
       return;
     }
 
+    if (mode === "shape") {
+      activePointerId = e.pointerId;
+      wetCanvas.setPointerCapture(e.pointerId);
+      const origin = getPagePoint(e);
+      shapeDraft = {
+        origin: { x: origin.x, y: origin.y, pressure: 0.5 },
+        current: { x: origin.x, y: origin.y, pressure: 0.5 },
+      };
+      showShapeOptions = false;
+      markDirtyWet();
+      e.preventDefault();
+      return;
+    }
+
     activePointerId = e.pointerId;
     wetCanvas.setPointerCapture(e.pointerId);
     showPenOptions = false;
+    showShapeOptions = false;
     isDrawing = true;
     currentStroke = [];
     currentStroke.push(getPagePoint(e));
@@ -1091,21 +1260,41 @@
           w: Math.abs(x - pending.startPoint.x),
           h: Math.abs(y - pending.startPoint.y),
         };
-        markDirty();
+        markDirtyWet();
+        e.preventDefault();
+        return;
+      }
+
+      if (mode === "shape") {
+        const events: PointerEvent[] = e.getCoalescedEvents?.() ?? [e];
+        const latest = events[events.length - 1];
+        const current = getPagePoint(latest);
+        shapeDraft = {
+          origin: { x: pending.startPoint.x, y: pending.startPoint.y, pressure: 0.5 },
+          current: { x: current.x, y: current.y, pressure: 0.5 },
+        };
+        showShapeOptions = false;
+        markDirtyWet();
         e.preventDefault();
         return;
       }
 
       showPenOptions = false;
+      showShapeOptions = false;
       isDrawing = true;
       currentStroke = [pending.startPoint];
       lastDrawnStrokeIndex = 0;
 
       const events: PointerEvent[] = e.getCoalescedEvents?.() ?? [e];
       for (const ce of events) {
-        currentStroke.push(getPagePoint(ce));
+        const pt = getPagePoint(ce);
+        if (shouldAddPoint(pt)) currentStroke.push(pt);
       }
-      markDirty();
+      predictedPoints = getSanitizedPredictedPoints(
+        e,
+        currentStroke[currentStroke.length - 1] ?? null,
+      );
+      markDirtyWet();
       e.preventDefault();
       return;
     }
@@ -1131,7 +1320,21 @@
         w: Math.abs(x - selectOrigin.x),
         h: Math.abs(y - selectOrigin.y),
       };
-      markDirty();
+      markDirtyWet();
+      return;
+    }
+
+    if (mode === "shape") {
+      if (e.pointerId !== activePointerId || !shapeDraft) return;
+      e.preventDefault();
+      const events: PointerEvent[] = e.getCoalescedEvents?.() ?? [e];
+      const latest = events[events.length - 1];
+      const current = getPagePoint(latest);
+      shapeDraft = {
+        origin: shapeDraft.origin,
+        current: { x: current.x, y: current.y, pressure: 0.5 },
+      };
+      markDirtyWet();
       return;
     }
 
@@ -1139,9 +1342,14 @@
     e.preventDefault();
     const events: PointerEvent[] = e.getCoalescedEvents?.() ?? [e];
     for (const ce of events) {
-      currentStroke.push(getPagePoint(ce));
+      const pt = getPagePoint(ce);
+      if (shouldAddPoint(pt)) currentStroke.push(pt);
     }
-    markDirty();
+    predictedPoints = getSanitizedPredictedPoints(
+      e,
+      currentStroke[currentStroke.length - 1] ?? null,
+    );
+    markDirtyWet();
   }
 
   function onPointerUp(e: PointerEvent) {
@@ -1168,7 +1376,9 @@
       activePointerId = null;
       isDrawing = false;
       currentStroke = [];
+      shapeDraft = null;
       lastDrawnStrokeIndex = 0;
+      predictedPoints = [];
       markDirty();
       e.preventDefault();
       void openChunkView(tappedChunk);
@@ -1191,6 +1401,17 @@
       }
       selectOrigin = null;
       selectRect = null;
+      markDirty();
+      e.preventDefault();
+      return;
+    }
+
+    if (mode === "shape") {
+      if (e.pointerId !== activePointerId) return;
+      activePointerId = null;
+      const draft = shapeDraft;
+      shapeDraft = null;
+      if (draft) commitPageShape(draft);
       markDirty();
       e.preventDefault();
       return;
@@ -1226,6 +1447,7 @@
     activePointerId = null;
     currentStroke = [];
     lastDrawnStrokeIndex = 0;
+    predictedPoints = [];
     markDirty();
   }
 
@@ -1243,11 +1465,12 @@
       pendingChunkTap = null;
     }
 
-    if (mode === 'erase' || mode === 'select') {
+    if (mode === 'erase' || mode === 'select' || mode === "shape") {
       if (e.pointerId !== activePointerId) return;
       activePointerId = null;
       selectOrigin = null;
       selectRect = null;
+      shapeDraft = null;
       markDirty();
       return;
     }
@@ -1257,6 +1480,8 @@
     activePointerId = null;
     currentStroke = [];
     lastDrawnStrokeIndex = 0;
+    predictedPoints = [];
+    shapeDraft = null;
     markDirty();
   }
 
@@ -1393,27 +1618,28 @@
     const ctx = wetCtx;
     const dpr = window.devicePixelRatio || 1;
     ctx.setTransform(camera.scale * dpr, 0, 0, camera.scale * dpr, camera.x * dpr, camera.y * dpr);
+    ctx.clearRect(
+      -camera.x / camera.scale, -camera.y / camera.scale,
+      wetCanvas.width / (camera.scale * dpr), wetCanvas.height / (camera.scale * dpr),
+    );
 
-    // Wet stroke
     if (isDrawing && currentStroke.length >= 2) {
-      const pts = currentStroke;
-      ctx.strokeStyle = penColour;
-      if (lastDrawnStrokeIndex < 2) {
-        ctx.clearRect(
-          -camera.x / camera.scale, -camera.y / camera.scale,
-          wetCanvas.width / (camera.scale * dpr), wetCanvas.height / (camera.scale * dpr),
-        );
-        drawStrokePoints(ctx, pts, penColour, penThickness, 0);
-      } else {
-        drawStrokePoints(ctx, pts, penColour, penThickness, Math.max(0, lastDrawnStrokeIndex - 1));
+      drawStrokePoints(ctx, currentStroke, penColour, penThickness, 0);
+      lastDrawnStrokeIndex = currentStroke.length;
+      if (predictedPoints.length > 0) {
+        ctx.save();
+        ctx.globalAlpha = 0.35;
+        const anchor = currentStroke.slice(-2);
+        drawStrokePoints(ctx, [...anchor, ...predictedPoints], penColour, penThickness, 0);
+        ctx.restore();
       }
-      lastDrawnStrokeIndex = pts.length;
+    } else if (mode === "shape" && shapeDraft) {
+      const previewStrokes = getPageShapeStrokes(shapeDraft);
+      for (const previewStroke of previewStrokes) {
+        if (previewStroke.length < 2) continue;
+        drawStrokePoints(ctx, previewStroke, penColour, penThickness, 0);
+      }
     } else if (selectRect) {
-      // Rubber-band selection rectangle
-      ctx.clearRect(
-        -camera.x / camera.scale, -camera.y / camera.scale,
-        wetCanvas.width / (camera.scale * dpr), wetCanvas.height / (camera.scale * dpr),
-      );
       const tl = normToWorld(selectRect.x, selectRect.y);
       const br = normToWorld(selectRect.x + selectRect.w, selectRect.y + selectRect.h);
       ctx.save();
@@ -1424,18 +1650,9 @@
       ctx.fillStyle = "rgba(57, 108, 216, 0.08)";
       ctx.fillRect(tl.x, tl.y, br.x - tl.x, br.y - tl.y);
       ctx.restore();
-    } else {
-      ctx.clearRect(
-        -camera.x / camera.scale, -camera.y / camera.scale,
-        wetCanvas.width / (camera.scale * dpr), wetCanvas.height / (camera.scale * dpr),
-      );
     }
   }
 
-  /**
-   * Draw stroke points in world space. ctx must have camera setTransform applied.
-   * Points are in normalised page space; converted to world here.
-   */
   function drawStrokePoints(
     ctx: CanvasRenderingContext2D,
     pts: Point[],
@@ -1443,30 +1660,10 @@
     thickness: number,
     startIdx: number,
   ) {
-    if (pts.length - startIdx < 2) return;
-    const slice = pts.slice(startIdx);
-    const wc = slice.map(p => normToWorld(p.x, p.y));
-
-    ctx.strokeStyle = colour;
-    ctx.beginPath();
-    ctx.moveTo(wc[0].x, wc[0].y);
-    ctx.lineWidth = widthForPoint(thickness, slice[0].pressure);
-
-    for (let i = 1; i < wc.length - 1; i++) {
-      const width = widthForPoint(thickness, slice[i].pressure);
-      if (Math.abs(ctx.lineWidth - width) > PRESSURE_WIDTH_THRESHOLD / camera.scale) {
-        ctx.stroke();
-        ctx.beginPath();
-        const midPrev = { x: (wc[i - 1].x + wc[i].x) / 2, y: (wc[i - 1].y + wc[i].y) / 2 };
-        ctx.moveTo(midPrev.x, midPrev.y);
-        ctx.lineWidth = width;
-      }
-      const mid = { x: (wc[i].x + wc[i + 1].x) / 2, y: (wc[i].y + wc[i + 1].y) / 2 };
-      ctx.quadraticCurveTo(wc[i].x, wc[i].y, mid.x, mid.y);
-    }
-    const last = wc.length - 1;
-    ctx.quadraticCurveTo(wc[last - 1].x, wc[last - 1].y, wc[last].x, wc[last].y);
-    ctx.stroke();
+    drawStrokePointsFn(
+      ctx, pts, colour, thickness, startIdx,
+      camera.scale, pageOrigin.x, pageOrigin.y, pageSize.w, pageSize.h,
+    );
   }
 
   // â”€â”€ Hit test / selection helpers â”€â”€
@@ -1525,6 +1722,7 @@
   function observeContainerResize(node: HTMLElement) {
     containerResizeObserver?.disconnect();
     containerResizeObserver = new ResizeObserver(() => {
+      cachedContainerRect = null;
       setupCanvases();
       requestCurrentPdfBitmap();
     });
@@ -1959,15 +2157,18 @@
     void appLogInfo(`[library] loaded ${sourceDocuments.length} documents`);
   }
 
-  async function importPdf() {
+  async function importPdf(documentMode: DocumentMode = "textbook") {
     error = null;
     importing = true;
     try {
-      const doc = await invoke<SourceDocument>("import_pdf");
+      const doc = await invoke<SourceDocument>("import_pdf", { documentMode });
       void appLogInfo(
-        `[import] imported doc=${doc.id} title="${doc.title}" path="${doc.file_path}"`,
+        `[import] imported doc=${doc.id} mode=${doc.document_mode} title="${doc.title}" path="${doc.file_path}"`,
       );
       void logChunkingStatus(doc.id, "after import");
+      if (doc.document_mode === "past_paper") {
+        void ensureChunkingForPage(doc.id, 1, "past-paper import");
+      }
       await loadSourceDocuments();
     } catch (e: unknown) {
       if (e !== "cancelled") {
@@ -1984,7 +2185,7 @@
     if (batchChunkProgress && batchChunkProgress.docId !== book.id) {
       batchChunkProgress = null;
     }
-    if (viewerAiOpen || viewerAiContextChunkId !== null || pendingChatAttachment) {
+    if (viewerAiOpen || viewerAiContextPageId !== null || pendingChatAttachment) {
       await closeViewerAiPanel();
     }
     if (chunkView) closeChunkView();
@@ -2027,7 +2228,7 @@
     if (rendering) return;
     const clamped = Math.max(1, Math.min(totalPages, pageNum));
     if (clamped === currentPage && currentPdfBitmap) return;
-    if (viewerAiOpen || viewerAiContextChunkId !== null || pendingChatAttachment) {
+    if (viewerAiOpen || viewerAiContextPageId !== null || pendingChatAttachment) {
       await closeViewerAiPanel();
     }
     if (chunkView && !options.keepChunkView) closeChunkView();
@@ -2112,11 +2313,14 @@
 
   async function undoStroke() {
     if (strokes.length === 0) return;
-    const removed = strokes[strokes.length - 1];
-    strokes = strokes.slice(0, -1);
-    redoStack = [...redoStack, [removed]];
+    const removed = getTrailingStrokeGroup(strokes);
+    if (removed.length === 0) return;
+    strokes = strokes.slice(0, strokes.length - removed.length);
+    redoStack = [...redoStack, removed];
     if (currentPageId !== null) cacheEvict(currentPageId);
-    if (removed.id !== null) invoke("delete_stroke", { strokeId: removed.id }).catch(() => {});
+    for (const stroke of removed) {
+      if (stroke.id !== null) invoke("delete_stroke", { strokeId: stroke.id }).catch(() => {});
+    }
     markDirty();
   }
 
@@ -2162,7 +2366,7 @@
   let aiWorking = $state(false);
   let chunkAiWorking = $state(false);
   let viewerAiOpen = $state(false);
-  let viewerAiContextChunkId = $state<number | null>(null);
+  let viewerAiContextPageId = $state<number | null>(null);
   interface PendingChatAttachment {
     imageBase64: string;
     imageDataUrl: string;
@@ -2183,53 +2387,25 @@
   }
 
   function getActiveChatChunkId(): number | null {
-    return chunkView?.chunk.id ?? viewerAiContextChunkId;
+    return chunkView?.chunk.id ?? null;
   }
 
-  function chunkTitleForChat(chunk: ChunkInfo): string {
-    const display = getChunkTitleDisplay(chunk);
-    if (display?.heading) return display.heading;
-    if (chunk.subject?.trim()) return chunk.subject.trim();
-    const colour = CHUNK_COLOURS[chunk.chunk_type];
-    return colour?.label ?? `Chunk ${chunk.id}`;
+  function getActiveViewerChatPageId(): number | null {
+    if (!viewerAiOpen || chunkView) return null;
+    return viewerAiContextPageId ?? currentPageId;
   }
 
-  function intersectionArea(
-    a: { x: number; y: number; width: number; height: number },
-    b: { x: number; y: number; width: number; height: number },
-  ): number {
-    const left = Math.max(a.x, b.x);
-    const right = Math.min(a.x + a.width, b.x + b.width);
-    const top = Math.max(a.y, b.y);
-    const bottom = Math.min(a.y + a.height, b.y + b.height);
-    if (right <= left || bottom <= top) return 0;
-    return (right - left) * (bottom - top);
+  function isChatContextReady(): boolean {
+    if (chunkView) return getActiveChatChunkId() != null;
+    return getActiveViewerChatPageId() != null;
   }
 
-  function getSelectionChunkCandidates(
-    selectionRect: { x: number; y: number; width: number; height: number },
-  ): ChunkInfo[] {
-    return currentChunks
-      .filter((chunk) => chunk.chunk_type !== "noise")
-      .map((chunk) => ({
-        chunk,
-        overlap: intersectionArea(selectionRect, {
-          x: chunk.bbox_x,
-          y: chunk.bbox_y,
-          width: chunk.bbox_w,
-          height: chunk.bbox_h,
-        }),
-      }))
-      .filter((entry) => entry.overlap > 0)
-      .sort((a, b) => b.overlap - a.overlap)
-      .map((entry) => entry.chunk);
-  }
-
-  async function setViewerAiContextChunk(chunk: ChunkInfo) {
-    if (viewerAiContextChunkId === chunk.id) return;
-    await cancelChunkChatForReset();
-    viewerAiContextChunkId = chunk.id;
-  }
+  $effect(() => {
+    if (!viewerAiOpen || chunkView) return;
+    if (viewerAiContextPageId !== currentPageId) {
+      viewerAiContextPageId = currentPageId;
+    }
+  });
 
   function clearPendingChatAttachment() {
     pendingChatAttachment = null;
@@ -2237,7 +2413,7 @@
 
   async function closeViewerAiPanel() {
     viewerAiOpen = false;
-    viewerAiContextChunkId = null;
+    viewerAiContextPageId = null;
     clearPendingChatAttachment();
     await cancelChunkChatForReset();
   }
@@ -2295,18 +2471,14 @@
   }
 
   async function onAiClick() {
-    if (!selection || aiWorking) return;
-    const selectionForChat = selection;
-    const candidates = getSelectionChunkCandidates(selectionForChat);
-    if (candidates.length === 0) {
-      chunkChatError = "Select an area that overlaps a chunk to open AI chat.";
-      viewerAiOpen = true;
-      return;
-    }
+    if (aiWorking) return;
+    viewerAiContextPageId = currentPageId;
+    viewerAiOpen = true;
+    chunkChatError = null;
+    if (!selection) return;
 
     aiWorking = true;
     try {
-      await setViewerAiContextChunk(candidates[0]);
       const b64 = await rasteriseSelection();
       pendingChatAttachment = {
         imageBase64: b64,
@@ -2315,8 +2487,6 @@
         createdAt: Date.now(),
         transcribedBody: null,
       };
-      viewerAiOpen = true;
-      chunkChatError = null;
     } catch (err) {
       chunkChatError = "Failed to rasterise the selected area.";
       await appLogWarn(`[viewer-ai] selection rasterisation failed: ${formatLogError(err)}`);
@@ -2395,6 +2565,7 @@
       viewerAiOpen = false;
       chunkTab = 'ai';
       showChunkPenOptions = false;
+      showChunkShapeOptions = false;
       chunkChatError = null;
     } catch (err) {
       chunkChatError = "Failed to rasterise the selected area.";
@@ -2419,6 +2590,9 @@
     ocr_text: string | null;
     formatted_body_md: string | null;
     glossary_md: string | null;
+    question_label: string | null;
+    available_marks: number | null;
+    achieved_marks: number | null;
   }
 
   interface ChunkForTranscription extends ChunkInfo {
@@ -2449,15 +2623,17 @@
     exercise:    { accent: 'oklch(0.58 0.16 50)',  tint: 'oklch(0.970 0.032 50)',  label: 'Exercise',     short: 'Ex'   },
     example:     { accent: 'oklch(0.58 0.16 50)',  tint: 'oklch(0.970 0.032 50)',  label: 'Example',      short: 'Eg'   },
     explanation: { accent: 'oklch(0.52 0.03 240)', tint: 'oklch(0.975 0.008 240)', label: 'Explanation',  short: 'Exp'  },
+    question:    { accent: 'oklch(0.56 0.16 22)',  tint: 'oklch(0.972 0.022 22)',  label: 'Question',     short: 'Q'    },
   };
 
   let currentChunks = $state<ChunkInfo[]>([]);
   const chunkSurfaceCache = new Map<number, ChunkSurfaceCache>();
   const chunkSurfaceRequests = new Map<number, Promise<ChunkSurfaceCache>>();
   const chunkBodyRequests = new Map<number, Promise<boolean>>();
-  let chunkMode = $state<'draw' | 'erase' | 'select'>('draw');
+  let chunkMode = $state<'draw' | 'shape' | 'erase' | 'select'>('draw');
   let chunkTab = $state<'ink' | 'glossary' | 'ai'>('ink');
   let showChunkPenOptions = $state(false);
+  let showChunkShapeOptions = $state(false);
   let chunkSelectOrigin = $state<{ x: number; y: number } | null>(null);
   let chunkSelectRect = $state<Rect | null>(null);
   let chunkSelectedStrokes = $state<Set<Stroke>>(new Set());
@@ -2468,6 +2644,21 @@
   let chunkLeftPanelWidth = $state(CHUNK_LEFT_PANEL_DEFAULT_WIDTH);
   let chunkSheet = $state<HTMLDivElement>(null!);
   let chunkResizingPointerId: number | null = null;
+  let questionAchievedMarksDraft = $state("");
+  let questionAchievedMarksSaving = $state(false);
+  let questionAchievedMarksError = $state<string | null>(null);
+  interface QuestionSourceSlice {
+    page_id: number;
+    page_number: number;
+    bbox_x: number;
+    bbox_y: number;
+    bbox_w: number;
+    bbox_h: number;
+    slice_order: number;
+  }
+  let questionSourceSlices = $state<QuestionSourceSlice[]>([]);
+  let questionSourceLoading = $state(false);
+  let questionSourceError = $state<string | null>(null);
 
   function clearChunkSelectionState() {
     chunkSelectOrigin = null;
@@ -2480,7 +2671,21 @@
     const wasDrawMode = chunkMode === 'draw';
     chunkMode = 'draw';
     clearChunkSelectionState();
+    chunkShapeDraft = null;
     showChunkPenOptions = wasDrawMode ? !showChunkPenOptions : true;
+    showChunkShapeOptions = false;
+    redrawChunkCanvases();
+  }
+
+  function activateChunkShapeTool() {
+    const wasShapeMode = chunkMode === "shape";
+    chunkMode = "shape";
+    clearChunkSelectionState();
+    chunkIsDrawing = false;
+    chunkCurrentStroke = [];
+    chunkShapeDraft = null;
+    showChunkPenOptions = false;
+    showChunkShapeOptions = wasShapeMode ? !showChunkShapeOptions : true;
     redrawChunkCanvases();
   }
 
@@ -2488,6 +2693,8 @@
     chunkMode = 'erase';
     clearChunkSelectionState();
     showChunkPenOptions = false;
+    showChunkShapeOptions = false;
+    chunkShapeDraft = null;
     redrawChunkCanvases();
   }
 
@@ -2495,6 +2702,8 @@
     chunkMode = 'select';
     clearChunkSelectionState();
     showChunkPenOptions = false;
+    showChunkShapeOptions = false;
+    chunkShapeDraft = null;
     redrawChunkCanvases();
   }
 
@@ -2630,6 +2839,18 @@
     surfaceId: number;
     strokes: Stroke[];
   } | null>(null);
+  const chunkGlossaryTabLabel = $derived(
+    chunkView?.chunk.chunk_type === "question" ? "Answer" : "Glossary",
+  );
+  const chunkIsQuestion = $derived(chunkView?.chunk.chunk_type === "question");
+  const chunkMarksDisplay = $derived(() => {
+    if (!chunkView || chunkView.chunk.chunk_type !== "question") return null;
+    const available = chunkView.chunk.available_marks;
+    const achieved = chunkView.chunk.achieved_marks;
+    const availableText = available == null ? "?" : `${available}`;
+    const achievedText = formatQuestionMarksValue(achieved);
+    return `${achievedText}/${availableText}`;
+  });
   let chunkTitleDraft = $state("");
   let chunkBodyDraft = $state("");
   let chunkTitleSaving = $state(false);
@@ -2845,7 +3066,9 @@
 
   interface ChunkAiStreamEventPayload {
     request_id: string;
-    chunk_id: number;
+    context_kind: "chunk" | "page";
+    chunk_id?: number | null;
+    page_id?: number | null;
     phase: "delta" | "completed" | "error" | "cancelled";
     delta?: string | null;
     error?: string | null;
@@ -2903,6 +3126,21 @@
       })
       : "",
   );
+  let includeQuestionMarkVisuals = $state(false);
+  let questionMarkingLoading = $state(false);
+  let questionMarkingApplying = $state(false);
+  let questionMarkingError = $state<string | null>(null);
+  let questionMarkingSuggestion = $state<QuestionMarkSuggestion | null>(null);
+  let questionMarkingSuggestionIncludeVisuals = $state(false);
+  let questionMarkAttempts = $state<QuestionMarkAttemptView[]>([]);
+  let questionMarkingSuggestionFeedbackHtml = $derived(
+    questionMarkingSuggestion
+      ? renderChunkBodyHtml(questionMarkingSuggestion.feedback_md, undefined, {
+        copyCodeBlocks: false,
+        allowHeadings: false,
+      })
+      : "",
+  );
 
   interface ChunkRewriteSuggestionOutput {
     title: string | null;
@@ -2911,6 +3149,52 @@
 
   interface ChunkGlossaryRewriteSuggestionOutput {
     glossary_markdown: string;
+  }
+
+  interface QuestionMarkAttemptView {
+    id: number;
+    source: string;
+    achieved_marks: number | null;
+    available_marks_snapshot: number | null;
+    feedback_md: string | null;
+    include_visuals: boolean;
+    provider: string | null;
+    model: string | null;
+    created_at: string;
+  }
+
+  interface QuestionMarkSuggestion {
+    achieved_marks: number | null;
+    feedback_md: string;
+  }
+
+  function formatQuestionMarksValue(value: number | null): string {
+    return value == null ? "?" : `${Number(value.toFixed(2))}`;
+  }
+
+  function formatQuestionAttemptScore(attempt: QuestionMarkAttemptView): string {
+    const achieved = formatQuestionMarksValue(attempt.achieved_marks);
+    const available = attempt.available_marks_snapshot == null
+      ? "?"
+      : `${attempt.available_marks_snapshot}`;
+    return `${achieved}/${available}`;
+  }
+
+  function formatQuestionAttemptTimestamp(createdAt: string): string {
+    const normalized = createdAt.includes("T")
+      ? createdAt
+      : `${createdAt.replace(" ", "T")}Z`;
+    const parsed = new Date(normalized);
+    if (Number.isNaN(parsed.getTime())) return createdAt;
+    return parsed.toLocaleString();
+  }
+
+  function renderQuestionAttemptFeedback(feedbackMd: string | null): string {
+    if (!feedbackMd || !feedbackMd.trim()) return "";
+    return renderChunkBodyHtml(feedbackMd, undefined, {
+      copyCodeBlocks: false,
+      allowHeadings: false,
+    });
   }
 
   interface BackendChunkReference {
@@ -2930,8 +3214,12 @@
     subject: string | null;
     status: string;
     body_preview: string | null;
+    glossary_preview?: string | null;
     has_formatted_body: boolean;
     has_self_explanation: boolean;
+    question_label?: string | null;
+    available_marks?: number | null;
+    achieved_marks?: number | null;
   }
 
   async function loadChunkReferences(chunkId: number) {
@@ -3656,13 +3944,17 @@
   }
 
   async function transcribePendingChatAttachment(
-    chunkId: number,
+    options: {
+      chunkId: number | null;
+      pageNumber: number;
+    },
     attachment: PendingChatAttachment,
   ): Promise<string | null> {
     if (attachment.transcribedBody?.trim()) return attachment.transcribedBody.trim();
-    const contextChunk = findChunkById(chunkId);
+    const contextChunk = options.chunkId == null ? null : findChunkById(options.chunkId);
     const visionProvider = aiTaskSettings.vision.provider;
     const visionModel = aiTaskSettings.vision.model.trim();
+    const fallbackTitle = contextChunk ? null : `Page ${options.pageNumber}`;
 
     chatAttachmentTranscribing = true;
     try {
@@ -3671,7 +3963,7 @@
         model: visionModel.length > 0 ? visionModel : null,
         imageBase64: attachment.imageBase64,
         chunkType: contextChunk?.chunk_type ?? "explanation",
-        title: contextChunk?.title ?? null,
+        title: contextChunk?.title ?? fallbackTitle,
         subject: contextChunk?.subject ?? null,
       });
       const body = result.body_markdown.trim();
@@ -3699,9 +3991,13 @@
   }
 
   async function prepareChunkChatUserMessage(
-    chunkId: number,
     draftContent: string,
+    options: {
+      chunkId: number | null;
+      pageNumber: number;
+    },
   ): Promise<PreparedChatUserMessage> {
+    const { chunkId, pageNumber } = options;
     const attachment = pendingChatAttachment;
     const supportsDirectImage = chatProviderSupportsDirectImage(aiTaskSettings.chat.provider);
     const historyParts: string[] = [];
@@ -3718,7 +4014,7 @@
       } else {
         let transcription: string | null = null;
         try {
-          transcription = await transcribePendingChatAttachment(chunkId, attachment);
+          transcription = await transcribePendingChatAttachment({ chunkId, pageNumber }, attachment);
         } catch (err) {
           await appLogWarn(`[chunk-ai] attachment transcription failed: ${formatLogError(err)}`);
         }
@@ -3732,7 +4028,7 @@
       attachmentCreatedAt = attachment.createdAt;
     }
 
-    if (includeChunkInkContext) {
+    if (chunkId != null && includeChunkInkContext) {
       if (supportsDirectImage && !imageBase64) {
         try {
           const inkImageBase64 = await rasteriseChunkInkContext(chunkId);
@@ -3759,7 +4055,9 @@
     const leadText = draftContent || (
       imageBase64 || attachment
         ? "Use the attached image as additional context."
-        : "Use the available chunk context."
+        : chunkId != null
+          ? "Use the available chunk context."
+          : "Use the current page context."
     );
     historyParts.unshift(leadText);
 
@@ -3807,9 +4105,12 @@
 
   async function sendChunkChatMessage() {
     const chunkId = getActiveChatChunkId();
+    const pageId = getActiveViewerChatPageId();
+    const pageNumber = chunkView?.pageNumber ?? currentPage;
     const draftContent = chunkChatDraft.trim();
     const hasAttachment = !!pendingChatAttachment;
-    if (chunkId == null || chunkChatStreaming || chunkChatLoadingContext) return;
+    if (chunkId == null && pageId == null) return;
+    if (chunkChatStreaming || chunkChatLoadingContext) return;
     if (!draftContent && !hasAttachment) return;
 
     chunkChatError = null;
@@ -3817,11 +4118,18 @@
 
     let prepared: PreparedChatUserMessage;
     try {
-      prepared = await prepareChunkChatUserMessage(chunkId, draftContent);
-      await ensureChunkChatContext(chunkId);
-      if (getActiveChatChunkId() !== chunkId) {
-        chunkChatLoadingContext = false;
-        return;
+      prepared = await prepareChunkChatUserMessage(draftContent, { chunkId, pageNumber });
+      if (chunkId != null) {
+        await ensureChunkChatContext(chunkId);
+        if (getActiveChatChunkId() !== chunkId) {
+          chunkChatLoadingContext = false;
+          return;
+        }
+      } else if (pageId != null) {
+        if (getActiveViewerChatPageId() !== pageId) {
+          chunkChatLoadingContext = false;
+          return;
+        }
       }
     } catch (err) {
       chunkChatLoadingContext = false;
@@ -3864,16 +4172,31 @@
       const history = getChunkChatHistory();
       const chatProvider = aiTaskSettings.chat.provider;
       const chatModel = aiTaskSettings.chat.model.trim();
-      await invoke("start_chunk_ai_stream", {
-        requestId,
-        chunkId,
-        provider: chatProvider,
-        model: chatModel.length > 0 ? chatModel : null,
-        history,
-      });
-      await appLogInfo(
-        `[chunk-ai] started requestId=${requestId} chunkId=${chunkId} provider=${chatProvider} model=${chatModel || "auto"} history=${history.length}`,
-      );
+      if (chunkId != null) {
+        await invoke("start_chunk_ai_stream", {
+          requestId,
+          chunkId,
+          provider: chatProvider,
+          model: chatModel.length > 0 ? chatModel : null,
+          history,
+        });
+        await appLogInfo(
+          `[chunk-ai] started requestId=${requestId} chunkId=${chunkId} provider=${chatProvider} model=${chatModel || "auto"} history=${history.length}`,
+        );
+      } else if (pageId != null) {
+        await invoke("start_page_ai_stream", {
+          requestId,
+          pageId,
+          provider: chatProvider,
+          model: chatModel.length > 0 ? chatModel : null,
+          history,
+        });
+        await appLogInfo(
+          `[viewer-ai] started requestId=${requestId} pageId=${pageId} provider=${chatProvider} model=${chatModel || "auto"} history=${history.length}`,
+        );
+      } else {
+        throw new Error("AI context is not ready.");
+      }
     } catch (err) {
       const message = formatLogError(err);
       chunkChatError = message;
@@ -3888,8 +4211,9 @@
         content: assistant.content || "Unable to reply.",
       }));
       queueChunkChatScroll();
+      const contextLabel = chunkId != null ? `chunkId=${chunkId}` : `pageId=${pageId ?? "unknown"}`;
       await appLogWarn(
-        `[chunk-ai] failed to start requestId=${requestId} chunkId=${chunkId}: ${message}`,
+        `[chunk-ai] failed to start requestId=${requestId} ${contextLabel}: ${message}`,
       );
     }
   }
@@ -4686,6 +5010,146 @@
     return request;
   }
 
+  async function loadQuestionSourceSlices(chunkId: number) {
+    questionSourceLoading = true;
+    questionSourceError = null;
+    try {
+      questionSourceSlices = await invoke<QuestionSourceSlice[]>("get_question_source_slices", { chunkId });
+    } catch (err) {
+      questionSourceError = formatLogError(err);
+      questionSourceSlices = [];
+      await appLogWarn(`[question] source slices failed chunkId=${chunkId}: ${questionSourceError}`);
+    } finally {
+      questionSourceLoading = false;
+    }
+  }
+
+  async function loadQuestionMarkAttempts(chunkId: number) {
+    try {
+      questionMarkAttempts = await invoke<QuestionMarkAttemptView[]>("list_question_mark_attempts", { chunkId });
+    } catch (err) {
+      questionMarkAttempts = [];
+      await appLogWarn(`[question] mark attempts failed chunkId=${chunkId}: ${formatLogError(err)}`);
+    }
+  }
+
+  async function saveQuestionAchievedMarks() {
+    const view = chunkView;
+    if (!view || view.chunk.chunk_type !== "question" || questionAchievedMarksSaving) return;
+
+    const draft = questionAchievedMarksDraft.trim();
+    const parsed = draft.length === 0 ? null : Number(draft);
+    if (parsed != null && (!Number.isFinite(parsed) || parsed < 0)) {
+      questionAchievedMarksError = "Enter a non-negative number.";
+      return;
+    }
+
+    questionAchievedMarksSaving = true;
+    questionAchievedMarksError = null;
+    try {
+      await invoke("save_question_achieved_marks", {
+        chunkId: view.chunk.id,
+        achievedMarks: parsed,
+      });
+      currentChunks = currentChunks.map((chunk) =>
+        chunk.id === view.chunk.id
+          ? { ...chunk, achieved_marks: parsed }
+          : chunk,
+      );
+      if (chunkView?.chunk.id === view.chunk.id) {
+        chunkView = {
+          ...chunkView,
+          chunk: { ...chunkView.chunk, achieved_marks: parsed },
+        };
+      }
+      await loadQuestionMarkAttempts(view.chunk.id);
+    } catch (err) {
+      questionAchievedMarksError = formatLogError(err);
+      await appLogWarn(`[question] save achieved marks failed chunkId=${view.chunk.id}: ${questionAchievedMarksError}`);
+    } finally {
+      questionAchievedMarksSaving = false;
+    }
+  }
+
+  async function openQuestionSource() {
+    const view = chunkView;
+    if (!view || view.chunk.chunk_type !== "question") return;
+    if (questionSourceSlices.length === 0) {
+      if (!questionSourceLoading) await loadQuestionSourceSlices(view.chunk.id);
+      if (questionSourceSlices.length === 0) return;
+    }
+    const target = questionSourceSlices[0];
+    await goToPage(target.page_number, { keepChunkView: true });
+  }
+
+  async function runQuestionMarking() {
+    const view = chunkView;
+    if (!view || view.chunk.chunk_type !== "question" || questionMarkingLoading || questionMarkingApplying) return;
+
+    questionMarkingLoading = true;
+    questionMarkingError = null;
+    questionMarkingSuggestion = null;
+    try {
+      await flushGlossarySave();
+      const chatProvider = aiTaskSettings.chat.provider;
+      const chatModel = aiTaskSettings.chat.model.trim();
+      const suggestion = await invoke<QuestionMarkSuggestion>("mark_question_answer_with_ai", {
+        chunkId: view.chunk.id,
+        provider: chatProvider,
+        model: chatModel.length > 0 ? chatModel : null,
+        includeVisuals: includeQuestionMarkVisuals,
+      });
+      questionMarkingSuggestion = suggestion;
+    } catch (err) {
+      questionMarkingError = formatLogError(err);
+      await appLogWarn(`[question] AI marking failed chunkId=${view.chunk.id}: ${questionMarkingError}`);
+    } finally {
+      questionMarkingLoading = false;
+    }
+  }
+
+  async function applyQuestionMarkingSuggestion() {
+    const view = chunkView;
+    if (!view || view.chunk.chunk_type !== "question" || !questionMarkingSuggestion || questionMarkingApplying) return;
+
+    questionMarkingApplying = true;
+    questionMarkingError = null;
+    try {
+      const chatProvider = aiTaskSettings.chat.provider;
+      const chatModel = aiTaskSettings.chat.model.trim();
+      await invoke("apply_question_mark_attempt", {
+        chunkId: view.chunk.id,
+        source: "ai",
+        achievedMarks: questionMarkingSuggestion.achieved_marks,
+        feedbackMd: questionMarkingSuggestion.feedback_md,
+        includeVisuals: includeQuestionMarkVisuals,
+        provider: chatProvider,
+        model: chatModel.length > 0 ? chatModel : null,
+      });
+
+      const achieved = questionMarkingSuggestion.achieved_marks;
+      currentChunks = currentChunks.map((chunk) =>
+        chunk.id === view.chunk.id
+          ? { ...chunk, achieved_marks: achieved }
+          : chunk,
+      );
+      if (chunkView?.chunk.id === view.chunk.id) {
+        chunkView = {
+          ...chunkView,
+          chunk: { ...chunkView.chunk, achieved_marks: achieved },
+        };
+      }
+      questionAchievedMarksDraft = achieved == null ? "" : `${Number(achieved.toFixed(2))}`;
+      await loadQuestionMarkAttempts(view.chunk.id);
+      questionMarkingSuggestion = null;
+    } catch (err) {
+      questionMarkingError = formatLogError(err);
+      await appLogWarn(`[question] apply AI marking failed chunkId=${view.chunk.id}: ${questionMarkingError}`);
+    } finally {
+      questionMarkingApplying = false;
+    }
+  }
+
   async function openChunkView(
     chunk: ChunkInfo,
     options: { pageNumber?: number; pageChunks?: ChunkInfo[] } = {},
@@ -4693,7 +5157,7 @@
     const pageNumber = options.pageNumber ?? currentPage;
     const pageChunks = options.pageChunks ?? (pageNumber === currentPage ? currentChunks : chunkNavigationPageChunks);
     viewerAiOpen = false;
-    viewerAiContextChunkId = null;
+    viewerAiContextPageId = null;
     clearPendingChatAttachment();
     void cancelChunkChatForReset();
     await flushGlossarySave();
@@ -4706,6 +5170,7 @@
     chunkMode = 'draw';
     chunkTab = 'ink';
     showChunkPenOptions = false;
+    showChunkShapeOptions = false;
     chunkCamera = { x: 0, y: 0, scale: 1 };
     chunkHomeCamera = { ...chunkCamera };
     chunkSurfaceSize = { w: 1, h: 1 };
@@ -4713,6 +5178,7 @@
     chunkTouchPointers = [];
     chunkLastPinchDist = 0;
     chunkLastPinchMid = { x: 0, y: 0 };
+    chunkShapeDraft = null;
     clearChunkSelectionState();
     chunkView = {
       chunk,
@@ -4758,6 +5224,22 @@
     glossaryRewriteSuggestion = null;
     glossaryRewriteLoading = false;
     glossaryRewriteApplying = false;
+    questionAchievedMarksDraft = chunk.achieved_marks == null ? "" : `${Number(chunk.achieved_marks.toFixed(2))}`;
+    questionAchievedMarksSaving = false;
+    questionAchievedMarksError = null;
+    questionMarkingLoading = false;
+    questionMarkingApplying = false;
+    questionMarkingError = null;
+    questionMarkingSuggestion = null;
+    includeQuestionMarkVisuals = false;
+    questionSourceSlices = [];
+    questionSourceError = null;
+    questionSourceLoading = false;
+    questionMarkAttempts = [];
+    if (chunk.chunk_type === "question") {
+      void loadQuestionSourceSlices(chunk.id);
+      void loadQuestionMarkAttempts(chunk.id);
+    }
     redoStack = [];
     markDirty();
     if (!chunkHasFormattedBody(chunk)) {
@@ -4785,12 +5267,15 @@
     chunkNavigationPageChunks = [];
     chunkMode = 'draw';
     showChunkPenOptions = false;
+    showChunkShapeOptions = false;
     chunkWetCtx = null;
     chunkDryCtx = null;
     chunkWetCanvas = null!;
     chunkDryCanvas = null!;
+    cachedChunkRect = null;
     chunkIsDrawing = false;
     chunkCurrentStroke = [];
+    chunkShapeDraft = null;
     chunkActivePointerId = null;
     chunkCamera = { x: 0, y: 0, scale: 1 };
     chunkHomeCamera = { ...chunkCamera };
@@ -4816,6 +5301,18 @@
     glossaryRewriteSuggestion = null;
     glossaryRewriteLoading = false;
     glossaryRewriteApplying = false;
+    questionAchievedMarksDraft = "";
+    questionAchievedMarksSaving = false;
+    questionAchievedMarksError = null;
+    questionMarkingLoading = false;
+    questionMarkingApplying = false;
+    questionMarkingError = null;
+    questionMarkingSuggestion = null;
+    includeQuestionMarkVisuals = false;
+    questionSourceSlices = [];
+    questionSourceLoading = false;
+    questionSourceError = null;
+    questionMarkAttempts = [];
     markDirty();
   }
 
@@ -4839,6 +5336,7 @@
   // Chunk drawing state (separate from page strokes)
   let chunkIsDrawing = false;
   let chunkCurrentStroke: Point[] = [];
+  let chunkShapeDraft = $state<ShapeDraft | null>(null);
   let chunkActivePointerId: number | null = null;
   let chunkTouchPointers: TouchPointer[] = [];
   let chunkLastPinchDist = 0;
@@ -4859,8 +5357,63 @@
     };
   }
 
+  function getChunkShapeStrokes(draft: ShapeDraft): Point[][] {
+    return buildShapeStrokes(
+      shapeKind,
+      draft.origin,
+      draft.current,
+      chunkSurfaceSize.w,
+      chunkSurfaceSize.h,
+      0.5,
+    );
+  }
+
+  async function commitChunkShape(draft: ShapeDraft) {
+    const view = chunkView;
+    if (!view) return;
+    const dragWorld = shapeDragLengthWorld(draft.origin, draft.current, chunkSurfaceSize.w, chunkSurfaceSize.h);
+    if (dragWorld < MIN_SHAPE_DRAG_WORLD) return;
+    const generated = getChunkShapeStrokes(draft);
+    if (generated.length === 0) return;
+    const groupId = generated.length > 1 ? makeStrokeGroupId() : null;
+    const newStrokes: Stroke[] = generated
+      .filter((pts) => pts.length >= 2)
+      .map((pts) => ({
+        id: null,
+        colour: penColour,
+        thickness: penThickness,
+        points: pts,
+        bbox: computeBBox(pts),
+        chunkId: view.chunk.id,
+        groupId,
+      }));
+    if (newStrokes.length === 0) return;
+
+    view.strokes = [...view.strokes, ...newStrokes];
+    clearChunkInkContextCache();
+    redrawChunkDry();
+
+    for (const stroke of newStrokes) {
+      try {
+        const id = await invoke<number>("save_surface_stroke", {
+          surfaceId: view.surfaceId,
+          stroke: {
+            colour: stroke.colour,
+            thickness: stroke.thickness,
+            points: stroke.points.map(({ x, y }) => ({ x, y })),
+          },
+        });
+        stroke.id = id;
+      } catch (err) {
+        console.error("save_surface_stroke failed", err);
+      }
+    }
+  }
+
+  let cachedChunkRect: DOMRect | null = null;
+
   function chunkClientToScreen(clientX: number, clientY: number): { x: number; y: number } {
-    const rect = chunkWetCanvas.getBoundingClientRect();
+    const rect = cachedChunkRect ??= chunkWetCanvas.getBoundingClientRect();
     return {
       x: clientX - rect.left,
       y: clientY - rect.top,
@@ -4885,29 +5438,10 @@
     colour: string,
     thickness: number,
   ) {
-    if (pts.length < 2) return;
-    const worldPts = pts.map(chunkPointToWorld);
-    ctx.strokeStyle = colour;
-    ctx.lineWidth = thickness / chunkCamera.scale;
-    ctx.beginPath();
-    ctx.moveTo(worldPts[0].x, worldPts[0].y);
-    for (let i = 1; i < worldPts.length - 1; i++) {
-      const current = worldPts[i];
-      const next = worldPts[i + 1];
-      const mid = {
-        x: (current.x + next.x) / 2,
-        y: (current.y + next.y) / 2,
-      };
-      ctx.quadraticCurveTo(current.x, current.y, mid.x, mid.y);
-    }
-    const last = worldPts.length - 1;
-    ctx.quadraticCurveTo(
-      worldPts[last - 1].x,
-      worldPts[last - 1].y,
-      worldPts[last].x,
-      worldPts[last].y,
+    drawStrokePointsFn(
+      ctx, pts, colour, thickness, 0,
+      chunkCamera.scale, 0, 0, chunkSurfaceSize.w, chunkSurfaceSize.h,
     );
-    ctx.stroke();
   }
 
   function redrawChunkCanvases() {
@@ -5032,6 +5566,7 @@
   function setupChunkCanvases(node: HTMLDivElement) {
     const resize = () => {
       if (!chunkWetCanvas || !chunkDryCanvas) return;
+      cachedChunkRect = null;
       const dpr = window.devicePixelRatio || 1;
       const w = Math.max(1, node.clientWidth);
       const h = Math.max(1, node.clientHeight);
@@ -5141,6 +5676,14 @@
       ctx.restore();
       return;
     }
+    if (chunkMode === "shape" && chunkShapeDraft) {
+      const previewStrokes = getChunkShapeStrokes(chunkShapeDraft);
+      for (const previewStroke of previewStrokes) {
+        if (previewStroke.length < 2) continue;
+        drawChunkStrokePoints(ctx, previewStroke, penColour, penThickness);
+      }
+      return;
+    }
     if (!chunkIsDrawing || chunkCurrentStroke.length < 2) return;
     drawChunkStrokePoints(ctx, chunkCurrentStroke, penColour, penThickness);
   }
@@ -5187,7 +5730,20 @@
       return;
     }
 
+    if (chunkMode === "shape") {
+      const origin = { ...point, pressure: 0.5 };
+      chunkShapeDraft = {
+        origin,
+        current: { ...origin },
+      };
+      showChunkShapeOptions = false;
+      drawChunkWet();
+      e.preventDefault();
+      return;
+    }
+
     chunkIsDrawing = true;
+    showChunkShapeOptions = false;
     chunkCurrentStroke = [{ ...point, pressure: e.pressure > 0 ? e.pressure : 0.5 }];
     e.preventDefault();
   }
@@ -5261,6 +5817,18 @@
       }
       return;
     }
+    if (chunkMode === "shape") {
+      if (!chunkShapeDraft) return;
+      const latest = events[events.length - 1];
+      const { x, y } = pointerToChunkWorld(latest.clientX, latest.clientY);
+      const point = chunkWorldToPoint(x, y, 0.5);
+      chunkShapeDraft = {
+        origin: chunkShapeDraft.origin,
+        current: { x: point.x, y: point.y, pressure: 0.5 },
+      };
+      drawChunkWet();
+      return;
+    }
     if (!chunkIsDrawing) return;
     for (const event of events) {
       const { x, y } = pointerToChunkWorld(event.clientX, event.clientY);
@@ -5299,6 +5867,14 @@
       return;
     }
     if (chunkMode === 'erase') return;
+    if (chunkMode === "shape") {
+      const draft = chunkShapeDraft;
+      chunkShapeDraft = null;
+      drawChunkWet();
+      if (!draft) return;
+      await commitChunkShape(draft);
+      return;
+    }
     if (!chunkIsDrawing) return;
     chunkIsDrawing = false;
 
@@ -5314,6 +5890,7 @@
       points: pts,
       bbox: computeBBox(pts),
       chunkId: chunkView.chunk.id,
+      groupId: null,
     };
     chunkView.strokes = [...chunkView.strokes, stroke];
     clearChunkInkContextCache();
@@ -5353,6 +5930,11 @@
       drawChunkWet();
       return;
     }
+    if (chunkMode === "shape") {
+      chunkShapeDraft = null;
+      drawChunkWet();
+      return;
+    }
     chunkIsDrawing = false;
     chunkCurrentStroke = [];
     drawChunkWet();
@@ -5377,10 +5959,12 @@
 
   async function undoChunkStroke() {
     if (!chunkView || chunkView.strokes.length === 0) return;
-    const last = chunkView.strokes[chunkView.strokes.length - 1];
-    chunkView.strokes = chunkView.strokes.slice(0, -1);
+    const removed = getTrailingStrokeGroup(chunkView.strokes);
+    if (removed.length === 0) return;
+    chunkView.strokes = chunkView.strokes.slice(0, chunkView.strokes.length - removed.length);
     clearChunkInkContextCache();
-    const nextSelected = new Set([...chunkSelectedStrokes].filter((stroke) => stroke !== last));
+    const removedSet = new Set(removed);
+    const nextSelected = new Set([...chunkSelectedStrokes].filter((stroke) => !removedSet.has(stroke)));
     chunkSelectedStrokes = nextSelected;
     if (nextSelected.size === 0) {
       chunkSelection = null;
@@ -5390,11 +5974,13 @@
       chunkSelection = unionBBox(nextSelected);
     }
     redrawChunkDry();
-    if (last.id === null) return;
-    try {
-      await invoke("delete_surface_stroke", { strokeId: last.id });
-    } catch (err) {
-      console.error("delete_surface_stroke failed", err);
+    for (const stroke of removed) {
+      if (stroke.id === null) continue;
+      try {
+        await invoke("delete_surface_stroke", { strokeId: stroke.id });
+      } catch (err) {
+        console.error("delete_surface_stroke failed", err);
+      }
     }
   }
 
@@ -5503,9 +6089,17 @@
       (event) => {
         const payload = event.payload;
         const activeRequestId = chunkChatActiveRequestId;
+        if (!activeRequestId || payload.request_id !== activeRequestId) return;
+
         const activeChunkId = getActiveChatChunkId();
-        if (!activeRequestId || !activeChunkId) return;
-        if (payload.request_id !== activeRequestId || payload.chunk_id !== activeChunkId) return;
+        const activePageId = getActiveViewerChatPageId();
+        if (payload.context_kind === "chunk") {
+          if (!activeChunkId || payload.chunk_id !== activeChunkId) return;
+        } else if (payload.context_kind === "page") {
+          if (!activePageId || payload.page_id !== activePageId) return;
+        } else {
+          return;
+        }
 
         if (payload.phase === "delta") {
           if (!payload.delta) return;
@@ -5821,6 +6415,7 @@
         class="infinite-canvas"
         bind:this={canvasContainer}
         class:mode-erase={mode === 'erase'}
+        class:mode-shape={mode === 'shape'}
         class:mode-select={mode === 'select'}
         use:observeContainerResize
       >
@@ -5839,16 +6434,16 @@
       </div>
 
       {#if viewerAiOpen && !chunkView}
-        {@const viewerAiContextChunk = viewerAiContextChunkId == null ? null : findChunkById(viewerAiContextChunkId)}
+        {@const viewerPageNumber = currentPage}
         <aside class="viewer-ai-panel" aria-label="AI chat">
           <div class="viewer-ai-header">
             <div>
               <p class="viewer-ai-kicker">AI chat</p>
               <p class="viewer-ai-context">
-                {#if viewerAiContextChunk}
-                  Context: {chunkTitleForChat(viewerAiContextChunk)}
+                {#if getActiveViewerChatPageId() != null}
+                  Context: Page {viewerPageNumber}
                 {:else}
-                  Select an area overlapping a chunk to set context.
+                  Context: Preparing page context...
                 {/if}
               </p>
             </div>
@@ -5865,8 +6460,8 @@
           <div class="chunk-ai-transcript" bind:this={chunkChatTranscript} use:chunkChatCodeCopy>
             {#if chunkChatMessages.length === 0}
               <div class="chunk-ai-empty">
-                <p>Ask about the selected context.</p>
-                <p>The AI sees chunk text, glossary entries, aliases, linked chunks, references, and any attached selection image.</p>
+                <p>Ask about this page.</p>
+                <p>The AI sees the page's extracted text, plus any attached selection image.</p>
               </div>
             {:else}
               {#each chunkChatMessages as message (message.id)}
@@ -5906,8 +6501,8 @@
           </div>
 
           <div class="chunk-ai-status-row">
-            {#if getActiveChatChunkId() == null}
-              <span class="chunk-ai-status">No chunk context selected yet.</span>
+            {#if getActiveViewerChatPageId() == null}
+              <span class="chunk-ai-status">Preparing page context...</span>
             {/if}
             {#if chatAttachmentTranscribing}
               <span class="chunk-ai-status">Transcribing attached image...</span>
@@ -5945,7 +6540,7 @@
               bind:value={chunkChatDraft}
               class="chunk-ai-input"
               rows="3"
-              placeholder="Ask about this selected area..."
+              placeholder="Ask about this page..."
               onkeydown={onChunkChatKeydown}
               disabled={chunkChatStreaming || chunkChatLoadingContext}
             ></textarea>
@@ -5959,7 +6554,7 @@
                   class="chunk-ai-action chunk-ai-send"
                   type="button"
                   onclick={sendChunkChatMessage}
-                  disabled={chunkChatStreaming || chunkChatLoadingContext || getActiveChatChunkId() == null || (!chunkChatDraft.trim() && !pendingChatAttachment)}
+                  disabled={chunkChatStreaming || chunkChatLoadingContext || !isChatContextReady() || (!chunkChatDraft.trim() && !pendingChatAttachment)}
                 >
                   Send
                 </button>
@@ -6145,7 +6740,11 @@
                 <button
                   class="chunk-tab"
                   class:active={chunkTab === 'ink'}
-                  onclick={() => chunkTab = 'ink'}
+                  onclick={() => {
+                    chunkTab = 'ink';
+                    showChunkPenOptions = false;
+                    showChunkShapeOptions = false;
+                  }}
                 >
                   <svg viewBox="0 0 16 16" fill="none" width="13" height="13">
                     <path d="M3 13l1.8-0.7 7-7-1.1-1.1-7 7z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
@@ -6159,6 +6758,7 @@
                   onclick={() => {
                     chunkTab = 'glossary';
                     showChunkPenOptions = false;
+                    showChunkShapeOptions = false;
                   }}
                 >
                   <svg viewBox="0 0 16 16" fill="none" width="13" height="13">
@@ -6173,6 +6773,7 @@
                   onclick={() => {
                     chunkTab = 'ai';
                     showChunkPenOptions = false;
+                    showChunkShapeOptions = false;
                   }}
                 >
                   AI
@@ -6183,6 +6784,7 @@
                 <div
                   class="chunk-sheet-surface"
                   class:mode-erase={chunkMode === 'erase'}
+                  class:mode-shape={chunkMode === 'shape'}
                   class:mode-select={chunkMode === 'select'}
                   use:setupChunkCanvases
                   onwheel={onChunkWheel}
@@ -6274,6 +6876,38 @@
                               ></button>
                             {/each}
                           </div>
+                        </div>
+                      {/if}
+                    </div>
+                    <div class="shape-tool">
+                      <button
+                        class="tool-btn"
+                        class:active={chunkMode === 'shape'}
+                        type="button"
+                        onclick={activateChunkShapeTool}
+                        aria-label="Shape"
+                        aria-pressed={chunkMode === 'shape'}
+                      >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+                          <circle cx="8" cy="8" r="3.2"/>
+                          <line x1="13" y1="16" x2="21" y2="16"/>
+                          <line x1="17" y1="12" x2="17" y2="20"/>
+                        </svg>
+                      </button>
+                      {#if showChunkShapeOptions}
+                        <div class="shape-popout chunk-shape-popout" transition:fade={{ duration: 140 }}>
+                          {#each SHAPE_OPTIONS as option}
+                            <button
+                              class="shape-option"
+                              class:active={shapeKind === option.value}
+                              type="button"
+                              onclick={() => shapeKind = option.value}
+                              aria-pressed={shapeKind === option.value}
+                            >
+                              <span class="shape-option-title">{option.label}</span>
+                              <span class="shape-option-hint">{option.hint}</span>
+                            </button>
+                          {/each}
                         </div>
                       {/if}
                     </div>
@@ -6840,6 +7474,38 @@
           {/if}
         </div>
 
+        <div class="shape-tool">
+          <button
+            class="tool-btn"
+            class:active={mode === 'shape'}
+            onclick={activateShapeTool}
+            aria-label="Shape"
+            aria-pressed={mode === 'shape'}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="8" cy="8" r="3.2"/>
+              <line x1="13" y1="16" x2="21" y2="16"/>
+              <line x1="17" y1="12" x2="17" y2="20"/>
+            </svg>
+          </button>
+          {#if showShapeOptions}
+            <div class="shape-popout" transition:fade={{ duration: 140 }}>
+              {#each SHAPE_OPTIONS as option}
+                <button
+                  class="shape-option"
+                  class:active={shapeKind === option.value}
+                  type="button"
+                  onclick={() => shapeKind = option.value}
+                  aria-pressed={shapeKind === option.value}
+                >
+                  <span class="shape-option-title">{option.label}</span>
+                  <span class="shape-option-hint">{option.hint}</span>
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+
         <!-- Erase -->
         <button
           class="tool-btn"
@@ -6870,11 +7536,11 @@
         <!-- AI -->
         <button
           class="tool-btn ai-btn"
-          class:active={viewerAiOpen || !!selection}
+          class:active={viewerAiOpen}
           onclick={onAiClick}
-          disabled={!selection || aiWorking}
-          aria-label="Ask AI about selection"
-          title="Open AI chat with selected area"
+          disabled={aiWorking}
+          aria-label="Open AI chat for this page"
+          title="Open AI chat for this page"
         >
           {#if aiWorking}
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="spin">
@@ -6947,7 +7613,7 @@
           >
             AI settings
           </button>
-          <button onclick={importPdf} disabled={importing} class="import-btn">
+          <button onclick={() => void importPdf()} disabled={importing} class="import-btn">
             {importing ? "Importingâ€¦" : "Import PDF"}
           </button>
         </div>
@@ -8082,6 +8748,7 @@
   }
 
   .infinite-canvas.mode-erase { cursor: cell; }
+  .infinite-canvas.mode-shape { cursor: crosshair; }
   .infinite-canvas.mode-select { cursor: default; }
 
   .viewer-ai-panel {
@@ -8800,6 +9467,7 @@
   }
 
   .chunk-sheet-surface.mode-erase { cursor: cell; }
+  .chunk-sheet-surface.mode-shape { cursor: crosshair; }
   .chunk-sheet-surface.mode-select { cursor: default; }
 
   .chunk-layer {
@@ -8873,9 +9541,30 @@
     z-index: 120;
   }
 
+  .chunk-ink-bar .chunk-shape-popout {
+    border: 1px solid color-mix(in oklch, var(--chunk-accent) 26%, transparent);
+    box-shadow: 0 14px 34px color-mix(in oklch, var(--chunk-accent) 14%, transparent);
+    z-index: 120;
+  }
+
   .chunk-ink-bar .pen-popout::after {
     border-right: 1px solid color-mix(in oklch, var(--chunk-accent) 26%, transparent);
     border-bottom: 1px solid color-mix(in oklch, var(--chunk-accent) 26%, transparent);
+  }
+
+  .chunk-ink-bar .chunk-shape-popout::after {
+    border-right: 1px solid color-mix(in oklch, var(--chunk-accent) 26%, transparent);
+    border-bottom: 1px solid color-mix(in oklch, var(--chunk-accent) 26%, transparent);
+  }
+
+  .chunk-ink-bar .shape-option:hover {
+    background: color-mix(in oklch, var(--chunk-accent) 10%, white);
+  }
+
+  .chunk-ink-bar .shape-option.active {
+    background: color-mix(in oklch, var(--chunk-accent) 14%, white);
+    border-color: color-mix(in oklch, var(--chunk-accent) 24%, transparent);
+    color: var(--chunk-accent);
   }
 
   .chunk-ink-bar .pen-slider {
@@ -9785,6 +10474,13 @@
     z-index: 40;
   }
 
+  .shape-tool {
+    position: relative;
+    display: flex;
+    align-items: center;
+    z-index: 40;
+  }
+
   .pen-popout {
     position: absolute;
     bottom: calc(100% + 10px);
@@ -9792,6 +10488,24 @@
     transform: translateX(-50%);
     width: 230px;
     padding: 0.8rem;
+    background: rgba(255, 255, 255, 0.96);
+    border: 1px solid rgba(32, 64, 160, 0.14);
+    border-radius: 14px;
+    box-shadow: 0 12px 32px rgba(25, 34, 68, 0.18);
+    backdrop-filter: blur(8px);
+    z-index: 120;
+  }
+
+  .shape-popout {
+    position: absolute;
+    bottom: calc(100% + 10px);
+    left: 50%;
+    transform: translateX(-50%);
+    width: 260px;
+    padding: 0.55rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
     background: rgba(255, 255, 255, 0.96);
     border: 1px solid rgba(32, 64, 160, 0.14);
     border-radius: 14px;
@@ -9811,6 +10525,56 @@
     border-right: 1px solid rgba(32, 64, 160, 0.14);
     border-bottom: 1px solid rgba(32, 64, 160, 0.14);
     transform: translate(-50%, -50%) rotate(45deg);
+  }
+
+  .shape-popout::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    width: 14px;
+    height: 14px;
+    background: rgba(255, 255, 255, 0.96);
+    border-right: 1px solid rgba(32, 64, 160, 0.14);
+    border-bottom: 1px solid rgba(32, 64, 160, 0.14);
+    transform: translate(-50%, -50%) rotate(45deg);
+  }
+
+  .shape-option {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.12rem;
+    padding: 0.45rem 0.55rem;
+    border-radius: 10px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: #384b67;
+    text-align: left;
+    transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+  }
+
+  .shape-option:hover {
+    background: #eef3ff;
+  }
+
+  .shape-option.active {
+    background: #e7efff;
+    border-color: rgba(32, 64, 160, 0.22);
+    color: #19397f;
+  }
+
+  .shape-option-title {
+    font-size: 0.82rem;
+    font-weight: 600;
+    line-height: 1.25;
+  }
+
+  .shape-option-hint {
+    font-size: 0.72rem;
+    line-height: 1.35;
+    color: #66758e;
   }
 
   .pen-popout-header {
@@ -9907,4 +10671,3 @@
   .spin { animation: spin 0.9s linear infinite; }
 
 </style>
-

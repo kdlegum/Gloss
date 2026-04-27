@@ -412,10 +412,7 @@ fn build_chat_messages(prompt: &str, history: &[ChunkChatMessage]) -> Value {
                 .filter(|value| !value.is_empty())
             {
                 if let Some(obj) = entry.as_object_mut() {
-                    obj.insert(
-                        "images".to_string(),
-                        json!([image_base64]),
-                    );
+                    obj.insert("images".to_string(), json!([image_base64]));
                 }
             }
         }

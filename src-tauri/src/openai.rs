@@ -89,9 +89,7 @@ impl OpenAiClient {
                 self.model
             );
         }
-        let value = self
-            .send_request(request)
-            .await?;
+        let value = self.send_request(request).await?;
         let output_text =
             extract_output_text(&value).ok_or_else(|| LlmError::Parse(value.to_string()))?;
         debug!(
