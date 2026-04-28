@@ -83,6 +83,30 @@ pub struct BlockForPrompt<'a> {
     pub text: &'a str,
 }
 
+pub struct PastPaperBlockForPrompt {
+    pub id: i64,
+    pub page_number: i64,
+    pub bbox_y: f32,
+}
+
+pub struct PastPaperInstructionMarkdown {
+    pub markdown: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PastPaperQuestionChunk {
+    pub question_label: String,
+    pub available_marks: Option<i64>,
+    pub block_ids: Vec<i64>,
+    pub question_text: String,
+}
+
+#[derive(Default)]
+pub struct PastPaperDocumentResult {
+    pub questions: Vec<PastPaperQuestionChunk>,
+    pub noise_block_ids: Vec<i64>,
+}
+
 pub struct ChunkBodyPrompt<'a> {
     pub chunk_type: &'a str,
     pub title: Option<&'a str>,
@@ -140,6 +164,7 @@ pub struct ChunkAlias {
 struct ChunkResponseWrapper {
     chunks: Vec<GroupedChunk>,
 }
+
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ChunkBodyResult {
@@ -319,6 +344,67 @@ pub fn build_prompt(blocks: &[BlockForPrompt<'_>]) -> String {
     s
 }
 
+pub fn build_instruction_markdown_prompt(blocks: &[PastPaperBlockForPrompt]) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You are extracting the instruction page of a maths exam paper.\n\
+         Return ONLY valid JSON: { \"markdown\": \"...\" }\n\
+         Transcribe the full visible content faithfully as markdown (preserve tables, lists, etc.).\n\n\
+         Block positions on this page (id :: y0):\n",
+    );
+    for b in blocks {
+        s.push_str(&format!("{} :: {:.2}\n", b.id, b.bbox_y));
+    }
+    s
+}
+
+pub fn build_past_paper_document_chunk_prompt(
+    blocks: &[PastPaperBlockForPrompt],
+    instruction_markdown: &str,
+) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "You are identifying all questions in a complete maths exam paper.\n\
+         You will receive images of every question page in order.\n\n\
+         Rules:\n\
+         1. Each question chunk must include ALL subparts (a, b, c, etc.) in one chunk.\n\
+         2. question_label: numeric string (\"1\", \"12\").\n\
+         3. available_marks: extract from the visible text if present (e.g. \"[4 marks]\"), else null.\n\
+         4. block_ids: list of pdfium block IDs that make up this question.\n\
+            Include ONLY blocks that genuinely belong to this question.\n\
+         5. noise_block_ids: list of block IDs that are NOT part of any question\n\
+         (e.g. section headers, blank-page labels, copyright/footer text, page numbers,\n\
+         formula booklets, or other admin material).\n\
+         6. Each block ID must appear exactly once, either in one question.block_ids OR\n\
+            in noise_block_ids (never both).\n\
+         7. question_text: full faithful transcription of the entire question (including all subparts)\n\
+            as markdown. Use $...$ for inline math and $$...$$ for display math. Preserve all\n\
+            mathematical notation exactly.\n\n\
+         Instruction page context:\n",
+    );
+    let instruction_trimmed = instruction_markdown.trim();
+    if instruction_trimmed.is_empty() {
+        s.push_str("(none)\n");
+    } else {
+        s.push_str(instruction_trimmed);
+        s.push('\n');
+    }
+    s.push_str("\nBlock positions (id :: page :: y0):\n");
+    for b in blocks {
+        s.push_str(&format!("{} :: {} :: {:.2}\n", b.id, b.page_number, b.bbox_y));
+    }
+    s.push_str(
+        "\nReturn ONLY valid JSON:\n\
+         { \"questions\": [\n\
+           { \"question_label\": \"1\", \"available_marks\": 4, \"block_ids\": [42, 43, 44], \
+               \"question_text\": \"**1.** Let $f(x) = x^2$. Find $f'(x)$. [4 marks]\" }\n\
+           ],\n\
+           \"noise_block_ids\": [99, 100]\n\
+         }",
+    );
+    s
+}
+
 pub fn build_chunk_body_prompt(chunk: &ChunkBodyPrompt<'_>) -> String {
     let mut s = String::new();
     s.push_str(
@@ -418,6 +504,49 @@ pub fn chunk_groups_schema() -> Value {
     })
 }
 
+pub fn instruction_markdown_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["markdown"],
+        "properties": {
+            "markdown": { "type": "string" }
+        }
+    })
+}
+
+pub fn past_paper_document_chunk_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["questions", "noise_block_ids"],
+        "properties": {
+            "questions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["question_label", "available_marks", "block_ids", "question_text"],
+                    "properties": {
+                        "question_label": { "type": "string", "minLength": 1 },
+                        "available_marks": { "type": ["integer", "null"] },
+                        "block_ids": {
+                            "type": "array",
+                            "items": { "type": "integer" },
+                            "minItems": 1
+                        },
+                        "question_text": { "type": "string", "minLength": 1 }
+                    }
+                }
+            },
+            "noise_block_ids": {
+                "type": "array",
+                "items": { "type": "integer" }
+            }
+        }
+    })
+}
+
 pub fn chunk_body_schema() -> Value {
     json!({
         "type": "object",
@@ -469,6 +598,75 @@ pub fn parse_chunks(raw: &str, log_target: &str) -> Result<Vec<GroupedChunk>, Ll
     }
     warn!(target: log_target, "failed to parse llm chunk response");
     Err(LlmError::Parse(raw.to_string()))
+}
+
+pub fn parse_instruction_markdown_result(
+    raw: &str,
+    log_target: &str,
+) -> Result<PastPaperInstructionMarkdown, LlmError> {
+    #[derive(Deserialize)]
+    struct Wrapper {
+        markdown: String,
+    }
+    let parsed: Wrapper = parse_json(raw, log_target, "instruction markdown")?;
+    Ok(PastPaperInstructionMarkdown {
+        markdown: parsed.markdown.trim().to_string(),
+    })
+}
+
+pub fn parse_past_paper_document_chunk_result(
+    raw: &str,
+    log_target: &str,
+) -> Result<PastPaperDocumentResult, LlmError> {
+    #[derive(Deserialize)]
+    struct Wrapper {
+        questions: Vec<PastPaperQuestionChunk>,
+        #[serde(default)]
+        noise_block_ids: Vec<i64>,
+    }
+    let parsed: Wrapper = parse_json(raw, log_target, "past-paper document chunk")?;
+    let mut questions = Vec::with_capacity(parsed.questions.len());
+    let mut noise_block_ids = Vec::new();
+    let mut noise_seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for id in parsed.noise_block_ids {
+        if noise_seen.insert(id) {
+            noise_block_ids.push(id);
+        }
+    }
+    for q in parsed.questions {
+        let label = q.question_label.trim().to_string();
+        if label.is_empty() || q.block_ids.is_empty() {
+            warn!(
+                target: log_target,
+                "skipping invalid past-paper question chunk label={:?}", label
+            );
+            continue;
+        }
+        let mut block_ids = Vec::with_capacity(q.block_ids.len());
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for id in q.block_ids {
+            if seen.insert(id) {
+                block_ids.push(id);
+            }
+        }
+        if block_ids.is_empty() {
+            warn!(
+                target: log_target,
+                "skipping past-paper question chunk with no unique block ids label={:?}", label
+            );
+            continue;
+        }
+        questions.push(PastPaperQuestionChunk {
+            question_label: label,
+            available_marks: q.available_marks.map(|m| m.max(0)),
+            block_ids,
+            question_text: q.question_text.trim().to_string(),
+        });
+    }
+    Ok(PastPaperDocumentResult {
+        questions,
+        noise_block_ids,
+    })
 }
 
 pub fn parse_chunk_body(raw: &str, log_target: &str) -> Result<ChunkBodyResult, LlmError> {

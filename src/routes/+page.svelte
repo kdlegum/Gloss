@@ -13,6 +13,15 @@
     shapeDragLengthWorld,
     drawStrokePoints as drawStrokePointsFn,
   } from "$lib/ink";
+  import GraphComposerModal from "$lib/GraphComposerModal.svelte";
+  import {
+    drawGraphCard,
+    graphSpecToFence,
+    normaliseGraphSpec,
+    pointsFromJson,
+    pointsToJson,
+    type GraphSpec,
+  } from "$lib/graph";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import {
     attachConsole,
@@ -32,6 +41,21 @@
     title: string;
     file_path: string;
     document_mode: DocumentMode;
+    instruction_page_start: number | null;
+    instruction_page_end: number | null;
+  }
+
+  interface PastPaperInstructionContextDebug {
+    source_document_id: number;
+    chunking_status: string;
+    instruction_page_start: number | null;
+    instruction_page_end: number | null;
+    expected_instruction_pages: number[];
+    extracted_instruction_pages: number[];
+    missing_instruction_pages: number[];
+    instruction_block_count: number;
+    instruction_transcribed_block_count: number;
+    preview_text: string;
   }
 
   interface AiSettingsState {
@@ -247,6 +271,16 @@
   let batchChunkStartInput = $state("1");
   let batchChunkEndInput = $state("1");
   let batchChunkSkipChunkedPages = $state(true);
+  let pastPaperInstructionPagesEnabled = $state(true);
+  let pastPaperInstructionStartInput = $state("1");
+  let pastPaperInstructionEndInput = $state("1");
+  let pastPaperInstructionSaving = $state(false);
+  let pastPaperInstructionError = $state<string | null>(null);
+  let pastPaperInstructionFeedback = $state<string | null>(null);
+  let pastPaperInstructionCheckLoading = $state(false);
+  let pastPaperInstructionCheckError = $state<string | null>(null);
+  let pastPaperInstructionCheckFeedback = $state<string | null>(null);
+  let pastPaperInstructionCheckPreview = $state<string | null>(null);
   let batchChunkStarting = $state(false);
   let batchChunkError = $state<string | null>(null);
   let batchChunkFeedback = $state<string | null>(null);
@@ -361,12 +395,15 @@
 
   // DB row id for the current (source_document, page) pair; null until resolved
   let currentPageId = $state<number | null>(null);
+  let currentPageSurfaceId = $state<number | null>(null);
 
   // â”€â”€ Stroke prefetch cache â”€â”€
   // 5-entry LRU keyed by page DB id. Evicts the oldest entry when full.
   const STROKE_CACHE_SIZE = 5;
   const strokeCacheOrder: number[] = [];   // front = most recently used
   const strokeCacheData = new Map<number, StrokeOutput[]>();
+  const pageSurfaceCache = new Map<number, SurfaceGraphCacheEntry>();
+  const pageSurfaceRequests = new Map<number, Promise<SurfaceGraphCacheEntry>>();
   const pageIdLookup = new Map<string, number>();
   const pageIdRequests = new Map<string, Promise<number>>();
   const chunkPageCache = new Map<string, ChunkInfo[]>();
@@ -475,10 +512,21 @@
     if (selectedBook?.id !== bookId || currentPage !== pageNum) return;
     currentPageId = pageId;
     await loadAndDrawStrokes(pageId);
+    try {
+      const pageSurface = await ensurePageSurface(pageId);
+      if (selectedBook?.id !== bookId || currentPage !== pageNum || currentPageId !== pageId) return;
+      currentPageSurfaceId = pageSurface.surfaceId;
+      pageGraphs = cloneGraphObjects(pageSurface.graphs);
+    } catch (err) {
+      void appLogWarn(`[graph] failed to load page surface graphs for pageId=${pageId}: ${formatLogError(err)}`);
+      currentPageSurfaceId = null;
+      pageGraphs = [];
+    }
     await loadChunksForPage(pageId, pageNum, bookId);
     void ensureChunkingForPage(bookId, pageNum, "page visible");
     prefetchPage(bookId, pageNum + 1);
     prefetchPage(bookId, pageNum - 1);
+    markDirty();
   }
 
   interface StrokeOutput {
@@ -507,6 +555,199 @@
     }));
     redoStack = [];
     markDirty();
+  }
+
+  function cloneGraphObject(graph: SurfaceGraphObject): SurfaceGraphObject {
+    return {
+      id: graph.id,
+      mode: graph.mode,
+      equation: graph.equation,
+      pointsJson: graph.pointsJson,
+      xMin: graph.xMin,
+      xMax: graph.xMax,
+      yMin: graph.yMin,
+      yMax: graph.yMax,
+      bboxX: graph.bboxX,
+      bboxY: graph.bboxY,
+      bboxW: graph.bboxW,
+      bboxH: graph.bboxH,
+      lineColour: graph.lineColour,
+      lineWidth: graph.lineWidth,
+    };
+  }
+
+  function cloneGraphObjects(graphs: SurfaceGraphObject[]): SurfaceGraphObject[] {
+    return graphs.map((graph) => cloneGraphObject(graph));
+  }
+
+  function graphOutputToObject(output: SurfaceGraphObjectOutput): SurfaceGraphObject {
+    return {
+      id: output.id,
+      mode: output.mode,
+      equation: output.equation,
+      pointsJson: output.points_json,
+      xMin: output.x_min,
+      xMax: output.x_max,
+      yMin: output.y_min,
+      yMax: output.y_max,
+      bboxX: output.bbox_x,
+      bboxY: output.bbox_y,
+      bboxW: output.bbox_w,
+      bboxH: output.bbox_h,
+      lineColour: output.line_colour,
+      lineWidth: output.line_width,
+    };
+  }
+
+  function graphObjectToSpec(graph: SurfaceGraphObject): GraphSpec {
+    return normaliseGraphSpec({
+      mode: graph.mode,
+      equation: graph.equation,
+      points: pointsFromJson(graph.pointsJson),
+      xMin: graph.xMin,
+      xMax: graph.xMax,
+      yMin: graph.yMin,
+      yMax: graph.yMax,
+      lineColour: graph.lineColour,
+      lineWidth: graph.lineWidth,
+    });
+  }
+
+  function buildGraphObjectFromSpec(
+    specInput: GraphSpec,
+    bbox: { x: number; y: number; w: number; h: number },
+  ): SurfaceGraphObject {
+    const spec = normaliseGraphSpec(specInput);
+    return {
+      id: null,
+      mode: spec.mode,
+      equation: spec.mode === "equation" ? spec.equation : null,
+      pointsJson: spec.mode === "points" ? pointsToJson(spec.points) : null,
+      xMin: spec.xMin,
+      xMax: spec.xMax,
+      yMin: spec.yMin,
+      yMax: spec.yMax,
+      bboxX: bbox.x,
+      bboxY: bbox.y,
+      bboxW: bbox.w,
+      bboxH: bbox.h,
+      lineColour: spec.lineColour,
+      lineWidth: spec.lineWidth,
+    };
+  }
+
+  function surfaceGraphPayload(graph: SurfaceGraphObject): Record<string, unknown> {
+    return {
+      mode: graph.mode,
+      equation: graph.mode === "equation" ? graph.equation : null,
+      points_json: graph.mode === "points" ? graph.pointsJson : null,
+      x_min: graph.xMin,
+      x_max: graph.xMax,
+      y_min: graph.yMin,
+      y_max: graph.yMax,
+      bbox_x: graph.bboxX,
+      bbox_y: graph.bboxY,
+      bbox_w: graph.bboxW,
+      bbox_h: graph.bboxH,
+      line_colour: graph.lineColour,
+      line_width: graph.lineWidth,
+    };
+  }
+
+  function canonicalPointsJson(value: string | null): string | null {
+    const points = pointsFromJson(value);
+    return points ? pointsToJson(points) : null;
+  }
+
+  function graphObjectsEquivalent(a: SurfaceGraphObject, b: SurfaceGraphObject): boolean {
+    return a.mode === b.mode
+      && (a.equation ?? null) === (b.equation ?? null)
+      && canonicalPointsJson(a.pointsJson) === canonicalPointsJson(b.pointsJson)
+      && a.xMin === b.xMin
+      && a.xMax === b.xMax
+      && a.yMin === b.yMin
+      && a.yMax === b.yMax
+      && a.bboxX === b.bboxX
+      && a.bboxY === b.bboxY
+      && a.bboxW === b.bboxW
+      && a.bboxH === b.bboxH
+      && a.lineColour === b.lineColour
+      && a.lineWidth === b.lineWidth;
+  }
+
+  async function reconcileSurfaceGraphs(
+    surfaceId: number,
+    currentGraphs: SurfaceGraphObject[],
+    targetGraphs: SurfaceGraphObject[],
+  ): Promise<SurfaceGraphObject[]> {
+    const currentById = new Map<number, SurfaceGraphObject>();
+    for (const graph of currentGraphs) {
+      if (graph.id == null) continue;
+      currentById.set(graph.id, graph);
+    }
+
+    const target = cloneGraphObjects(targetGraphs);
+    const targetIds = new Set<number>();
+    for (const graph of target) {
+      if (graph.id == null) continue;
+      targetIds.add(graph.id);
+    }
+
+    for (const currentGraph of currentGraphs) {
+      if (currentGraph.id == null) continue;
+      if (targetIds.has(currentGraph.id)) continue;
+      await invoke("delete_surface_graph_object", { graphId: currentGraph.id });
+    }
+
+    for (const graph of target) {
+      if (graph.id != null) {
+        const existing = currentById.get(graph.id);
+        if (existing && !graphObjectsEquivalent(existing, graph)) {
+          await invoke("update_surface_graph_object", {
+            graphId: graph.id,
+            graph: surfaceGraphPayload(graph),
+          });
+        } else if (!existing) {
+          const created = await invoke<number>("save_surface_graph_object", {
+            surfaceId,
+            graph: surfaceGraphPayload(graph),
+          });
+          graph.id = created;
+        }
+      } else {
+        const created = await invoke<number>("save_surface_graph_object", {
+          surfaceId,
+          graph: surfaceGraphPayload(graph),
+        });
+        graph.id = created;
+      }
+    }
+
+    return target;
+  }
+
+  async function ensurePageSurface(pageId: number): Promise<SurfaceGraphCacheEntry> {
+    const cached = pageSurfaceCache.get(pageId);
+    if (cached) return cached;
+    const existing = pageSurfaceRequests.get(pageId);
+    if (existing) return existing;
+
+    const request = (async () => {
+      const surfaceId = await invoke<number>("get_or_create_page_surface", { pageId });
+      const raw = await invoke<SurfaceGraphObjectOutput[]>("load_surface_graph_objects", { surfaceId });
+      const entry: SurfaceGraphCacheEntry = {
+        surfaceId,
+        graphs: raw.map((graph) => graphOutputToObject(graph)),
+      };
+      pageSurfaceCache.set(pageId, entry);
+      return entry;
+    })();
+    pageSurfaceRequests.set(pageId, request);
+    try {
+      return await request;
+    } finally {
+      pageSurfaceRequests.delete(pageId);
+    }
   }
 
   // â”€â”€ Tool mode â”€â”€
@@ -566,6 +807,15 @@
   const MAX_PREDICTED_RANGE_PX = 36;
   let strokes = $state<Stroke[]>([]);
   let redoStack = $state<Stroke[][]>([]);
+  let pageGraphs = $state<SurfaceGraphObject[]>([]);
+  let selectedPageGraphId = $state<number | null>(null);
+  let pageGraphDrag = $state<GraphPointerDrag | null>(null);
+  let pageGraphUndoStack = $state<GraphHistoryEntry[]>([]);
+  let pageGraphRedoStack = $state<GraphHistoryEntry[]>([]);
+  let graphModalOpen = $state(false);
+  let graphModalSource = $state<GraphModalSource>("page");
+  let graphModalInitialGraph = $state<GraphSpec | null>(null);
+  let pendingGraphPlacement = $state<PendingGraphPlacement | null>(null);
   let activePointerId: number | null = null;
   const CHUNK_TAP_MAX_DISTANCE = 10;
 
@@ -979,9 +1229,188 @@
     }
   }
 
+  const MIN_GRAPH_BBOX_SIZE = 0.08;
+  const PAGE_GRAPH_DEFAULT_SIZE = { w: 0.34, h: 0.28 };
+  const CHUNK_GRAPH_DEFAULT_SIZE = { w: 0.48, h: 0.4 };
+
+  function graphArraysEquivalent(a: SurfaceGraphObject[], b: SurfaceGraphObject[]): boolean {
+    if (a.length !== b.length) return false;
+    for (let index = 0; index < a.length; index += 1) {
+      const left = a[index];
+      const right = b[index];
+      if (left.id !== right.id) return false;
+      if (!graphObjectsEquivalent(left, right)) return false;
+    }
+    return true;
+  }
+
+  function clampGraphRect(rect: { x: number; y: number; w: number; h: number }) {
+    const w = clampNorm(Math.max(MIN_GRAPH_BBOX_SIZE, rect.w));
+    const h = clampNorm(Math.max(MIN_GRAPH_BBOX_SIZE, rect.h));
+    const x = Math.max(0, Math.min(1 - w, rect.x));
+    const y = Math.max(0, Math.min(1 - h, rect.y));
+    return { x, y, w, h };
+  }
+
+  function graphRectFromCenter(
+    center: { x: number; y: number },
+    size: { w: number; h: number },
+  ) {
+    return clampGraphRect({
+      x: center.x - size.w * 0.5,
+      y: center.y - size.h * 0.5,
+      w: size.w,
+      h: size.h,
+    });
+  }
+
+  function updatePageSurfaceCacheGraphs(next: SurfaceGraphObject[]) {
+    if (currentPageId == null) return;
+    const cached = pageSurfaceCache.get(currentPageId);
+    if (!cached) return;
+    cached.graphs = cloneGraphObjects(next);
+  }
+
+  function recordPageGraphHistory(
+    before: SurfaceGraphObject[],
+    after: SurfaceGraphObject[],
+  ) {
+    if (currentPageSurfaceId == null) return;
+    if (graphArraysEquivalent(before, after)) return;
+    pageGraphUndoStack = [
+      ...pageGraphUndoStack,
+      {
+        surfaceId: currentPageSurfaceId,
+        before: cloneGraphObjects(before),
+        after: cloneGraphObjects(after),
+      },
+    ];
+    pageGraphRedoStack = [];
+  }
+
+  async function applyPageGraphChange(
+    target: SurfaceGraphObject[],
+    options: { recordHistory?: boolean; beforeSnapshot?: SurfaceGraphObject[] } = {},
+  ): Promise<SurfaceGraphObject[] | null> {
+    if (currentPageSurfaceId == null) return null;
+    const before = options.beforeSnapshot ? cloneGraphObjects(options.beforeSnapshot) : cloneGraphObjects(pageGraphs);
+    const reconciled = await reconcileSurfaceGraphs(currentPageSurfaceId, pageGraphs, target);
+    pageGraphs = reconciled;
+    updatePageSurfaceCacheGraphs(reconciled);
+    if (options.recordHistory) {
+      recordPageGraphHistory(before, reconciled);
+    }
+    markDirty();
+    return reconciled;
+  }
+
+  function hitTestPageGraph(
+    point: { x: number; y: number },
+  ): { graphId: number; mode: "move" | "resize" } | null {
+    if (pageGraphs.length === 0) return null;
+    const handleNormX = pageSize.w > 0 ? (12 / camera.scale) / pageSize.w : 0.02;
+    const handleNormY = pageSize.h > 0 ? (12 / camera.scale) / pageSize.h : 0.02;
+
+    for (let index = pageGraphs.length - 1; index >= 0; index -= 1) {
+      const graph = pageGraphs[index];
+      if (graph.id == null) continue;
+      const x2 = graph.bboxX + graph.bboxW;
+      const y2 = graph.bboxY + graph.bboxH;
+      if (
+        point.x < graph.bboxX
+        || point.x > x2
+        || point.y < graph.bboxY
+        || point.y > y2
+      ) {
+        continue;
+      }
+
+      const nearHandle = Math.abs(point.x - x2) <= handleNormX && Math.abs(point.y - y2) <= handleNormY;
+      return { graphId: graph.id, mode: nearHandle ? "resize" : "move" };
+    }
+    return null;
+  }
+
+  async function deleteSelectedPageGraph() {
+    if (selectedPageGraphId == null) return;
+    const before = cloneGraphObjects(pageGraphs);
+    const target = pageGraphs.filter((graph) => graph.id !== selectedPageGraphId);
+    await applyPageGraphChange(target, {
+      recordHistory: true,
+      beforeSnapshot: before,
+    });
+    selectedPageGraphId = null;
+  }
+
+  function openGraphComposer(source: GraphModalSource) {
+    graphModalSource = source;
+    graphModalInitialGraph = null;
+    graphModalOpen = true;
+    showPenOptions = false;
+    showShapeOptions = false;
+    showChunkPenOptions = false;
+    showChunkShapeOptions = false;
+  }
+
+  function closeGraphComposer() {
+    graphModalOpen = false;
+  }
+
+  function onGraphModalInsertCanvas(spec: GraphSpec) {
+    const normalized = normaliseGraphSpec(spec);
+    if ((graphModalSource === "chunk" || graphModalSource === "glossary") && chunkView) {
+      pendingGraphPlacement = { scope: "chunk", spec: normalized };
+      closeGraphComposer();
+      return;
+    }
+    pendingGraphPlacement = { scope: "page", spec: normalized };
+    closeGraphComposer();
+  }
+
+  function onGraphModalInsertGlossary(spec: GraphSpec) {
+    if (!chunkView) {
+      closeGraphComposer();
+      return;
+    }
+    insertGraphFenceIntoGlossary(spec);
+    closeGraphComposer();
+  }
+
+  function updatePageGraphInState(graphId: number, next: SurfaceGraphObject) {
+    pageGraphs = pageGraphs.map((graph) => (graph.id === graphId ? next : graph));
+    updatePageSurfaceCacheGraphs(pageGraphs);
+    markDirty();
+  }
+
+  async function placePendingPageGraphAt(point: { x: number; y: number }): Promise<boolean> {
+    if (!pendingGraphPlacement || pendingGraphPlacement.scope !== "page") return false;
+    const rect = graphRectFromCenter(point, PAGE_GRAPH_DEFAULT_SIZE);
+    const graph = buildGraphObjectFromSpec(pendingGraphPlacement.spec, rect);
+    const before = cloneGraphObjects(pageGraphs);
+    const target = [...before, graph];
+    try {
+      const applied = await applyPageGraphChange(target, {
+        recordHistory: true,
+        beforeSnapshot: before,
+      });
+      if (applied && applied.length > 0) {
+        selectedPageGraphId = applied[applied.length - 1].id;
+      }
+      selectedStrokes = new Set();
+      selection = null;
+    } catch (err) {
+      void appLogWarn(`[graph] failed to place page graph: ${formatLogError(err)}`);
+    } finally {
+      pendingGraphPlacement = null;
+    }
+    return true;
+  }
+
   function clearSelectionState() {
     selectedStrokes = new Set();
     selection = null;
+    selectedPageGraphId = null;
+    pageGraphDrag = null;
   }
 
   function activateDrawTool() {
@@ -991,6 +1420,7 @@
     selectOrigin = null;
     selectRect = null;
     shapeDraft = null;
+    if (pendingGraphPlacement?.scope === "page") pendingGraphPlacement = null;
     showPenOptions = wasDrawMode ? !showPenOptions : true;
     showShapeOptions = false;
     markDirty();
@@ -1006,8 +1436,18 @@
     currentStroke = [];
     predictedPoints = [];
     shapeDraft = null;
+    if (pendingGraphPlacement?.scope === "page") pendingGraphPlacement = null;
     showPenOptions = false;
     showShapeOptions = wasShapeMode ? !showShapeOptions : true;
+    markDirty();
+  }
+
+  function activateGraphTool() {
+    clearSelectionState();
+    selectOrigin = null;
+    selectRect = null;
+    shapeDraft = null;
+    openGraphComposer("page");
     markDirty();
   }
 
@@ -1019,6 +1459,7 @@
     selectOrigin = null;
     selectRect = null;
     shapeDraft = null;
+    if (pendingGraphPlacement?.scope === "page") pendingGraphPlacement = null;
     markDirty();
   }
 
@@ -1030,6 +1471,7 @@
     selectOrigin = null;
     selectRect = null;
     shapeDraft = null;
+    if (pendingGraphPlacement?.scope === "page") pendingGraphPlacement = null;
     markDirty();
   }
 
@@ -1112,9 +1554,15 @@
 
   function onPointerDown(e: PointerEvent) {
     if (e.pointerType === 'touch') {
+      if (pendingGraphPlacement?.scope === "page") {
+        const { x, y } = pointerToNorm(e.clientX, e.clientY);
+        void placePendingPageGraphAt({ x, y });
+        e.preventDefault();
+        return;
+      }
       touchPointers = touchPointers.filter(p => p.id !== e.pointerId);
       touchPointers = [...touchPointers, { id: e.pointerId, x: e.clientX, y: e.clientY }];
-      if (touchPointers.length === 1 && mode !== 'erase') {
+      if (touchPointers.length === 1 && mode !== 'erase' && mode !== 'select') {
         const { x, y } = pointerToNorm(e.clientX, e.clientY);
         const hit = chunkAt(x, y);
         if (hit) beginPendingChunkTap(e, hit);
@@ -1135,7 +1583,14 @@
     if (!isPenOrMouse(e)) return;
     if (activePointerId !== null) return;
 
-    if (mode !== 'erase') {
+    if (pendingGraphPlacement?.scope === "page") {
+      const { x, y } = pointerToNorm(e.clientX, e.clientY);
+      void placePendingPageGraphAt({ x, y });
+      e.preventDefault();
+      return;
+    }
+
+    if (mode !== 'erase' && mode !== 'select') {
       const { x, y } = pointerToNorm(e.clientX, e.clientY);
       const hit = chunkAt(x, y);
       if (hit) {
@@ -1160,6 +1615,34 @@
       activePointerId = e.pointerId;
       wetCanvas.setPointerCapture(e.pointerId);
       const { x, y } = pointerToNorm(e.clientX, e.clientY);
+      const graphHit = hitTestPageGraph({ x, y });
+      if (graphHit) {
+        const graph = pageGraphs.find((entry) => entry.id === graphHit.graphId);
+        if (graph) {
+          selectedPageGraphId = graphHit.graphId;
+          selectedStrokes = new Set();
+          selection = {
+            x: graph.bboxX,
+            y: graph.bboxY,
+            width: graph.bboxW,
+            height: graph.bboxH,
+          };
+          pageGraphDrag = {
+            graphId: graphHit.graphId,
+            mode: graphHit.mode,
+            startPoint: { x, y },
+            startGraph: cloneGraphObject(graph),
+            beforeSnapshot: cloneGraphObjects(pageGraphs),
+          };
+          selectOrigin = null;
+          selectRect = null;
+          markDirty();
+          e.preventDefault();
+          return;
+        }
+      }
+      selectedPageGraphId = null;
+      pageGraphDrag = null;
       selectOrigin = { x, y };
       selectRect = null;
       selectedStrokes = new Set();
@@ -1252,6 +1735,8 @@
       if (mode === 'select') {
         selectOrigin = { x: pending.startPoint.x, y: pending.startPoint.y };
         selectedStrokes = new Set();
+        selectedPageGraphId = null;
+        pageGraphDrag = null;
         selection = null;
         const { x, y } = pointerToNorm(e.clientX, e.clientY);
         selectRect = {
@@ -1311,8 +1796,52 @@
     }
 
     if (mode === 'select') {
-      if (e.pointerId !== activePointerId || !selectOrigin) return;
+      if (e.pointerId !== activePointerId) return;
       e.preventDefault();
+      const drag = pageGraphDrag;
+      if (drag) {
+        const { x, y } = pointerToNorm(e.clientX, e.clientY);
+        const graph = pageGraphs.find((entry) => entry.id === drag.graphId);
+        if (!graph) return;
+
+        const deltaX = x - drag.startPoint.x;
+        const deltaY = y - drag.startPoint.y;
+        let rect = {
+          x: drag.startGraph.bboxX,
+          y: drag.startGraph.bboxY,
+          w: drag.startGraph.bboxW,
+          h: drag.startGraph.bboxH,
+        };
+
+        if (drag.mode === "move") {
+          rect = clampGraphRect({
+            x: drag.startGraph.bboxX + deltaX,
+            y: drag.startGraph.bboxY + deltaY,
+            w: drag.startGraph.bboxW,
+            h: drag.startGraph.bboxH,
+          });
+        } else {
+          rect = clampGraphRect({
+            x: drag.startGraph.bboxX,
+            y: drag.startGraph.bboxY,
+            w: drag.startGraph.bboxW + deltaX,
+            h: drag.startGraph.bboxH + deltaY,
+          });
+        }
+
+        const updated: SurfaceGraphObject = {
+          ...graph,
+          bboxX: rect.x,
+          bboxY: rect.y,
+          bboxW: rect.w,
+          bboxH: rect.h,
+        };
+        updatePageGraphInState(drag.graphId, updated);
+        selection = { x: rect.x, y: rect.y, width: rect.w, height: rect.h };
+        return;
+      }
+
+      if (!selectOrigin) return;
       const { x, y } = pointerToNorm(e.clientX, e.clientY);
       selectRect = {
         x: Math.min(selectOrigin.x, x),
@@ -1395,8 +1924,28 @@
     if (mode === 'select') {
       if (e.pointerId !== activePointerId) return;
       activePointerId = null;
+      if (pageGraphDrag) {
+        const before = cloneGraphObjects(pageGraphDrag.beforeSnapshot);
+        const target = cloneGraphObjects(pageGraphs);
+        const changed = !graphArraysEquivalent(before, target);
+        if (changed) {
+          void applyPageGraphChange(target, {
+            recordHistory: true,
+            beforeSnapshot: before,
+          }).catch((err) => {
+            void appLogWarn(`[graph] failed to save page graph update: ${formatLogError(err)}`);
+          });
+        }
+        pageGraphDrag = null;
+        selectOrigin = null;
+        selectRect = null;
+        markDirty();
+        e.preventDefault();
+        return;
+      }
       if (selectRect) {
         selectedStrokes = hitTestStrokes(selectRect);
+        selectedPageGraphId = null;
         selection = unionBBox(selectedStrokes) ?? { x: selectRect.x, y: selectRect.y, width: selectRect.w, height: selectRect.h };
       }
       selectOrigin = null;
@@ -1470,6 +2019,7 @@
       activePointerId = null;
       selectOrigin = null;
       selectRect = null;
+      pageGraphDrag = null;
       shapeDraft = null;
       markDirty();
       return;
@@ -1597,6 +2147,34 @@
         stroke.bbox.maxY < visMinY || stroke.bbox.minY > visMaxY
       ) continue;
       drawStrokePoints(ctx, stroke.points, stroke.colour, stroke.thickness, 0);
+    }
+
+    for (const graph of pageGraphs) {
+      const minX = graph.bboxX;
+      const minY = graph.bboxY;
+      const maxX = graph.bboxX + graph.bboxW;
+      const maxY = graph.bboxY + graph.bboxH;
+      if (
+        maxX < visMinX || minX > visMaxX ||
+        maxY < visMinY || minY > visMaxY
+      ) continue;
+
+      const worldX = pageOrigin.x + graph.bboxX * pageSize.w;
+      const worldY = pageOrigin.y + graph.bboxY * pageSize.h;
+      const worldW = graph.bboxW * pageSize.w;
+      const worldH = graph.bboxH * pageSize.h;
+      drawGraphCard(
+        ctx,
+        graphObjectToSpec(graph),
+        worldX,
+        worldY,
+        worldW,
+        worldH,
+        {
+          selected: selectedPageGraphId != null && graph.id === selectedPageGraphId,
+          showResizeHandle: mode === "select" && selectedPageGraphId != null && graph.id === selectedPageGraphId,
+        },
+      );
     }
 
     // Draw selection highlight on dry canvas
@@ -2157,6 +2735,148 @@
     void appLogInfo(`[library] loaded ${sourceDocuments.length} documents`);
   }
 
+  function syncPastPaperInstructionInputs(book: SourceDocument | null) {
+    if (!book || book.document_mode !== "past_paper") {
+      pastPaperInstructionPagesEnabled = true;
+      pastPaperInstructionStartInput = "1";
+      pastPaperInstructionEndInput = "1";
+      pastPaperInstructionError = null;
+      pastPaperInstructionFeedback = null;
+      pastPaperInstructionCheckError = null;
+      pastPaperInstructionCheckFeedback = null;
+      pastPaperInstructionCheckPreview = null;
+      return;
+    }
+    if (book.instruction_page_start != null && book.instruction_page_end != null) {
+      pastPaperInstructionPagesEnabled = true;
+      pastPaperInstructionStartInput = `${book.instruction_page_start}`;
+      pastPaperInstructionEndInput = `${book.instruction_page_end}`;
+    } else {
+      pastPaperInstructionPagesEnabled = false;
+      pastPaperInstructionStartInput = "1";
+      pastPaperInstructionEndInput = "1";
+    }
+    pastPaperInstructionError = null;
+    pastPaperInstructionFeedback = null;
+    pastPaperInstructionCheckError = null;
+    pastPaperInstructionCheckFeedback = null;
+    pastPaperInstructionCheckPreview = null;
+  }
+
+  function applyUpdatedSourceDocument(updated: SourceDocument) {
+    sourceDocuments = sourceDocuments.map((doc) => doc.id === updated.id ? updated : doc);
+    if (selectedBook?.id === updated.id) {
+      selectedBook = updated;
+      syncPastPaperInstructionInputs(updated);
+    }
+  }
+
+  async function savePastPaperInstructionRange() {
+    const book = selectedBook;
+    if (!book || book.document_mode !== "past_paper" || pastPaperInstructionSaving) return;
+
+    pastPaperInstructionError = null;
+    pastPaperInstructionFeedback = null;
+    pastPaperInstructionCheckError = null;
+    pastPaperInstructionCheckFeedback = null;
+    pastPaperInstructionCheckPreview = null;
+    pastPaperInstructionSaving = true;
+    try {
+      let startPage: number | null = null;
+      let endPage: number | null = null;
+      if (pastPaperInstructionPagesEnabled) {
+        const start = parseBatchChunkPageInput(pastPaperInstructionStartInput);
+        const end = parseBatchChunkPageInput(pastPaperInstructionEndInput);
+        if (start == null || end == null) {
+          throw new Error("Enter valid instruction page numbers.");
+        }
+        if (start > end) {
+          throw new Error("Instruction start page must be less than or equal to end page.");
+        }
+        if (totalPages > 0 && end > totalPages) {
+          throw new Error(`Instruction range must be within 1-${totalPages}.`);
+        }
+        startPage = start;
+        endPage = end;
+      }
+
+      const updated = await invoke<SourceDocument>("save_past_paper_instruction_range", {
+        sourceDocumentId: book.id,
+        startPage,
+        endPage,
+      });
+      applyUpdatedSourceDocument(updated);
+      if (startPage == null || endPage == null) {
+        pastPaperInstructionFeedback = "Saved: no instruction pages.";
+      } else {
+        pastPaperInstructionFeedback = `Saved instruction pages ${startPage}-${endPage}.`;
+      }
+      await appLogInfo(
+        `[past-paper] instruction range saved doc=${book.id} start=${startPage ?? "none"} end=${endPage ?? "none"}`,
+      );
+    } catch (err) {
+      pastPaperInstructionError = formatLogError(err);
+      await appLogWarn(`[past-paper] instruction range save failed: ${pastPaperInstructionError}`);
+    } finally {
+      pastPaperInstructionSaving = false;
+    }
+  }
+
+  function formatPageNumbersForDebug(pages: number[]): string {
+    if (pages.length === 0) return "none";
+    if (pages.length <= 10) return pages.join(", ");
+    return `${pages.slice(0, 10).join(", ")}, ...`;
+  }
+
+  async function checkPastPaperInstructionContext() {
+    const book = selectedBook;
+    if (!book || book.document_mode !== "past_paper" || pastPaperInstructionCheckLoading) return;
+
+    pastPaperInstructionCheckError = null;
+    pastPaperInstructionCheckFeedback = null;
+    pastPaperInstructionCheckPreview = null;
+    pastPaperInstructionCheckLoading = true;
+    try {
+      const summary = await invoke<PastPaperInstructionContextDebug>(
+        "inspect_past_paper_instruction_context",
+        { sourceDocumentId: book.id },
+      );
+
+      const configuredRange = summary.instruction_page_start == null || summary.instruction_page_end == null
+        ? "none"
+        : `${summary.instruction_page_start}-${summary.instruction_page_end}`;
+      const expectedCount = summary.expected_instruction_pages.length;
+      const extractedCount = summary.extracted_instruction_pages.length;
+      const missingCount = summary.missing_instruction_pages.length;
+
+      pastPaperInstructionCheckFeedback =
+        `Configured range: ${configuredRange}. Extracted instruction pages: ${extractedCount}/${expectedCount}. ` +
+        `Instruction blocks: ${summary.instruction_block_count} (${summary.instruction_transcribed_block_count} transcribed). ` +
+        `Chunking status: ${summary.chunking_status}.`;
+      pastPaperInstructionCheckPreview = summary.preview_text.trim().length > 0
+        ? summary.preview_text.trim()
+        : null;
+
+      if (missingCount > 0) {
+        pastPaperInstructionCheckError =
+          `Missing extracted instruction pages: ${formatPageNumbersForDebug(summary.missing_instruction_pages)}. ` +
+          `Run chunking on those pages first.`;
+      } else if (summary.instruction_page_start != null && summary.instruction_block_count === 0) {
+        pastPaperInstructionCheckError =
+          "No instruction text blocks were found in the configured range. Check the range and OCR extraction.";
+      }
+
+      await appLogInfo(
+        `[past-paper] instruction context check doc=${book.id} range=${configuredRange} extracted_pages=${extractedCount}/${expectedCount} blocks=${summary.instruction_block_count} missing=${missingCount}`,
+      );
+    } catch (err) {
+      pastPaperInstructionCheckError = formatLogError(err);
+      await appLogWarn(`[past-paper] instruction context check failed: ${pastPaperInstructionCheckError}`);
+    } finally {
+      pastPaperInstructionCheckLoading = false;
+    }
+  }
+
   async function importPdf(documentMode: DocumentMode = "textbook") {
     error = null;
     importing = true;
@@ -2192,11 +2912,20 @@
     pendingChunkTap = null;
     void appLogInfo(`[viewer] opening doc=${book.id} title="${book.title}"`);
     selectedBook = book;
+    syncPastPaperInstructionInputs(book);
     currentPage = loadSavedPage(book.id);
     currentPageId = null;
+    currentPageSurfaceId = null;
     totalPages = 0;
     strokes = [];
     redoStack = [];
+    pageGraphs = [];
+    selectedPageGraphId = null;
+    pageGraphDrag = null;
+    pageGraphUndoStack = [];
+    pageGraphRedoStack = [];
+    pendingGraphPlacement = null;
+    graphModalOpen = false;
     selectedStrokes = new Set();
     selection = null;
     currentPdfBitmap = null;
@@ -2209,6 +2938,8 @@
     reChunkingPage = false;
     clearChunkPageCaches();
     chunkSurfaceCache.clear();
+    pageSurfaceCache.clear();
+    pageSurfaceRequests.clear();
 
     // Get page count from backend
     try {
@@ -2235,8 +2966,15 @@
     pendingChunkTap = null;
     currentPage = clamped;
     currentPageId = null;
+    currentPageSurfaceId = null;
     strokes = [];
     redoStack = [];
+    pageGraphs = [];
+    selectedPageGraphId = null;
+    pageGraphDrag = null;
+    pageGraphUndoStack = [];
+    pageGraphRedoStack = [];
+    pendingGraphPlacement = null;
     selectedStrokes = new Set();
     selection = null;
     currentChunks = [];
@@ -2289,11 +3027,20 @@
     pendingChunkTap = null;
     batchChunkProgress = null;
     selectedBook = null;
+    syncPastPaperInstructionInputs(null);
     currentPage = 1;
     currentPageId = null;
+    currentPageSurfaceId = null;
     totalPages = 0;
     strokes = [];
     redoStack = [];
+    pageGraphs = [];
+    selectedPageGraphId = null;
+    pageGraphDrag = null;
+    pageGraphUndoStack = [];
+    pageGraphRedoStack = [];
+    pendingGraphPlacement = null;
+    graphModalOpen = false;
     selectedStrokes = new Set();
     selection = null;
     currentPdfBitmap = null;
@@ -2306,12 +3053,26 @@
     reChunkingPage = false;
     clearChunkPageCaches();
     chunkSurfaceCache.clear();
+    pageSurfaceCache.clear();
+    pageSurfaceRequests.clear();
     chunkView = null;
   }
 
   // â”€â”€ Undo / Redo â”€â”€
 
   async function undoStroke() {
+    if (pageGraphUndoStack.length > 0) {
+      const entry = pageGraphUndoStack[pageGraphUndoStack.length - 1];
+      pageGraphUndoStack = pageGraphUndoStack.slice(0, -1);
+      try {
+        await applyPageGraphChange(entry.before, { recordHistory: false });
+        pageGraphRedoStack = [...pageGraphRedoStack, entry];
+        selectedPageGraphId = null;
+      } catch (err) {
+        void appLogWarn(`[graph] undo failed: ${formatLogError(err)}`);
+      }
+      return;
+    }
     if (strokes.length === 0) return;
     const removed = getTrailingStrokeGroup(strokes);
     if (removed.length === 0) return;
@@ -2325,6 +3086,18 @@
   }
 
   async function redoStroke() {
+    if (pageGraphRedoStack.length > 0) {
+      const entry = pageGraphRedoStack[pageGraphRedoStack.length - 1];
+      pageGraphRedoStack = pageGraphRedoStack.slice(0, -1);
+      try {
+        await applyPageGraphChange(entry.after, { recordHistory: false });
+        pageGraphUndoStack = [...pageGraphUndoStack, entry];
+        selectedPageGraphId = null;
+      } catch (err) {
+        void appLogWarn(`[graph] redo failed: ${formatLogError(err)}`);
+      }
+      return;
+    }
     if (redoStack.length === 0) return;
     const entry = redoStack[redoStack.length - 1];
     redoStack = redoStack.slice(0, -1);
@@ -2349,6 +3122,10 @@
   // â”€â”€ Delete selected â”€â”€
 
   async function deleteSelected() {
+    if (selectedPageGraphId != null) {
+      await deleteSelectedPageGraph();
+      return;
+    }
     if (selectedStrokes.size === 0) return;
     const deleted = [...selectedStrokes];
     if (currentPageId !== null) cacheEvict(currentPageId);
@@ -2463,6 +3240,24 @@
             stroke.bbox.maxY < selection.y || stroke.bbox.minY > selection.y + selection.height) continue;
         drawStrokePoints(inkCtx as unknown as CanvasRenderingContext2D, stroke.points, stroke.colour, stroke.thickness, 0);
       }
+      for (const graph of pageGraphs) {
+        const x2 = graph.bboxX + graph.bboxW;
+        const y2 = graph.bboxY + graph.bboxH;
+        if (
+          x2 < selection.x || graph.bboxX > selection.x + selection.width
+          || y2 < selection.y || graph.bboxY > selection.y + selection.height
+        ) {
+          continue;
+        }
+        drawGraphCard(
+          inkCtx as unknown as CanvasRenderingContext2D,
+          graphObjectToSpec(graph),
+          pageOrigin.x + graph.bboxX * pageSize.w,
+          pageOrigin.y + graph.bboxY * pageSize.h,
+          graph.bboxW * pageSize.w,
+          graph.bboxH * pageSize.h,
+        );
+      }
       ctx.drawImage(inkCanvas, 0, 0);
     }
 
@@ -2546,6 +3341,25 @@
       );
     }
 
+    for (const graph of chunkView.graphs) {
+      const x2 = graph.bboxX + graph.bboxW;
+      const y2 = graph.bboxY + graph.bboxH;
+      if (
+        x2 < cropMinX || graph.bboxX > cropMaxX
+        || y2 < cropMinY || graph.bboxY > cropMaxY
+      ) {
+        continue;
+      }
+      drawGraphCard(
+        ctx as unknown as CanvasRenderingContext2D,
+        graphObjectToSpec(graph),
+        (graph.bboxX - cropMinX) * pxPerNormX,
+        (graph.bboxY - cropMinY) * pxPerNormY,
+        graph.bboxW * pxPerNormX,
+        graph.bboxH * pxPerNormY,
+      );
+    }
+
     const blob = await offscreen.convertToBlob({ type: "image/png" });
     return blobToBase64(blob);
   }
@@ -2611,9 +3425,72 @@
     max_y: number;
   }
 
+  interface SurfaceGraphObjectOutput {
+    id: number;
+    surface_id: number;
+    mode: "equation" | "points";
+    equation: string | null;
+    points_json: string | null;
+    x_min: number;
+    x_max: number;
+    y_min: number;
+    y_max: number;
+    bbox_x: number;
+    bbox_y: number;
+    bbox_w: number;
+    bbox_h: number;
+    line_colour: string;
+    line_width: number;
+  }
+
+  interface SurfaceGraphObject {
+    id: number | null;
+    mode: "equation" | "points";
+    equation: string | null;
+    pointsJson: string | null;
+    xMin: number;
+    xMax: number;
+    yMin: number;
+    yMax: number;
+    bboxX: number;
+    bboxY: number;
+    bboxW: number;
+    bboxH: number;
+    lineColour: string;
+    lineWidth: number;
+  }
+
+  interface SurfaceGraphCacheEntry {
+    surfaceId: number;
+    graphs: SurfaceGraphObject[];
+  }
+
+  interface GraphHistoryEntry {
+    surfaceId: number;
+    before: SurfaceGraphObject[];
+    after: SurfaceGraphObject[];
+  }
+
+  interface GraphPointerDrag {
+    graphId: number;
+    mode: "move" | "resize";
+    startPoint: { x: number; y: number };
+    startGraph: SurfaceGraphObject;
+    beforeSnapshot: SurfaceGraphObject[];
+  }
+
+  type GraphModalSource = "page" | "chunk" | "glossary";
+  type GraphPlacementScope = "page" | "chunk";
+
+  interface PendingGraphPlacement {
+    scope: GraphPlacementScope;
+    spec: GraphSpec;
+  }
+
   interface ChunkSurfaceCache {
     surfaceId: number;
     strokes: Stroke[];
+    graphs: SurfaceGraphObject[];
   }
 
   const CHUNK_COLOURS: Record<string, { accent: string; tint: string; label: string; short: string }> = {
@@ -2637,6 +3514,10 @@
   let chunkSelectOrigin = $state<{ x: number; y: number } | null>(null);
   let chunkSelectRect = $state<Rect | null>(null);
   let chunkSelectedStrokes = $state<Set<Stroke>>(new Set());
+  let chunkSelectedGraphId = $state<number | null>(null);
+  let chunkGraphDrag = $state<GraphPointerDrag | null>(null);
+  let chunkGraphUndoStack = $state<GraphHistoryEntry[]>([]);
+  let chunkGraphRedoStack = $state<GraphHistoryEntry[]>([]);
   let chunkSelection = $state<{ x: number; y: number; width: number; height: number } | null>(null);
   const CHUNK_LEFT_PANEL_DEFAULT_WIDTH = 360;
   const CHUNK_LEFT_PANEL_MIN_WIDTH = 260;
@@ -2644,6 +3525,11 @@
   let chunkLeftPanelWidth = $state(CHUNK_LEFT_PANEL_DEFAULT_WIDTH);
   let chunkSheet = $state<HTMLDivElement>(null!);
   let chunkResizingPointerId: number | null = null;
+  let questionAvailableMarksDraft = $state("");
+  let questionAvailableMarksEditing = $state(false);
+  let questionAvailableMarksSaving = $state(false);
+  let questionAvailableMarksError = $state<string | null>(null);
+  let questionAvailableMarksInputEl = $state<HTMLInputElement>(null!);
   let questionAchievedMarksDraft = $state("");
   let questionAchievedMarksSaving = $state(false);
   let questionAchievedMarksError = $state<string | null>(null);
@@ -2664,6 +3550,8 @@
     chunkSelectOrigin = null;
     chunkSelectRect = null;
     chunkSelectedStrokes = new Set();
+    chunkSelectedGraphId = null;
+    chunkGraphDrag = null;
     chunkSelection = null;
   }
 
@@ -2672,6 +3560,7 @@
     chunkMode = 'draw';
     clearChunkSelectionState();
     chunkShapeDraft = null;
+    if (pendingGraphPlacement?.scope === "chunk") pendingGraphPlacement = null;
     showChunkPenOptions = wasDrawMode ? !showChunkPenOptions : true;
     showChunkShapeOptions = false;
     redrawChunkCanvases();
@@ -2684,8 +3573,18 @@
     chunkIsDrawing = false;
     chunkCurrentStroke = [];
     chunkShapeDraft = null;
+    if (pendingGraphPlacement?.scope === "chunk") pendingGraphPlacement = null;
     showChunkPenOptions = false;
     showChunkShapeOptions = wasShapeMode ? !showChunkShapeOptions : true;
+    redrawChunkCanvases();
+  }
+
+  function activateChunkGraphTool() {
+    clearChunkSelectionState();
+    chunkIsDrawing = false;
+    chunkCurrentStroke = [];
+    chunkShapeDraft = null;
+    openGraphComposer("chunk");
     redrawChunkCanvases();
   }
 
@@ -2695,6 +3594,7 @@
     showChunkPenOptions = false;
     showChunkShapeOptions = false;
     chunkShapeDraft = null;
+    if (pendingGraphPlacement?.scope === "chunk") pendingGraphPlacement = null;
     redrawChunkCanvases();
   }
 
@@ -2704,6 +3604,7 @@
     showChunkPenOptions = false;
     showChunkShapeOptions = false;
     chunkShapeDraft = null;
+    if (pendingGraphPlacement?.scope === "chunk") pendingGraphPlacement = null;
     redrawChunkCanvases();
   }
 
@@ -2784,6 +3685,7 @@
   let glossarySaveError = $state<string | null>(null);
   let glossarySaveTimer: ReturnType<typeof setTimeout> | null = null;
   let glossaryPendingChunkId: number | null = null;
+  let glossaryTextareaEl = $state<HTMLTextAreaElement | null>(null);
   let glossaryHtml = $derived(renderChunkBodyHtml(glossaryDraft));
 
   async function flushGlossarySave() {
@@ -2833,23 +3735,61 @@
     scheduleGlossarySave();
   }
 
+  function insertGraphFenceIntoGlossary(spec: GraphSpec) {
+    const fence = graphSpecToFence(spec);
+    const textarea = glossaryTextareaEl;
+    if (
+      textarea
+      && glossaryMode === "edit"
+      && document.activeElement === textarea
+    ) {
+      const start = textarea.selectionStart ?? glossaryDraft.length;
+      const end = textarea.selectionEnd ?? start;
+      const prefix = glossaryDraft.slice(0, start);
+      const suffix = glossaryDraft.slice(end);
+      const separatorBefore = prefix.trim().length > 0 && !prefix.endsWith("\n\n") ? "\n\n" : "";
+      const separatorAfter = suffix.trim().length > 0 && !suffix.startsWith("\n") ? "\n\n" : "";
+      const inserted = `${separatorBefore}${fence}${separatorAfter}`;
+      glossaryDraft = `${prefix}${inserted}${suffix}`;
+      const caret = prefix.length + inserted.length;
+      void tick().then(() => {
+        textarea.focus();
+        textarea.setSelectionRange(caret, caret);
+      });
+    } else {
+      const sep = glossaryDraft.trim().length > 0 ? "\n\n" : "";
+      glossaryDraft = `${glossaryDraft}${sep}${fence}`;
+    }
+    scheduleGlossarySave();
+  }
+
+  function openGlossaryGraphComposer() {
+    openGraphComposer("glossary");
+  }
+
   let chunkView = $state<{
     chunk: ChunkInfo;
     pageNumber: number;
     surfaceId: number;
     strokes: Stroke[];
+    graphs: SurfaceGraphObject[];
   } | null>(null);
   const chunkGlossaryTabLabel = $derived(
     chunkView?.chunk.chunk_type === "question" ? "Answer" : "Glossary",
   );
   const chunkIsQuestion = $derived(chunkView?.chunk.chunk_type === "question");
-  const chunkMarksDisplay = $derived(() => {
+  const chunkAchievedMarksDisplay = $derived.by(() => {
+    if (!chunkView || chunkView.chunk.chunk_type !== "question") return null;
+    return chunkView.chunk.achieved_marks == null
+      ? "—"
+      : formatQuestionMarksValue(chunkView.chunk.achieved_marks);
+  });
+  const chunkMarksDisplay = $derived.by(() => {
     if (!chunkView || chunkView.chunk.chunk_type !== "question") return null;
     const available = chunkView.chunk.available_marks;
-    const achieved = chunkView.chunk.achieved_marks;
+    const achieved = chunkAchievedMarksDisplay ?? "—";
     const availableText = available == null ? "?" : `${available}`;
-    const achievedText = formatQuestionMarksValue(achieved);
-    return `${achievedText}/${availableText}`;
+    return `${achieved}/${availableText}`;
   });
   let chunkTitleDraft = $state("");
   let chunkBodyDraft = $state("");
@@ -4740,6 +5680,7 @@
     const req = (async () => {
       const surfaceId = await invoke<number>("get_or_create_chunk_surface", { chunkId });
       const raw = await invoke<SurfaceStrokeOutput[]>("load_surface_strokes", { surfaceId });
+      const rawGraphs = await invoke<SurfaceGraphObjectOutput[]>("load_surface_graph_objects", { surfaceId });
       const strokes: Stroke[] = raw.map(s => ({
         id: s.id,
         colour: s.colour,
@@ -4748,7 +5689,8 @@
         bbox: { minX: s.min_x, minY: s.min_y, maxX: s.max_x, maxY: s.max_y },
         chunkId,
       }));
-      const entry: ChunkSurfaceCache = { surfaceId, strokes };
+      const graphs = rawGraphs.map((graph) => graphOutputToObject(graph));
+      const entry: ChunkSurfaceCache = { surfaceId, strokes, graphs };
       chunkSurfaceCache.set(chunkId, entry);
       return entry;
     })();
@@ -4761,13 +5703,24 @@
   }
 
   function chunkAt(normX: number, normY: number): ChunkInfo | null {
+    let bestMatch: ChunkInfo | null = null;
+    let bestArea = Number.POSITIVE_INFINITY;
+
     for (const c of currentChunks) {
+      if (c.chunk_type === "noise") continue;
       if (
-        normX >= c.bbox_x && normX <= c.bbox_x + c.bbox_w &&
-        normY >= c.bbox_y && normY <= c.bbox_y + c.bbox_h
-      ) return c;
+        normX < c.bbox_x || normX > c.bbox_x + c.bbox_w ||
+        normY < c.bbox_y || normY > c.bbox_y + c.bbox_h
+      ) continue;
+
+      const area = Math.max(0, c.bbox_w) * Math.max(0, c.bbox_h);
+      if (!bestMatch || area < bestArea) {
+        bestMatch = c;
+        bestArea = area;
+      }
     }
-    return null;
+
+    return bestMatch;
   }
 
   function chunkHasFormattedBody(chunk: ChunkInfo): boolean {
@@ -5033,6 +5986,72 @@
     }
   }
 
+  function beginQuestionAvailableMarksEdit() {
+    const view = chunkView;
+    if (!view || view.chunk.chunk_type !== "question" || questionAvailableMarksSaving) return;
+    questionAvailableMarksEditing = true;
+    questionAvailableMarksError = null;
+    questionAvailableMarksDraft = view.chunk.available_marks == null
+      ? ""
+      : `${view.chunk.available_marks}`;
+    void tick().then(() => {
+      questionAvailableMarksInputEl?.focus();
+      questionAvailableMarksInputEl?.select();
+    });
+  }
+
+  function cancelQuestionAvailableMarksEdit() {
+    const view = chunkView;
+    if (view?.chunk.chunk_type === "question") {
+      questionAvailableMarksDraft = view.chunk.available_marks == null
+        ? ""
+        : `${view.chunk.available_marks}`;
+    } else {
+      questionAvailableMarksDraft = "";
+    }
+    questionAvailableMarksEditing = false;
+    questionAvailableMarksError = null;
+  }
+
+  async function saveQuestionAvailableMarks() {
+    const view = chunkView;
+    if (!view || view.chunk.chunk_type !== "question" || questionAvailableMarksSaving) return;
+
+    const draft = questionAvailableMarksDraft.trim();
+    const parsed = draft.length === 0 ? null : Number(draft);
+    if (parsed != null && (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 0)) {
+      questionAvailableMarksError = "Enter a non-negative whole number.";
+      return;
+    }
+
+    questionAvailableMarksSaving = true;
+    questionAvailableMarksError = null;
+    try {
+      await invoke("save_question_available_marks", {
+        chunkId: view.chunk.id,
+        availableMarks: parsed,
+      });
+      currentChunks = currentChunks.map((chunk) =>
+        chunk.id === view.chunk.id
+          ? { ...chunk, available_marks: parsed }
+          : chunk,
+      );
+      if (chunkView?.chunk.id === view.chunk.id) {
+        chunkView = {
+          ...chunkView,
+          chunk: { ...chunkView.chunk, available_marks: parsed },
+        };
+      }
+      questionAvailableMarksDraft = parsed == null ? "" : `${parsed}`;
+      questionAvailableMarksEditing = false;
+    } catch (err) {
+      questionAvailableMarksError = formatLogError(err);
+      await appLogWarn(`[question] save available marks failed chunkId=${view.chunk.id}: ${questionAvailableMarksError}`);
+    } finally {
+      questionAvailableMarksSaving = false;
+    }
+  }
+
   async function saveQuestionAchievedMarks() {
     const view = chunkView;
     if (!view || view.chunk.chunk_type !== "question" || questionAchievedMarksSaving) return;
@@ -5183,11 +6202,14 @@
     chunkLastPinchMid = { x: 0, y: 0 };
     chunkShapeDraft = null;
     clearChunkSelectionState();
+    chunkGraphUndoStack = [];
+    chunkGraphRedoStack = [];
     chunkView = {
       chunk,
       pageNumber,
       surfaceId: cache.surfaceId,
       strokes: [...cache.strokes],
+      graphs: cloneGraphObjects(cache.graphs),
     };
     chunkNavigationPageChunks = pageChunks;
     chunkTitleDraft = chunk.title ?? "";
@@ -5227,6 +6249,12 @@
     glossaryRewriteSuggestion = null;
     glossaryRewriteLoading = false;
     glossaryRewriteApplying = false;
+    questionAvailableMarksDraft = chunk.available_marks == null
+      ? ""
+      : `${chunk.available_marks}`;
+    questionAvailableMarksEditing = false;
+    questionAvailableMarksSaving = false;
+    questionAvailableMarksError = null;
     questionAchievedMarksDraft = chunk.achieved_marks == null
       ? ""
       : formatQuestionMarksValue(chunk.achieved_marks);
@@ -5267,7 +6295,10 @@
         `[chunk] close chunkId=${chunkView.chunk.id} strokes=${chunkView.strokes.length}`,
       );
       const cached = chunkSurfaceCache.get(chunkView.chunk.id);
-      if (cached) cached.strokes = [...chunkView.strokes];
+      if (cached) {
+        cached.strokes = [...chunkView.strokes];
+        cached.graphs = cloneGraphObjects(chunkView.graphs);
+      }
     }
     chunkView = null;
     chunkNavigationPageChunks = [];
@@ -5291,6 +6322,14 @@
     chunkLastPinchDist = 0;
     chunkLastPinchMid = { x: 0, y: 0 };
     clearChunkSelectionState();
+    chunkGraphUndoStack = [];
+    chunkGraphRedoStack = [];
+    if (pendingGraphPlacement?.scope === "chunk") {
+      pendingGraphPlacement = null;
+    }
+    if (graphModalOpen && (graphModalSource === "chunk" || graphModalSource === "glossary")) {
+      graphModalOpen = false;
+    }
     redoStack = [];
     chunkTitleEditing = false;
     chunkBodyEditing = false;
@@ -5307,6 +6346,10 @@
     glossaryRewriteSuggestion = null;
     glossaryRewriteLoading = false;
     glossaryRewriteApplying = false;
+    questionAvailableMarksDraft = "";
+    questionAvailableMarksEditing = false;
+    questionAvailableMarksSaving = false;
+    questionAvailableMarksError = null;
     questionAchievedMarksDraft = "";
     questionAchievedMarksSaving = false;
     questionAchievedMarksError = null;
@@ -5415,6 +6458,110 @@
         console.error("save_surface_stroke failed", err);
       }
     }
+  }
+
+  function updateChunkSurfaceCacheGraphs(next: SurfaceGraphObject[]) {
+    if (!chunkView) return;
+    const cached = chunkSurfaceCache.get(chunkView.chunk.id);
+    if (!cached) return;
+    cached.graphs = cloneGraphObjects(next);
+  }
+
+  function recordChunkGraphHistory(
+    before: SurfaceGraphObject[],
+    after: SurfaceGraphObject[],
+  ) {
+    if (!chunkView) return;
+    if (graphArraysEquivalent(before, after)) return;
+    chunkGraphUndoStack = [
+      ...chunkGraphUndoStack,
+      {
+        surfaceId: chunkView.surfaceId,
+        before: cloneGraphObjects(before),
+        after: cloneGraphObjects(after),
+      },
+    ];
+    chunkGraphRedoStack = [];
+  }
+
+  async function applyChunkGraphChange(
+    target: SurfaceGraphObject[],
+    options: { recordHistory?: boolean; beforeSnapshot?: SurfaceGraphObject[] } = {},
+  ): Promise<SurfaceGraphObject[] | null> {
+    if (!chunkView) return null;
+    const before = options.beforeSnapshot ? cloneGraphObjects(options.beforeSnapshot) : cloneGraphObjects(chunkView.graphs);
+    const reconciled = await reconcileSurfaceGraphs(chunkView.surfaceId, chunkView.graphs, target);
+    chunkView.graphs = reconciled;
+    updateChunkSurfaceCacheGraphs(reconciled);
+    if (options.recordHistory) {
+      recordChunkGraphHistory(before, reconciled);
+    }
+    clearChunkInkContextCache();
+    redrawChunkDry();
+    return reconciled;
+  }
+
+  function hitTestChunkGraph(
+    point: { x: number; y: number },
+  ): { graphId: number; mode: "move" | "resize" } | null {
+    if (!chunkView || chunkView.graphs.length === 0) return null;
+    const handleNormX = chunkSurfaceSize.w > 0 ? (12 / chunkCamera.scale) / chunkSurfaceSize.w : 0.03;
+    const handleNormY = chunkSurfaceSize.h > 0 ? (12 / chunkCamera.scale) / chunkSurfaceSize.h : 0.03;
+
+    for (let index = chunkView.graphs.length - 1; index >= 0; index -= 1) {
+      const graph = chunkView.graphs[index];
+      if (graph.id == null) continue;
+      const x2 = graph.bboxX + graph.bboxW;
+      const y2 = graph.bboxY + graph.bboxH;
+      if (point.x < graph.bboxX || point.x > x2 || point.y < graph.bboxY || point.y > y2) continue;
+      const nearHandle = Math.abs(point.x - x2) <= handleNormX && Math.abs(point.y - y2) <= handleNormY;
+      return { graphId: graph.id, mode: nearHandle ? "resize" : "move" };
+    }
+    return null;
+  }
+
+  function updateChunkGraphInState(graphId: number, next: SurfaceGraphObject) {
+    if (!chunkView) return;
+    chunkView.graphs = chunkView.graphs.map((graph) => (graph.id === graphId ? next : graph));
+    updateChunkSurfaceCacheGraphs(chunkView.graphs);
+    clearChunkInkContextCache();
+    redrawChunkDry();
+  }
+
+  async function placePendingChunkGraphAt(point: { x: number; y: number }): Promise<boolean> {
+    if (!chunkView) return false;
+    if (!pendingGraphPlacement || pendingGraphPlacement.scope !== "chunk") return false;
+    const rect = graphRectFromCenter(point, CHUNK_GRAPH_DEFAULT_SIZE);
+    const graph = buildGraphObjectFromSpec(pendingGraphPlacement.spec, rect);
+    const before = cloneGraphObjects(chunkView.graphs);
+    const target = [...before, graph];
+    try {
+      const applied = await applyChunkGraphChange(target, {
+        recordHistory: true,
+        beforeSnapshot: before,
+      });
+      if (applied && applied.length > 0) {
+        chunkSelectedGraphId = applied[applied.length - 1].id;
+      }
+      chunkSelectedStrokes = new Set();
+      chunkSelection = null;
+    } catch (err) {
+      console.warn("placePendingChunkGraphAt failed", err);
+    } finally {
+      pendingGraphPlacement = null;
+    }
+    return true;
+  }
+
+  async function deleteSelectedChunkGraph() {
+    if (!chunkView || chunkSelectedGraphId == null) return;
+    const before = cloneGraphObjects(chunkView.graphs);
+    const target = chunkView.graphs.filter((graph) => graph.id !== chunkSelectedGraphId);
+    await applyChunkGraphChange(target, {
+      recordHistory: true,
+      beforeSnapshot: before,
+    });
+    chunkSelectedGraphId = null;
   }
 
   let cachedChunkRect: DOMRect | null = null;
@@ -5634,6 +6781,31 @@
       ) continue;
       drawChunkStrokePoints(ctx, stroke.points, stroke.colour, stroke.thickness);
     }
+
+    for (const graph of chunkView.graphs) {
+      const minX = graph.bboxX * chunkSurfaceSize.w;
+      const minY = graph.bboxY * chunkSurfaceSize.h;
+      const maxX = (graph.bboxX + graph.bboxW) * chunkSurfaceSize.w;
+      const maxY = (graph.bboxY + graph.bboxH) * chunkSurfaceSize.h;
+      if (
+        maxX < visMinX || minX > visMaxX ||
+        maxY < visMinY || minY > visMaxY
+      ) continue;
+
+      drawGraphCard(
+        ctx,
+        graphObjectToSpec(graph),
+        minX,
+        minY,
+        graph.bboxW * chunkSurfaceSize.w,
+        graph.bboxH * chunkSurfaceSize.h,
+        {
+          selected: chunkSelectedGraphId != null && graph.id === chunkSelectedGraphId,
+          showResizeHandle: chunkMode === "select" && chunkSelectedGraphId != null && graph.id === chunkSelectedGraphId,
+        },
+      );
+    }
+
     if (chunkSelectedStrokes.size > 0) {
       for (const stroke of chunkSelectedStrokes) {
         if (stroke.points.length < 2) continue;
@@ -5698,6 +6870,13 @@
   function onChunkPointerDown(e: PointerEvent) {
     if (!chunkView) return;
     if (e.pointerType === "touch") {
+      if (pendingGraphPlacement?.scope === "chunk") {
+        const { x, y } = pointerToChunkWorld(e.clientX, e.clientY);
+        const point = chunkWorldToPoint(x, y);
+        void placePendingChunkGraphAt({ x: point.x, y: point.y });
+        e.preventDefault();
+        return;
+      }
       const local = chunkClientToScreen(e.clientX, e.clientY);
       chunkWetCanvas.setPointerCapture(e.pointerId);
       chunkTouchPointers = chunkTouchPointers.filter((p) => p.id !== e.pointerId);
@@ -5716,12 +6895,46 @@
     if (e.pointerType === "mouse" && e.button !== 0) return;
     if (chunkActivePointerId !== null) return;
 
-    chunkActivePointerId = e.pointerId;
-    chunkWetCanvas.setPointerCapture(e.pointerId);
     const { x, y } = pointerToChunkWorld(e.clientX, e.clientY);
     const point = chunkWorldToPoint(x, y);
+    if (pendingGraphPlacement?.scope === "chunk") {
+      void placePendingChunkGraphAt({ x: point.x, y: point.y });
+      e.preventDefault();
+      return;
+    }
+
+    chunkActivePointerId = e.pointerId;
+    chunkWetCanvas.setPointerCapture(e.pointerId);
 
     if (chunkMode === "select") {
+      const graphHit = hitTestChunkGraph({ x: point.x, y: point.y });
+      if (graphHit) {
+        const graph = chunkView.graphs.find((entry) => entry.id === graphHit.graphId);
+        if (graph) {
+          chunkSelectedGraphId = graphHit.graphId;
+          chunkSelectedStrokes = new Set();
+          chunkSelection = {
+            x: graph.bboxX,
+            y: graph.bboxY,
+            width: graph.bboxW,
+            height: graph.bboxH,
+          };
+          chunkGraphDrag = {
+            graphId: graphHit.graphId,
+            mode: graphHit.mode,
+            startPoint: { x: point.x, y: point.y },
+            startGraph: cloneGraphObject(graph),
+            beforeSnapshot: cloneGraphObjects(chunkView.graphs),
+          };
+          chunkSelectOrigin = null;
+          chunkSelectRect = null;
+          redrawChunkCanvases();
+          e.preventDefault();
+          return;
+        }
+      }
+      chunkSelectedGraphId = null;
+      chunkGraphDrag = null;
       chunkSelectOrigin = { x: point.x, y: point.y };
       chunkSelectRect = null;
       chunkSelectedStrokes = new Set();
@@ -5806,6 +7019,44 @@
       const latest = events[events.length - 1];
       const { x, y } = pointerToChunkWorld(latest.clientX, latest.clientY);
       const point = chunkWorldToPoint(x, y);
+      const drag = chunkGraphDrag;
+      if (drag) {
+        const graph = chunkView.graphs.find((entry) => entry.id === drag.graphId);
+        if (!graph) return;
+        const deltaX = point.x - drag.startPoint.x;
+        const deltaY = point.y - drag.startPoint.y;
+        let rect = {
+          x: drag.startGraph.bboxX,
+          y: drag.startGraph.bboxY,
+          w: drag.startGraph.bboxW,
+          h: drag.startGraph.bboxH,
+        };
+        if (drag.mode === "move") {
+          rect = clampGraphRect({
+            x: drag.startGraph.bboxX + deltaX,
+            y: drag.startGraph.bboxY + deltaY,
+            w: drag.startGraph.bboxW,
+            h: drag.startGraph.bboxH,
+          });
+        } else {
+          rect = clampGraphRect({
+            x: drag.startGraph.bboxX,
+            y: drag.startGraph.bboxY,
+            w: drag.startGraph.bboxW + deltaX,
+            h: drag.startGraph.bboxH + deltaY,
+          });
+        }
+        const updated: SurfaceGraphObject = {
+          ...graph,
+          bboxX: rect.x,
+          bboxY: rect.y,
+          bboxW: rect.w,
+          bboxH: rect.h,
+        };
+        updateChunkGraphInState(drag.graphId, updated);
+        chunkSelection = { x: rect.x, y: rect.y, width: rect.w, height: rect.h };
+        return;
+      }
       if (chunkSelectOrigin) {
         chunkSelectRect = {
           x: Math.min(chunkSelectOrigin.x, point.x),
@@ -5859,14 +7110,35 @@
     e.preventDefault();
     chunkActivePointerId = null;
     if (chunkMode === "select") {
+      if (chunkGraphDrag) {
+        const before = cloneGraphObjects(chunkGraphDrag.beforeSnapshot);
+        const target = cloneGraphObjects(chunkView.graphs);
+        const changed = !graphArraysEquivalent(before, target);
+        if (changed) {
+          void applyChunkGraphChange(target, {
+            recordHistory: true,
+            beforeSnapshot: before,
+          }).catch((err) => {
+            console.warn("applyChunkGraphChange failed", err);
+          });
+        }
+        chunkGraphDrag = null;
+        chunkSelectOrigin = null;
+        chunkSelectRect = null;
+        redrawChunkCanvases();
+        return;
+      }
       if (chunkSelectRect) {
         const hits = hitTestChunkStrokes(chunkSelectRect);
         chunkSelectedStrokes = hits;
+        chunkSelectedGraphId = null;
         chunkSelection = unionBBox(hits)
           ?? { x: chunkSelectRect.x, y: chunkSelectRect.y, width: chunkSelectRect.w, height: chunkSelectRect.h };
       } else {
         chunkSelectedStrokes = new Set();
-        chunkSelection = null;
+        if (chunkSelectedGraphId == null) {
+          chunkSelection = null;
+        }
       }
       chunkSelectOrigin = null;
       chunkSelectRect = null;
@@ -5934,6 +7206,7 @@
     if (chunkMode === "select") {
       chunkSelectOrigin = null;
       chunkSelectRect = null;
+      chunkGraphDrag = null;
       drawChunkWet();
       return;
     }
@@ -5965,7 +7238,20 @@
   }
 
   async function undoChunkStroke() {
-    if (!chunkView || chunkView.strokes.length === 0) return;
+    if (!chunkView) return;
+    if (chunkGraphUndoStack.length > 0) {
+      const entry = chunkGraphUndoStack[chunkGraphUndoStack.length - 1];
+      chunkGraphUndoStack = chunkGraphUndoStack.slice(0, -1);
+      try {
+        await applyChunkGraphChange(entry.before, { recordHistory: false });
+        chunkGraphRedoStack = [...chunkGraphRedoStack, entry];
+        chunkSelectedGraphId = null;
+      } catch (err) {
+        console.warn("chunk graph undo failed", err);
+      }
+      return;
+    }
+    if (chunkView.strokes.length === 0) return;
     const removed = getTrailingStrokeGroup(chunkView.strokes);
     if (removed.length === 0) return;
     chunkView.strokes = chunkView.strokes.slice(0, chunkView.strokes.length - removed.length);
@@ -5988,6 +7274,20 @@
       } catch (err) {
         console.error("delete_surface_stroke failed", err);
       }
+    }
+  }
+
+  async function redoChunkGraphAction() {
+    if (!chunkView) return;
+    if (chunkGraphRedoStack.length === 0) return;
+    const entry = chunkGraphRedoStack[chunkGraphRedoStack.length - 1];
+    chunkGraphRedoStack = chunkGraphRedoStack.slice(0, -1);
+    try {
+      await applyChunkGraphChange(entry.after, { recordHistory: false });
+      chunkGraphUndoStack = [...chunkGraphUndoStack, entry];
+      chunkSelectedGraphId = null;
+    } catch (err) {
+      console.warn("chunk graph redo failed", err);
     }
   }
 
@@ -6041,6 +7341,10 @@
   }
 
   async function deleteChunkSelectedStrokes() {
+    if (chunkSelectedGraphId != null) {
+      await deleteSelectedChunkGraph();
+      return;
+    }
     if (!chunkView || chunkSelectedStrokes.size === 0) return;
     const remove = [...chunkSelectedStrokes];
     chunkView.strokes = chunkView.strokes.filter((stroke) => !chunkSelectedStrokes.has(stroke));
@@ -6193,6 +7497,13 @@
       }
       return;
     }
+    if (graphModalOpen) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeGraphComposer();
+      }
+      return;
+    }
     if (!selectedBook) return;
     if (e.defaultPrevented) return;
     const eventTarget = e.target;
@@ -6209,6 +7520,12 @@
       if (e.key === "Escape") {
         e.preventDefault();
         closeChunkView();
+      } else if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "z" && !e.shiftKey) {
+        e.preventDefault();
+        await undoChunkStroke();
+      } else if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key.toLowerCase() === "y" || (e.shiftKey && e.key.toLowerCase() === "z"))) {
+        e.preventDefault();
+        await redoChunkGraphAction();
       } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key === "0") {
         e.preventDefault();
         restoreChunkHomeView();
@@ -6224,7 +7541,11 @@
       } else if (!e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key === "ArrowRight") {
         e.preventDefault();
         await navigateChunk(1);
-      } else if ((e.key === "Delete" || e.key === "Backspace") && chunkMode === "select" && chunkSelectedStrokes.size > 0) {
+      } else if (
+        (e.key === "Delete" || e.key === "Backspace")
+        && chunkMode === "select"
+        && (chunkSelectedStrokes.size > 0 || chunkSelectedGraphId != null)
+      ) {
         e.preventDefault();
         await deleteChunkSelectedStrokes();
       }
@@ -6237,7 +7558,11 @@
     } else if ((e.ctrlKey || e.metaKey) && (e.key === "y" || (e.shiftKey && e.key === "z"))) {
       e.preventDefault();
       await redoStroke();
-    } else if ((e.key === "Delete" || e.key === "Backspace") && mode === 'select' && selectedStrokes.size > 0) {
+    } else if (
+      (e.key === "Delete" || e.key === "Backspace")
+      && mode === "select"
+      && (selectedStrokes.size > 0 || selectedPageGraphId != null)
+    ) {
       e.preventDefault();
       await deleteSelected();
     } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
@@ -6658,7 +7983,44 @@
 	                  </div>
 	                  <div class="cpl-question-row">
 	                    <span class="cpl-question-label">Marks</span>
-	                    <span class="cpl-question-value">{chunkMarksDisplay ?? "?/?"}</span>
+	                    {#if questionAvailableMarksEditing}
+	                      <span class="cpl-question-value cpl-question-marks-editor">
+	                        <span class="cpl-question-marks-prefix">{chunkAchievedMarksDisplay ?? "—"}/</span>
+	                        <input
+	                          class="cpl-question-marks-input"
+	                          type="text"
+	                          inputmode="numeric"
+	                          pattern="[0-9]*"
+	                          placeholder="?"
+	                          bind:this={questionAvailableMarksInputEl}
+	                          bind:value={questionAvailableMarksDraft}
+	                          disabled={questionAvailableMarksSaving}
+	                          onkeydown={(event) => {
+	                            if (event.key === "Enter") {
+	                              event.preventDefault();
+	                              void saveQuestionAvailableMarks();
+	                            }
+	                            if (event.key === "Escape") {
+	                              event.preventDefault();
+	                              cancelQuestionAvailableMarksEdit();
+	                            }
+	                          }}
+	                          onblur={() => {
+	                            if (!questionAvailableMarksSaving) {
+	                              void saveQuestionAvailableMarks();
+	                            }
+	                          }}
+	                        />
+	                      </span>
+	                    {:else}
+	                      <button
+	                        class="cpl-question-value cpl-question-value-button"
+	                        type="button"
+	                        onclick={beginQuestionAvailableMarksEdit}
+	                      >
+	                        {chunkMarksDisplay ?? "—/?"}
+	                      </button>
+	                    {/if}
 	                  </div>
 	                  <div class="cpl-question-entry">
 	                    <input
@@ -6701,6 +8063,9 @@
 	                  </div>
 	                  {#if questionAchievedMarksError}
 	                    <p class="cpl-question-error">{questionAchievedMarksError}</p>
+	                  {/if}
+	                  {#if questionAvailableMarksError}
+	                    <p class="cpl-question-error">{questionAvailableMarksError}</p>
 	                  {/if}
 	                  {#if questionSourceError}
 	                    <p class="cpl-question-error">{questionSourceError}</p>
@@ -6870,12 +8235,24 @@
                       class="ink-btn"
                       type="button"
                       onclick={undoChunkStroke}
-                      disabled={chunkView.strokes.length === 0}
+                      disabled={chunkView.strokes.length === 0 && chunkGraphUndoStack.length === 0}
                       aria-label="Undo chunk stroke"
                     >
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M9 14 4 9l5-5"/>
                         <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>
+                      </svg>
+                    </button>
+                    <button
+                      class="ink-btn"
+                      type="button"
+                      onclick={redoChunkGraphAction}
+                      disabled={chunkGraphRedoStack.length === 0}
+                      aria-label="Redo chunk graph action"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M15 14l5-5-5-5"/>
+                        <path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/>
                       </svg>
                     </button>
                     <button
@@ -6980,6 +8357,21 @@
                     </div>
                     <button
                       class="tool-btn"
+                      class:active={pendingGraphPlacement?.scope === "chunk"}
+                      type="button"
+                      onclick={activateChunkGraphTool}
+                      aria-label="Graph"
+                      aria-pressed={pendingGraphPlacement?.scope === "chunk"}
+                      title="Compose a graph"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M4 20V4"/>
+                        <path d="M4 20H20"/>
+                        <path d="M6 16c1.6-2.8 3-4.2 4.6-4.2 1.9 0 2.7 2.7 4.5 2.7 1.4 0 2.8-1.4 4.9-5.5"/>
+                      </svg>
+                    </button>
+                    <button
+                      class="tool-btn"
                       class:active={chunkMode === 'erase'}
                       type="button"
                       onclick={activateChunkEraseTool}
@@ -7027,7 +8419,7 @@
                       class="ink-btn"
                       type="button"
                       onclick={() => void deleteChunkSelectedStrokes()}
-                      disabled={chunkSelectedStrokes.size === 0}
+                      disabled={chunkSelectedStrokes.size === 0 && chunkSelectedGraphId == null}
                       aria-label="Delete selected strokes"
                       title="Delete selected strokes"
                     >
@@ -7093,6 +8485,11 @@
                         class:active={glossaryMode === 'preview'}
                         onclick={() => { void flushGlossarySave(); glossaryMode = 'preview'; }}
                       >Preview</button>
+                      <button
+                        type="button"
+                        class="chunk-glossary-insert-graph"
+                        onclick={openGlossaryGraphComposer}
+                      >Insert graph</button>
                     </div>
                     <span class="chunk-glossary-status">
                       {#if glossarySaveError}
@@ -7107,6 +8504,7 @@
                   {#if glossaryMode === 'edit'}
 	                    <textarea
 	                      class="chunk-glossary-editor"
+                        bind:this={glossaryTextareaEl}
 	                      placeholder={chunkIsQuestion
 	                        ? "Write your answer. Markdown works, and LaTeX via $â€¦$ inline or $$â€¦$$ block."
 	                        : "Write your own explanation. Markdown works, and LaTeX via $â€¦$ inline or $$â€¦$$ block."}
@@ -7131,7 +8529,7 @@
 	                    <section class="chunk-ai-marking">
 	                      <div class="chunk-ai-marking-header">
 	                        <strong>Mark my answer</strong>
-	                        <span>{chunkMarksDisplay ?? "?/?"}</span>
+	                        <span>{chunkMarksDisplay ?? "—/?"}</span>
 	                      </div>
 	                      <div class="chunk-ai-marking-controls">
 	                        <button
@@ -7562,7 +8960,7 @@
         <div class="divider"></div>
 
         <!-- Undo -->
-        <button class="ink-btn" onclick={undoStroke} disabled={strokes.length === 0} aria-label="Undo stroke">
+        <button class="ink-btn" onclick={undoStroke} disabled={strokes.length === 0 && pageGraphUndoStack.length === 0} aria-label="Undo stroke">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M9 14 4 9l5-5"/>
             <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>
@@ -7570,7 +8968,7 @@
         </button>
 
         <!-- Redo -->
-        <button class="ink-btn" onclick={redoStroke} disabled={redoStack.length === 0} aria-label="Redo stroke">
+        <button class="ink-btn" onclick={redoStroke} disabled={redoStack.length === 0 && pageGraphRedoStack.length === 0} aria-label="Redo stroke">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M15 14l5-5-5-5"/>
             <path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/>
@@ -7665,6 +9063,21 @@
             </div>
           {/if}
         </div>
+
+        <button
+          class="tool-btn"
+          class:active={pendingGraphPlacement?.scope === "page"}
+          onclick={activateGraphTool}
+          aria-label="Graph"
+          aria-pressed={pendingGraphPlacement?.scope === "page"}
+          title="Compose a graph"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 20V4"/>
+            <path d="M4 20H20"/>
+            <path d="M6 16c1.6-2.8 3-4.2 4.6-4.2 1.9 0 2.7 2.7 4.5 2.7 1.4 0 2.8-1.4 4.9-5.5"/>
+          </svg>
+        </button>
 
         <!-- Erase -->
         <button
@@ -7985,6 +9398,79 @@
 
           <section class="ai-batch-section">
             <h3>Batch chunking</h3>
+            {#if selectedBook?.document_mode === "past_paper"}
+              <div class="ai-pastpaper-range">
+                <p class="ai-batch-copy">
+                  Instruction pages are used to extract exam-level rules and mark hints before question chunking.
+                </p>
+                <label class="ai-batch-toggle">
+                  <input
+                    type="checkbox"
+                    bind:checked={pastPaperInstructionPagesEnabled}
+                    disabled={pastPaperInstructionSaving}
+                  />
+                  This paper has instruction pages
+                </label>
+                {#if pastPaperInstructionPagesEnabled}
+                  <div class="ai-pastpaper-range-grid">
+                    <label class="ai-batch-field">
+                      <span>Instruction from</span>
+                      <input
+                        type="text"
+                        inputmode="numeric"
+                        pattern="[0-9]*"
+                        bind:value={pastPaperInstructionStartInput}
+                        disabled={pastPaperInstructionSaving}
+                      />
+                    </label>
+                    <label class="ai-batch-field">
+                      <span>Instruction to</span>
+                      <input
+                        type="text"
+                        inputmode="numeric"
+                        pattern="[0-9]*"
+                        bind:value={pastPaperInstructionEndInput}
+                        disabled={pastPaperInstructionSaving}
+                      />
+                    </label>
+                  </div>
+                {/if}
+                <button
+                  class="ai-batch-btn ai-batch-btn-secondary"
+                  type="button"
+                  onclick={() => void savePastPaperInstructionRange()}
+                  disabled={pastPaperInstructionSaving}
+                >
+                  {pastPaperInstructionSaving ? "Saving..." : "Save instruction pages"}
+                </button>
+                <button
+                  class="ai-batch-btn ai-batch-btn-secondary"
+                  type="button"
+                  onclick={() => void checkPastPaperInstructionContext()}
+                  disabled={pastPaperInstructionCheckLoading}
+                >
+                  {pastPaperInstructionCheckLoading ? "Checking..." : "Check instruction context"}
+                </button>
+                {#if pastPaperInstructionError}
+                  <p class="ai-batch-error">{pastPaperInstructionError}</p>
+                {/if}
+                {#if pastPaperInstructionFeedback}
+                  <p class="ai-batch-feedback">{pastPaperInstructionFeedback}</p>
+                {/if}
+                {#if pastPaperInstructionCheckError}
+                  <p class="ai-batch-error">{pastPaperInstructionCheckError}</p>
+                {/if}
+                {#if pastPaperInstructionCheckFeedback}
+                  <p class="ai-batch-feedback">{pastPaperInstructionCheckFeedback}</p>
+                {/if}
+                {#if pastPaperInstructionCheckPreview}
+                  <div class="ai-pastpaper-preview">
+                    <p class="ai-pastpaper-preview-title">Instruction preview</p>
+                    <p class="ai-pastpaper-preview-body">{pastPaperInstructionCheckPreview}</p>
+                  </div>
+                {/if}
+              </div>
+            {/if}
             {#if selectedBook && totalPages > 0}
               <p class="ai-batch-copy">
                 Run chunking over a page range for <strong>{selectedBook.title}</strong>. Uses the currently selected Chunking provider/model.
@@ -8180,6 +9666,15 @@
       </div>
     </div>
   {/if}
+  <GraphComposerModal
+    open={graphModalOpen}
+    initialGraph={graphModalInitialGraph}
+    title={graphModalSource === "glossary" ? "Insert graph in glossary" : "Compose graph"}
+    showGlossaryAction={!!chunkView}
+    onCancel={closeGraphComposer}
+    onInsertCanvas={onGraphModalInsertCanvas}
+    onInsertGlossary={onGraphModalInsertGlossary}
+  />
 </main>
 
 <style>
@@ -8628,6 +10123,52 @@
     line-height: 1.4;
   }
 
+  .ai-pastpaper-range {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    padding: 0.65rem;
+    border: 1px solid #dce3ee;
+    border-radius: 9px;
+    background: #f6f9ff;
+  }
+
+  .ai-pastpaper-range-grid {
+    display: grid;
+    grid-template-columns: 140px 140px;
+    gap: 0.55rem;
+    align-items: end;
+  }
+
+  .ai-pastpaper-preview {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    margin: 0;
+    padding: 0.6rem;
+    border: 1px dashed #ccd7ea;
+    border-radius: 8px;
+    background: #ffffff;
+  }
+
+  .ai-pastpaper-preview-title {
+    margin: 0;
+    color: #4b5b73;
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .ai-pastpaper-preview-body {
+    margin: 0;
+    color: #243041;
+    font-size: 0.84rem;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
   .ai-batch-toggle {
     display: inline-flex;
     align-items: center;
@@ -8827,6 +10368,10 @@
     }
 
     .ai-batch-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .ai-pastpaper-range-grid {
       grid-template-columns: 1fr;
     }
   }
@@ -9354,6 +10899,52 @@
     font-weight: 700;
     font-variant-numeric: tabular-nums;
     font-feature-settings: "tnum" 1;
+  }
+
+  .cpl-question-value-button {
+    min-height: 24px;
+    padding: 0 6px;
+    border: 1px dashed color-mix(in oklch, var(--chunk-accent) 32%, #cbd5e1);
+    border-radius: 7px;
+    background: #fff;
+    color: #111827;
+    cursor: text;
+  }
+
+  .cpl-question-value-button:hover {
+    border-color: color-mix(in oklch, var(--chunk-accent) 52%, #cbd5e1);
+  }
+
+  .cpl-question-marks-editor {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+
+  .cpl-question-marks-prefix {
+    color: #111827;
+  }
+
+  .cpl-question-marks-input {
+    width: 44px;
+    height: 24px;
+    padding: 0 5px;
+    border-radius: 6px;
+    border: 1px solid rgba(148, 163, 184, 0.7);
+    background: #fff;
+    color: #111827;
+    font-size: 12px;
+    font-family: Inter, system-ui, sans-serif;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+    text-align: center;
+  }
+
+  .cpl-question-marks-input:focus {
+    outline: none;
+    border-color: color-mix(in oklch, var(--chunk-accent) 56%, white);
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--chunk-accent) 16%, transparent);
   }
 
   .cpl-question-entry {
@@ -9961,6 +11552,22 @@
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
   }
 
+  .chunk-glossary-insert-graph {
+    height: 22px;
+    padding: 0 10px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #1d4ed8;
+    background: #ffffff;
+    border: 1px solid #bfdbfe;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .chunk-glossary-insert-graph:hover {
+    background: #eff6ff;
+  }
+
   .chunk-glossary-status {
     font-size: 11px;
     color: #9ca3af;
@@ -10045,6 +11652,38 @@
     color: #9ca3af;
     font-style: italic;
     margin: 0;
+  }
+
+  :global(.chunk-graph-block) {
+    margin: 0.85em 0;
+    padding: 8px;
+    border-radius: 9px;
+    border: 1px solid #d1d5db;
+    background: #f8fafc;
+  }
+
+  :global(.chunk-graph-block svg) {
+    width: 100%;
+    height: auto;
+    display: block;
+  }
+
+  :global(.chunk-graph-block figcaption) {
+    margin-top: 6px;
+    font-family: Inter, system-ui, sans-serif;
+    font-size: 11px;
+    color: #475569;
+  }
+
+  :global(.chunk-graph-error) {
+    margin: 0.7em 0;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid #fecaca;
+    background: #fef2f2;
+    color: #991b1b;
+    font-family: Inter, system-ui, sans-serif;
+    font-size: 12px;
   }
 
   .chunk-ai-pane {

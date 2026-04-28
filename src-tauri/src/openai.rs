@@ -1,9 +1,13 @@
 use crate::llm::{
-    build_chunk_body_prompt, build_chunk_chat_prompt, build_chunk_rewrite_prompt, build_prompt,
-    chunk_body_schema, chunk_groups_schema, chunk_rewrite_schema, map_reqwest_error,
-    merge_stream_text, parse_chunk_body, parse_chunk_rewrite, parse_chunks, stream_sse_events,
-    BlockForPrompt, ChunkBodyPrompt, ChunkBodyResult, ChunkChatMessage, ChunkChatPrompt,
-    ChunkRewritePrompt, ChunkRewriteResult, GroupedChunk, LlmError,
+    build_chunk_body_prompt, build_chunk_chat_prompt, build_chunk_rewrite_prompt,
+    build_instruction_markdown_prompt, build_past_paper_document_chunk_prompt, build_prompt,
+    chunk_body_schema, chunk_groups_schema, chunk_rewrite_schema, instruction_markdown_schema,
+    map_reqwest_error, merge_stream_text, parse_chunk_body, parse_chunk_rewrite, parse_chunks,
+    parse_instruction_markdown_result, parse_past_paper_document_chunk_result,
+    past_paper_document_chunk_schema, stream_sse_events, BlockForPrompt, ChunkBodyPrompt,
+    ChunkBodyResult, ChunkChatMessage, ChunkChatPrompt, ChunkRewritePrompt, ChunkRewriteResult,
+    GroupedChunk, LlmError, PastPaperBlockForPrompt, PastPaperDocumentResult,
+    PastPaperInstructionMarkdown,
 };
 use log::{debug, info};
 use serde_json::{json, Value};
@@ -99,6 +103,119 @@ impl OpenAiClient {
         );
 
         parse_chunks(&output_text, LOG_TARGET)
+    }
+
+    pub async fn extract_instruction_markdown(
+        &self,
+        images: &[String],
+        blocks: &[PastPaperBlockForPrompt],
+    ) -> Result<PastPaperInstructionMarkdown, LlmError> {
+        info!(
+            target: LOG_TARGET,
+            "extract_instruction_markdown model={} images={} blocks={}",
+            self.model,
+            images.len(),
+            blocks.len()
+        );
+
+        let prompt = build_instruction_markdown_prompt(blocks);
+        let mut user_content: Vec<serde_json::Value> = Vec::new();
+        user_content.push(json!({
+            "type": "input_text",
+            "text": "Extract the exam instructions from these page images."
+        }));
+        for image_b64 in images {
+            user_content.push(json!({
+                "type": "input_image",
+                "image_url": format!("data:image/png;base64,{}", image_b64),
+                "detail": "high"
+            }));
+        }
+
+        let value = self
+            .send_request(json!({
+                "model": self.model,
+                "store": false,
+                "input": [
+                    { "role": "developer", "content": [{ "type": "input_text", "text": prompt }] },
+                    { "role": "user", "content": user_content }
+                ],
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "instruction_markdown",
+                        "schema": instruction_markdown_schema(),
+                        "strict": true
+                    }
+                }
+            }))
+            .await?;
+        let output_text =
+            extract_output_text(&value).ok_or_else(|| LlmError::Parse(value.to_string()))?;
+        debug!(
+            target: LOG_TARGET,
+            "received {} response chars from openai instruction markdown extraction",
+            output_text.len()
+        );
+
+        parse_instruction_markdown_result(&output_text, LOG_TARGET)
+    }
+
+    pub async fn chunk_past_paper_document(
+        &self,
+        images: &[String],
+        blocks: &[PastPaperBlockForPrompt],
+        instruction_markdown: &str,
+    ) -> Result<PastPaperDocumentResult, LlmError> {
+        info!(
+            target: LOG_TARGET,
+            "chunk_past_paper_document model={} images={} blocks={}",
+            self.model,
+            images.len(),
+            blocks.len()
+        );
+
+        let prompt = build_past_paper_document_chunk_prompt(blocks, instruction_markdown);
+        let mut user_content: Vec<serde_json::Value> = Vec::new();
+        user_content.push(json!({
+            "type": "input_text",
+            "text": "Identify and transcribe all questions from these exam pages."
+        }));
+        for image_b64 in images {
+            user_content.push(json!({
+                "type": "input_image",
+                "image_url": format!("data:image/png;base64,{}", image_b64),
+                "detail": "high"
+            }));
+        }
+
+        let value = self
+            .send_request(json!({
+                "model": self.model,
+                "store": false,
+                "input": [
+                    { "role": "developer", "content": [{ "type": "input_text", "text": prompt }] },
+                    { "role": "user", "content": user_content }
+                ],
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "past_paper_chunks",
+                        "schema": past_paper_document_chunk_schema(),
+                        "strict": true
+                    }
+                }
+            }))
+            .await?;
+        let output_text =
+            extract_output_text(&value).ok_or_else(|| LlmError::Parse(value.to_string()))?;
+        debug!(
+            target: LOG_TARGET,
+            "received {} response chars from openai past-paper document chunking",
+            output_text.len()
+        );
+
+        parse_past_paper_document_chunk_result(&output_text, LOG_TARGET)
     }
 
     pub async fn transcribe_chunk_body(

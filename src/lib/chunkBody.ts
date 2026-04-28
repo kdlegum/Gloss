@@ -1,4 +1,5 @@
 import katex from "katex";
+import { renderGraphFenceHtml } from "$lib/graph";
 
 type ChunkBodyBlock =
   | { kind: "paragraph"; lines: string[] }
@@ -11,6 +12,7 @@ type ChunkBodyBlock =
 interface DisplayMathMatch {
   nextIndex: number;
   tex: string;
+  trailingText?: string;
 }
 
 export interface RenderChunkBodyOptions {
@@ -231,6 +233,10 @@ function parseBlocks(source: string, options: RenderChunkBodyOptions): ChunkBody
       flushParagraph();
       flushLists();
       blocks.push({ kind: "display-math", tex: displayMath.tex });
+      const trailing = displayMath.trailingText?.trim() ?? "";
+      if (trailing && !isIgnorableDisplayMathTrailingText(trailing)) {
+        blocks.push({ kind: "paragraph", lines: [trailing] });
+      }
       index = displayMath.nextIndex;
       continue;
     }
@@ -347,11 +353,16 @@ function consumeDisplayMath(lines: string[], startIndex: number): DisplayMathMat
     if (!line.startsWith(opener)) return null;
 
     const inner = line.slice(opener.length);
-    if (inner.endsWith(closer) && inner !== closer) {
-      return {
-        nextIndex: startIndex,
-        tex: inner.slice(0, inner.length - closer.length).trim(),
-      };
+    const singleLineCloseIndex = inner.lastIndexOf(closer);
+    if (singleLineCloseIndex !== -1) {
+      const tail = inner.slice(singleLineCloseIndex + closer.length);
+      if (isDisplayMathTrailingText(tail)) {
+        return {
+          nextIndex: startIndex,
+          tex: inner.slice(0, singleLineCloseIndex).trim(),
+          trailingText: normalizeDisplayMathTrailingText(tail),
+        };
+      }
     }
 
     const collected: string[] = inner.trim() ? [inner] : [];
@@ -364,11 +375,18 @@ function consumeDisplayMath(lines: string[], startIndex: number): DisplayMathMat
           tex: collected.join("\n").trim(),
         };
       }
-      if (trimmedCurrent.endsWith(closer)) {
-        collected.push(current.slice(0, current.lastIndexOf(closer)));
+      const closerIndex = current.lastIndexOf(closer);
+      if (closerIndex !== -1) {
+        const tail = current.slice(closerIndex + closer.length);
+        if (!isDisplayMathTrailingText(tail)) {
+          collected.push(current);
+          continue;
+        }
+        collected.push(current.slice(0, closerIndex));
         return {
           nextIndex: index,
           tex: collected.join("\n").trim(),
+          trailingText: normalizeDisplayMathTrailingText(tail),
         };
       }
       collected.push(current);
@@ -376,6 +394,18 @@ function consumeDisplayMath(lines: string[], startIndex: number): DisplayMathMat
 
     return null;
   }
+}
+
+function isDisplayMathTrailingText(source: string): boolean {
+  return /^[\s.,;:!?)]*$/u.test(source);
+}
+
+function normalizeDisplayMathTrailingText(source: string): string {
+  return source.trim();
+}
+
+function isIgnorableDisplayMathTrailingText(source: string): boolean {
+  return /^[.,;:!?)]*$/u.test(source.trim());
 }
 
 function renderBlock(block: ChunkBodyBlock, options: RenderChunkBodyOptions): string {
@@ -391,6 +421,10 @@ function renderBlock(block: ChunkBodyBlock, options: RenderChunkBodyOptions): st
       if (options.allowHeadings === false) return `<p>${renderInlineContent(block.text, options)}</p>`;
       return `<h${block.level}>${renderInlineContent(block.text, options)}</h${block.level}>`;
     case "code-fence": {
+      const language = block.language?.toLowerCase() ?? null;
+      if (language === "graph") {
+        return renderGraphFenceHtml(block.code);
+      }
       const languageClass = block.language
         ? ` class="language-${escapeHtmlAttribute(block.language)}"`
         : "";
@@ -685,6 +719,18 @@ function renderInlineContent(source: string, options: RenderChunkBodyOptions = {
       }
     }
 
+    if (source.startsWith("$$", index) && !isEscaped(source, index)) {
+      const end = findClosingDoubleDollar(source, index + 2);
+      if (end !== -1) {
+        protectedSource += reservePlaceholder(
+          renderMath(source.slice(index + 2, end), false),
+          placeholders,
+        );
+        index = end + 2;
+        continue;
+      }
+    }
+
     if (source[index] === "$" && !isEscaped(source, index) && source[index + 1] !== "$") {
       const end = findClosingInlineDollar(source, index + 1);
       if (end !== -1) {
@@ -730,6 +776,15 @@ function renderMath(source: string, displayMode: boolean): string {
 function findClosingInlineDollar(source: string, startIndex: number): number {
   for (let index = startIndex; index < source.length; index += 1) {
     if (source[index] !== "$" || isEscaped(source, index) || source[index + 1] === "$") continue;
+    return index;
+  }
+  return -1;
+}
+
+function findClosingDoubleDollar(source: string, startIndex: number): number {
+  for (let index = startIndex; index < source.length - 1; index += 1) {
+    if (source[index] !== "$" || source[index + 1] !== "$") continue;
+    if (isEscaped(source, index)) continue;
     return index;
   }
   return -1;

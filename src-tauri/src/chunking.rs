@@ -11,7 +11,10 @@
 
 use crate::deepseek::DeepSeekClient;
 use crate::gemini::GeminiClient;
-use crate::llm::{BlockForPrompt, GroupedChunk, LlmProvider};
+use crate::llm::{
+    BlockForPrompt, GroupedChunk, LlmProvider, PastPaperBlockForPrompt, PastPaperDocumentResult,
+    PastPaperInstructionMarkdown,
+};
 use crate::ollama::OllamaClient;
 use crate::openai::OpenAiClient;
 use crate::references;
@@ -25,11 +28,13 @@ use log::{debug, error, info, warn};
 use pdfium_render::prelude::*;
 use serde::Serialize;
 use sqlx::{Row, SqlitePool};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Semaphore;
+use tokio::time::{sleep, Duration};
 
 // ── Data types ──────────────────────────────────────────────────────────────
 
@@ -101,12 +106,33 @@ struct DocumentBlock {
     transcribed_text: Option<String>,
 }
 
-#[derive(Clone)]
-struct QuestionChunkCandidate {
+struct PastPaperChunkCandidate {
     label: String,
     available_marks: Option<i64>,
     block_ids: Vec<i64>,
+    question_text: String,
 }
+
+struct NormalizedPastPaperAssignments {
+    question_candidates: Vec<PastPaperChunkCandidate>,
+    noise_block_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstructionPageRange {
+    start_page: i64,
+    end_page: i64,
+}
+
+impl InstructionPageRange {
+    fn contains(&self, page_number: i64) -> bool {
+        page_number >= self.start_page && page_number <= self.end_page
+    }
+}
+
+const TRANSIENT_LLM_RETRY_MAX_ATTEMPTS: usize = 4;
+const TRANSIENT_LLM_RETRY_DELAYS_MS: [u64; TRANSIENT_LLM_RETRY_MAX_ATTEMPTS - 1] =
+    [1_500, 3_000, 6_000];
 
 // ── Top-level orchestrator ──────────────────────────────────────────────────
 
@@ -200,8 +226,18 @@ async fn run_inner(
     );
 
     if document_mode == DocumentMode::PastPaper {
-        return run_past_paper_document(pool, pdfium, app, doc_id, page_number, &abs_path, false)
-            .await;
+        return run_past_paper_document(
+            pool,
+            pdfium,
+            app,
+            doc_id,
+            page_number,
+            provider,
+            model_override.as_deref(),
+            &abs_path,
+            false,
+        )
+        .await;
     }
 
     let page_id = get_or_create_page(pool, doc_id, page_number).await?;
@@ -400,6 +436,8 @@ async fn run_past_paper_document(
     app: &AppHandle,
     doc_id: i64,
     requested_page: i64,
+    provider: LlmProvider,
+    model_override: Option<&str>,
     abs_path: &PathBuf,
     force_rebuild: bool,
 ) -> Result<(), String> {
@@ -418,6 +456,13 @@ async fn run_past_paper_document(
     }
 
     set_status(pool, doc_id, "grouping").await?;
+    let use_llm = provider_health_check(pool, provider, model_override).await;
+    if !use_llm {
+        return Err(format!(
+            "provider {} is unavailable for past-paper chunking",
+            provider
+        ));
+    }
 
     let existing_questions: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE source_document_id = ?")
@@ -436,16 +481,200 @@ async fn run_past_paper_document(
         return Ok(());
     }
 
-    let grouped = group_document_questions(&blocks);
-    if grouped.is_empty() {
+    let instruction_range = load_instruction_page_range(pool, doc_id).await?;
+    info!(
+        target: "gloss_lib::chunking",
+        "doc_id={} past-paper instruction_page_range={}",
+        doc_id,
+        instruction_range
+            .as_ref()
+            .map(|r| format!("{}-{}", r.start_page, r.end_page))
+            .unwrap_or_else(|| "none".to_string())
+    );
+
+    // Render all pages as base64 PNG images.
+    let page_numbers = collect_document_page_numbers(&blocks);
+    let mut page_images: HashMap<i64, String> = HashMap::new();
+    for &page_number in &page_numbers {
+        let page_index = (page_number - 1) as usize;
+        match render_page_as_base64(pdfium, abs_path, page_index).await {
+            Ok(b64) => {
+                page_images.insert(page_number, b64);
+            }
+            Err(e) => warn!(
+                target: "gloss_lib::chunking",
+                "doc_id={} page={} failed to render for past-paper: {}",
+                doc_id, page_number, e
+            ),
+        }
+    }
+    info!(
+        target: "gloss_lib::chunking",
+        "doc_id={} rendered {}/{} pages as images",
+        doc_id,
+        page_images.len(),
+        page_numbers.len()
+    );
+
+    // Separate instruction vs question blocks and images (preserving page order).
+    let mut instruction_blocks: Vec<PastPaperBlockForPrompt> = Vec::new();
+    let mut question_blocks: Vec<PastPaperBlockForPrompt> = Vec::new();
+    let mut instruction_images: Vec<String> = Vec::new();
+    let mut question_images: Vec<String> = Vec::new();
+    let mut instruction_pages_seen: HashSet<i64> = HashSet::new();
+    let mut question_pages_seen: HashSet<i64> = HashSet::new();
+
+    for block in &blocks {
+        let is_instruction = instruction_range
+            .as_ref()
+            .is_some_and(|r| r.contains(block.page_number));
+        let pp_block = PastPaperBlockForPrompt {
+            id: block.id,
+            page_number: block.page_number,
+            bbox_y: block.bbox_y,
+        };
+        if is_instruction {
+            instruction_blocks.push(pp_block);
+            if instruction_pages_seen.insert(block.page_number) {
+                if let Some(img) = page_images.get(&block.page_number) {
+                    instruction_images.push(img.clone());
+                }
+            }
+        } else {
+            question_blocks.push(pp_block);
+            if question_pages_seen.insert(block.page_number) {
+                if let Some(img) = page_images.get(&block.page_number) {
+                    question_images.push(img.clone());
+                }
+            }
+        }
+    }
+
+    info!(
+        target: "gloss_lib::chunking",
+        "doc_id={} past-paper: {} instruction blocks ({} pages), {} question blocks ({} pages)",
+        doc_id,
+        instruction_blocks.len(),
+        instruction_images.len(),
+        question_blocks.len(),
+        question_images.len()
+    );
+
+    // Call #1: extract instruction markdown (best-effort; proceed without on failure).
+    let instruction_markdown = if instruction_blocks.is_empty() {
+        String::new()
+    } else {
+        match run_with_transient_llm_retry(
+            doc_id,
+            provider,
+            "instruction extraction",
+            || {
+                try_chunk_ai_extract_instruction(
+                    pool,
+                    provider,
+                    &instruction_images,
+                    &instruction_blocks,
+                    model_override,
+                )
+            },
+        )
+        .await {
+            Ok(result) => {
+                let preview = result
+                    .markdown
+                    .chars()
+                    .take(240)
+                    .collect::<String>()
+                    .replace('\n', " ");
+                info!(
+                    target: "gloss_lib::chunking",
+                    "doc_id={} extracted instruction markdown ({} chars) preview={:?}",
+                    doc_id,
+                    result.markdown.len(),
+                    preview
+                );
+                result.markdown
+            }
+            Err(e) => {
+                warn!(
+                    target: "gloss_lib::chunking",
+                    "doc_id={} instruction extraction failed: {}; proceeding without",
+                    doc_id,
+                    e
+                );
+                String::new()
+            }
+        }
+    };
+
+    if question_blocks.is_empty() {
         warn!(
             target: "gloss_lib::chunking",
-            "doc_id={} no question boundaries detected; creating single fallback question",
+            "doc_id={} past-paper has no question blocks; skipping chunk extraction",
             doc_id
+        );
+        set_status(pool, doc_id, "done").await?;
+        return Ok(());
+    }
+
+    // Call #2: identify and transcribe all questions in a single document call.
+    let result = run_with_transient_llm_retry(
+        doc_id,
+        provider,
+        "question chunking",
+        || {
+            try_chunk_ai_chunk_document(
+                pool,
+                provider,
+                &question_images,
+                &question_blocks,
+                &instruction_markdown,
+                model_override,
+            )
+        },
+    )
+    .await?;
+
+    info!(
+        target: "gloss_lib::chunking",
+        "doc_id={} past-paper LLM returned {} questions (noise_blocks={})",
+        doc_id,
+        result.questions.len(),
+        result.noise_block_ids.len()
+    );
+
+    let raw_candidates: Vec<PastPaperChunkCandidate> = result
+        .questions
+        .into_iter()
+        .map(|q| PastPaperChunkCandidate {
+            label: q.question_label,
+            available_marks: q.available_marks,
+            block_ids: q.block_ids,
+            question_text: q.question_text,
+        })
+        .collect();
+    log_past_paper_mark_coverage(doc_id, &instruction_markdown, &raw_candidates);
+
+    let assignments = normalize_past_paper_candidates(
+        doc_id,
+        raw_candidates,
+        &question_blocks,
+        &result.noise_block_ids,
+    );
+    if assignments.question_candidates.is_empty() {
+        return Err(
+            "LLM did not return any usable question chunks for the past paper".to_string(),
         );
     }
 
-    persist_document_question_chunks(pool, doc_id, &blocks, &grouped).await?;
+    persist_past_paper_chunks(
+        pool,
+        doc_id,
+        &blocks,
+        &assignments.question_candidates,
+        &assignments.noise_block_ids,
+    )
+    .await?;
     if let Err(e) = references::reindex_document_references(pool, doc_id).await {
         warn!(
             target: "gloss_lib::chunking",
@@ -545,198 +774,300 @@ async fn load_document_blocks_for_page(
         .collect())
 }
 
-fn group_document_questions(blocks: &[DocumentBlock]) -> Vec<QuestionChunkCandidate> {
-    if blocks.is_empty() {
-        return Vec::new();
+fn collect_document_page_numbers(blocks: &[DocumentBlock]) -> Vec<i64> {
+    let mut pages: Vec<i64> = blocks
+        .iter()
+        .map(|block| block.page_number)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    pages.sort_unstable();
+    pages
+}
+
+async fn load_instruction_page_range(
+    pool: &SqlitePool,
+    doc_id: i64,
+) -> Result<Option<InstructionPageRange>, String> {
+    let row = sqlx::query(
+        "SELECT instruction_page_start, instruction_page_end \
+         FROM source_documents WHERE id = ?",
+    )
+    .bind(doc_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let start: Option<i64> = row.get("instruction_page_start");
+    let end: Option<i64> = row.get("instruction_page_end");
+    resolve_instruction_page_range(start, end).map_err(|err| format!("doc_id={doc_id} {err}"))
+}
+
+fn resolve_instruction_page_range(
+    start_page: Option<i64>,
+    end_page: Option<i64>,
+) -> Result<Option<InstructionPageRange>, String> {
+    match (start_page, end_page) {
+        (None, None) => Ok(None),
+        (Some(start_page), Some(end_page)) => {
+            if start_page < 1 || end_page < 1 || start_page > end_page {
+                return Err(format!(
+                    "invalid instruction page range {}-{}",
+                    start_page, end_page
+                ));
+            }
+            Ok(Some(InstructionPageRange {
+                start_page,
+                end_page,
+            }))
+        }
+        _ => Err(
+            "invalid instruction page range columns (both start and end are required)".to_string(),
+        ),
+    }
+}
+
+fn is_transient_model_demand_error(error_text: &str) -> bool {
+    let lower = error_text.to_ascii_lowercase();
+    if !(lower.contains("status 503") || lower.contains("\"code\": 503")) {
+        return false;
+    }
+    lower.contains("service unavailable")
+        || lower.contains("\"status\": \"unavailable\"")
+        || lower.contains("currently experiencing high demand")
+        || lower.contains("please try again later")
+}
+
+async fn run_with_transient_llm_retry<T, F, Fut>(
+    doc_id: i64,
+    provider: LlmProvider,
+    operation: &'static str,
+    mut op: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    let mut attempt: usize = 1;
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if attempt >= TRANSIENT_LLM_RETRY_MAX_ATTEMPTS
+                    || !is_transient_model_demand_error(&err)
+                {
+                    return Err(err);
+                }
+
+                let delay_ms = TRANSIENT_LLM_RETRY_DELAYS_MS[attempt - 1];
+                warn!(
+                    target: "gloss_lib::chunking",
+                    "doc_id={} {} provider={} transient model demand error (attempt {}/{}); retrying in {}ms: {}",
+                    doc_id,
+                    operation,
+                    provider,
+                    attempt,
+                    TRANSIENT_LLM_RETRY_MAX_ATTEMPTS,
+                    delay_ms,
+                    err
+                );
+                sleep(Duration::from_millis(delay_ms)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+async fn try_chunk_ai_extract_instruction(
+    pool: &SqlitePool,
+    provider: LlmProvider,
+    images: &[String],
+    blocks: &[PastPaperBlockForPrompt],
+    model_override: Option<&str>,
+) -> Result<PastPaperInstructionMarkdown, String> {
+    info!(
+        target: "gloss_lib::chunking",
+        "past-paper instruction extraction provider={} images={} blocks={}",
+        provider,
+        images.len(),
+        blocks.len()
+    );
+    let api_key = configured_api_key(pool, provider).await;
+    let model_override = normalize_model_override(model_override);
+    match provider {
+        LlmProvider::OpenAI => OpenAiClient::with_api_key_and_model(api_key, model_override)
+            .extract_instruction_markdown(images, blocks)
+            .await
+            .map_err(|e| e.to_string()),
+        LlmProvider::Gemini => GeminiClient::with_api_key_and_model(api_key, model_override)
+            .extract_instruction_markdown(images, blocks)
+            .await
+            .map_err(|e| e.to_string()),
+        LlmProvider::Ollama | LlmProvider::DeepSeek => Err(
+            "past-paper chunking requires a vision-capable model (OpenAI or Gemini)".to_string(),
+        ),
+        LlmProvider::Zai => Err("provider zai does not support past-paper chunking".to_string()),
+    }
+}
+
+async fn try_chunk_ai_chunk_document(
+    pool: &SqlitePool,
+    provider: LlmProvider,
+    images: &[String],
+    blocks: &[PastPaperBlockForPrompt],
+    instruction_markdown: &str,
+    model_override: Option<&str>,
+) -> Result<PastPaperDocumentResult, String> {
+    info!(
+        target: "gloss_lib::chunking",
+        "past-paper document chunking provider={} images={} blocks={}",
+        provider,
+        images.len(),
+        blocks.len()
+    );
+    let api_key = configured_api_key(pool, provider).await;
+    let model_override = normalize_model_override(model_override);
+    match provider {
+        LlmProvider::OpenAI => OpenAiClient::with_api_key_and_model(api_key, model_override)
+            .chunk_past_paper_document(images, blocks, instruction_markdown)
+            .await
+            .map_err(|e| e.to_string()),
+        LlmProvider::Gemini => GeminiClient::with_api_key_and_model(api_key, model_override)
+            .chunk_past_paper_document(images, blocks, instruction_markdown)
+            .await
+            .map_err(|e| e.to_string()),
+        LlmProvider::Ollama | LlmProvider::DeepSeek => Err(
+            "past-paper chunking requires a vision-capable model (OpenAI or Gemini)".to_string(),
+        ),
+        LlmProvider::Zai => Err("provider zai does not support past-paper chunking".to_string()),
+    }
+}
+
+fn normalize_past_paper_candidates(
+    doc_id: i64,
+    candidates: Vec<PastPaperChunkCandidate>,
+    question_blocks: &[PastPaperBlockForPrompt],
+    noise_block_ids: &[i64],
+) -> NormalizedPastPaperAssignments {
+    let mut valid_ids: HashSet<i64> = HashSet::new();
+    let mut block_order: HashMap<i64, usize> = HashMap::new();
+    for (idx, block) in question_blocks.iter().enumerate() {
+        valid_ids.insert(block.id);
+        block_order.entry(block.id).or_insert(idx);
     }
 
-    let front_page_marks = extract_front_page_marks(blocks);
-    let mut grouped: Vec<QuestionChunkCandidate> = Vec::new();
-    let mut current: Option<QuestionChunkCandidate> = None;
+    let mut noise_valid: HashSet<i64> = HashSet::new();
+    for block_id in noise_block_ids {
+        if valid_ids.contains(block_id) {
+            noise_valid.insert(*block_id);
+        } else {
+            warn!(
+                target: "gloss_lib::chunking",
+                "doc_id={} ignoring unknown noise block_id={}",
+                doc_id,
+                block_id
+            );
+        }
+    }
 
-    for block in blocks {
-        let source = block
-            .transcribed_text
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(block.text.as_str());
+    let mut assigned: HashSet<i64> = HashSet::new();
+    let mut normalized = Vec::new();
 
-        if let Some(label) = detect_question_label(source) {
-            if let Some(existing) = current.take() {
-                if !existing.block_ids.is_empty() {
-                    grouped.push(existing);
-                }
+    for candidate in candidates {
+        let mut unique_local: HashSet<i64> = HashSet::new();
+        let mut kept_block_ids = Vec::new();
+        for block_id in candidate.block_ids {
+            if !valid_ids.contains(&block_id) {
+                warn!(
+                    target: "gloss_lib::chunking",
+                    "doc_id={} question_label={} dropped unknown block_id={}",
+                    doc_id,
+                    candidate.label,
+                    block_id
+                );
+                continue;
             }
-            let available_marks =
-                extract_marks(source).or_else(|| front_page_marks.get(&label).copied());
-            current = Some(QuestionChunkCandidate {
-                label,
-                available_marks,
-                block_ids: vec![block.id],
-            });
+            if noise_valid.contains(&block_id) {
+                continue;
+            }
+            if !unique_local.insert(block_id) {
+                continue;
+            }
+            if !assigned.insert(block_id) {
+                continue;
+            }
+            kept_block_ids.push(block_id);
+        }
+
+        kept_block_ids.sort_by_key(|id| block_order.get(id).copied().unwrap_or(usize::MAX));
+
+        if kept_block_ids.is_empty() {
+            warn!(
+                target: "gloss_lib::chunking",
+                "doc_id={} dropping question_label={} because no usable block_ids remained",
+                doc_id,
+                candidate.label
+            );
             continue;
         }
 
-        if let Some(active) = current.as_mut() {
-            active.block_ids.push(block.id);
-            if active.available_marks.is_none() {
-                active.available_marks = extract_marks(source)
-                    .or_else(|| front_page_marks.get(&active.label).copied());
-            }
-        }
-    }
-
-    if let Some(existing) = current.take() {
-        if !existing.block_ids.is_empty() {
-            grouped.push(existing);
-        }
-    }
-
-    if grouped.is_empty() {
-        grouped.push(QuestionChunkCandidate {
-            label: "1".to_string(),
-            available_marks: front_page_marks.get("1").copied(),
-            block_ids: blocks.iter().map(|block| block.id).collect(),
+        normalized.push(PastPaperChunkCandidate {
+            label: candidate.label,
+            available_marks: candidate.available_marks,
+            block_ids: kept_block_ids,
+            question_text: candidate.question_text,
         });
     }
 
-    grouped
+    let mut unassigned_ids: Vec<i64> = valid_ids
+        .iter()
+        .copied()
+        .filter(|id| !assigned.contains(id) && !noise_valid.contains(id))
+        .collect();
+    unassigned_ids.sort_by_key(|id| block_order.get(id).copied().unwrap_or(usize::MAX));
+
+    let mut noise_ids_final: Vec<i64> = noise_valid
+        .iter()
+        .copied()
+        .filter(|id| !assigned.contains(id))
+        .collect();
+    noise_ids_final.sort_by_key(|id| block_order.get(id).copied().unwrap_or(usize::MAX));
+
+    if !unassigned_ids.is_empty() {
+        warn!(
+            target: "gloss_lib::chunking",
+            "doc_id={} past-paper {} block(s) were left unassigned by model output",
+            doc_id,
+            unassigned_ids.len()
+        );
+    }
+
+    info!(
+        target: "gloss_lib::chunking",
+        "doc_id={} past-paper normalized questions={} assigned_blocks={} noise_blocks={} unassigned_blocks={}",
+        doc_id,
+        normalized.len(),
+        assigned.len(),
+        noise_ids_final.len(),
+        unassigned_ids.len()
+    );
+
+    NormalizedPastPaperAssignments {
+        question_candidates: normalized,
+        noise_block_ids: noise_ids_final,
+    }
 }
 
-fn extract_front_page_marks(blocks: &[DocumentBlock]) -> HashMap<String, i64> {
-    let mut out = HashMap::new();
-    for block in blocks.iter().filter(|block| block.page_number == 1) {
-        for raw_line in block.text.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Some(label) = detect_question_label(line) else {
-                continue;
-            };
-            let Some(marks) = extract_marks(line) else {
-                continue;
-            };
-            out.entry(label).or_insert(marks);
-        }
-    }
-    out
-}
-
-fn detect_question_label(source: &str) -> Option<String> {
-    let line = source
-        .lines()
-        .map(str::trim)
-        .find(|value| !value.is_empty())
-        .unwrap_or_else(|| source.trim());
-    if line.is_empty() {
-        return None;
-    }
-
-    let lower = line.to_lowercase();
-    if lower.starts_with("question") {
-        let mut rest = &line["question".len()..];
-        rest = rest.trim_start_matches([' ', '\t', ':', '.', '-', ')']);
-        if let Some((value, _)) = parse_leading_number(rest) {
-            if (1..=300).contains(&value) {
-                return Some(value.to_string());
-            }
-        }
-    }
-
-    let (value, consumed) = parse_leading_number(line)?;
-    if !(1..=300).contains(&value) {
-        return None;
-    }
-    let trailing = line[consumed..].trim_start();
-    if trailing.is_empty() {
-        return Some(value.to_string());
-    }
-    let first = trailing.chars().next()?;
-    if matches!(first, ')' | '.' | ':' | '-' | ']') {
-        return Some(value.to_string());
-    }
-    None
-}
-
-fn parse_leading_number(source: &str) -> Option<(i64, usize)> {
-    let mut end = 0usize;
-    for (idx, ch) in source.char_indices() {
-        if ch.is_ascii_digit() {
-            end = idx + ch.len_utf8();
-            continue;
-        }
-        break;
-    }
-    if end == 0 {
-        return None;
-    }
-    let value = source[..end].parse::<i64>().ok()?;
-    Some((value, end))
-}
-
-fn extract_marks(source: &str) -> Option<i64> {
-    let compact = source.trim();
-    if compact.is_empty() {
-        return None;
-    }
-
-    // Common exam style: [6]
-    let chars: Vec<char> = compact.chars().collect();
-    for i in 0..chars.len() {
-        if chars[i] != '[' {
-            continue;
-        }
-        let mut j = i + 1;
-        let mut digits = String::new();
-        while j < chars.len() && chars[j].is_ascii_digit() {
-            digits.push(chars[j]);
-            j += 1;
-        }
-        if j < chars.len() && chars[j] == ']' && !digits.is_empty() {
-            if let Ok(value) = digits.parse::<i64>() {
-                return Some(value);
-            }
-        }
-    }
-
-    // Phrase style: "6 marks"
-    let lower = compact.to_lowercase();
-    let mut search_start = 0usize;
-    while let Some(rel_idx) = lower[search_start..].find("mark") {
-        let idx = search_start + rel_idx;
-        let prefix = &lower[..idx];
-        let digits: String = prefix
-            .chars()
-            .rev()
-            .take_while(|ch| ch.is_ascii_digit() || ch.is_whitespace() || matches!(ch, ')' | '(' | ']'))
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        let value: String = digits.chars().filter(|ch| ch.is_ascii_digit()).collect();
-        if !value.is_empty() {
-            if let Ok(parsed) = value.parse::<i64>() {
-                return Some(parsed);
-            }
-        }
-        search_start = idx + 4;
-        if search_start >= lower.len() {
-            break;
-        }
-    }
-
-    None
-}
-
-async fn persist_document_question_chunks(
+async fn persist_past_paper_chunks(
     pool: &SqlitePool,
     doc_id: i64,
     blocks: &[DocumentBlock],
-    grouped: &[QuestionChunkCandidate],
+    candidates: &[PastPaperChunkCandidate],
+    noise_block_ids: &[i64],
 ) -> Result<(), String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-    let by_id: HashMap<i64, &DocumentBlock> = blocks.iter().map(|block| (block.id, block)).collect();
+    let by_id: HashMap<i64, &DocumentBlock> =
+        blocks.iter().map(|block| (block.id, block)).collect();
 
     sqlx::query(
         "UPDATE text_blocks SET chunk_id = NULL \
@@ -753,7 +1084,7 @@ async fn persist_document_question_chunks(
         .await
         .map_err(|e| e.to_string())?;
 
-    for candidate in grouped {
+    for candidate in candidates {
         let mut members: Vec<&DocumentBlock> = candidate
             .block_ids
             .iter()
@@ -769,7 +1100,6 @@ async fn persist_document_question_chunks(
         });
 
         let mut page_slices: BTreeMap<i64, (i64, (f32, f32, f32, f32))> = BTreeMap::new();
-        let mut body_segments = Vec::new();
         let mut ocr_segments = Vec::new();
         for member in &members {
             let key = member.page_number;
@@ -778,22 +1108,7 @@ async fn persist_document_question_chunks(
                 .entry(key)
                 .and_modify(|(_, existing)| *existing = merge_bbox(*existing, bbox))
                 .or_insert((member.page_id, bbox));
-
-            if let Some(text) = member
-                .transcribed_text
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                body_segments.push(text.to_string());
-            } else {
-                let text = member.text.as_str().trim();
-                if !text.is_empty() {
-                    body_segments.push(text.to_string());
-                }
-            }
-            let text = member.text.as_str().trim();
-            if !text.is_empty() {
+            if let Some(text) = preferred_block_text(member) {
                 ocr_segments.push(text.to_string());
             }
         }
@@ -809,10 +1124,10 @@ async fn persist_document_question_chunks(
         } else {
             Some(ocr_segments.join("\n\n"))
         };
-        let formatted_body = if body_segments.is_empty() {
-            ocr_text.clone()
+        let formatted_body_md = if candidate.question_text.trim().is_empty() {
+            None
         } else {
-            Some(body_segments.join("\n\n"))
+            Some(candidate.question_text.trim().to_string())
         };
         let title = format!("Question {}", candidate.label);
 
@@ -829,7 +1144,7 @@ async fn persist_document_question_chunks(
         .bind(anchor_bbox.2)
         .bind(anchor_bbox.3)
         .bind(ocr_text.as_deref())
-        .bind(formatted_body.as_deref())
+        .bind(formatted_body_md.as_deref())
         .bind(&title)
         .bind(&candidate.label)
         .bind(candidate.available_marks)
@@ -847,6 +1162,7 @@ async fn persist_document_question_chunks(
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
+
         sqlx::query(
             "INSERT OR IGNORE INTO chunk_aliases (chunk_id, alias, alias_kind) \
              VALUES (?, ?, 'canonical_name')",
@@ -885,6 +1201,36 @@ async fn persist_document_question_chunks(
         }
     }
 
+    for block_id in noise_block_ids {
+        let Some(block) = by_id.get(block_id).copied() else {
+            continue;
+        };
+        let ocr_text = preferred_block_text(block);
+        let row = sqlx::query(
+            "INSERT INTO chunks \
+             (source_document_id, page_id, chunk_type, bbox_x, bbox_y, bbox_w, bbox_h, ocr_text, ai_suggested) \
+             VALUES (?, ?, 'noise', ?, ?, ?, ?, ?, 1) RETURNING id",
+        )
+        .bind(doc_id)
+        .bind(block.page_id)
+        .bind(block.bbox_x)
+        .bind(block.bbox_y)
+        .bind(block.bbox_w)
+        .bind(block.bbox_h)
+        .bind(ocr_text)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        let chunk_id: i64 = row.get("id");
+
+        sqlx::query("UPDATE text_blocks SET chunk_id = ? WHERE id = ?")
+            .bind(chunk_id)
+            .bind(block.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
     tx.commit().await.map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -897,6 +1243,89 @@ fn merge_bbox(current: (f32, f32, f32, f32), next: (f32, f32, f32, f32)) -> (f32
     (x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
 }
 
+fn log_past_paper_mark_coverage(
+    doc_id: i64,
+    instruction_markdown: &str,
+    candidates: &[PastPaperChunkCandidate],
+) {
+    let total = candidates.len();
+    let with_marks = candidates
+        .iter()
+        .filter(|candidate| candidate.available_marks.is_some())
+        .count();
+    let missing = total.saturating_sub(with_marks);
+
+    info!(
+        target: "gloss_lib::chunking",
+        "doc_id={} past-paper available_marks coverage: {}/{} questions have marks",
+        doc_id,
+        with_marks,
+        total
+    );
+
+    if missing == 0 {
+        return;
+    }
+
+    let missing_labels = candidates
+        .iter()
+        .filter(|candidate| candidate.available_marks.is_none())
+        .map(|candidate| candidate.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    warn!(
+        target: "gloss_lib::chunking",
+        "doc_id={} available_marks missing for {} question(s): [{}]",
+        doc_id,
+        missing,
+        missing_labels
+    );
+
+    let instruction_preview = instruction_markdown
+        .chars()
+        .take(500)
+        .collect::<String>()
+        .replace('\n', " ");
+    info!(
+        target: "gloss_lib::chunking",
+        "doc_id={} instruction_markdown preview (500 chars): {}",
+        doc_id,
+        instruction_preview
+    );
+
+    for candidate in candidates.iter().filter(|c| c.available_marks.is_none()).take(6) {
+        let snippet = candidate
+            .question_text
+            .chars()
+            .take(220)
+            .collect::<String>()
+            .replace('\n', " ");
+        info!(
+            target: "gloss_lib::chunking",
+            "doc_id={} question_label={} missing available_marks; question_text preview: {}",
+            doc_id,
+            candidate.label,
+            snippet
+        );
+    }
+}
+
+fn preferred_block_text(block: &DocumentBlock) -> Option<&str> {
+    block
+        .transcribed_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let extracted = block.text.trim();
+            if extracted.is_empty() {
+                None
+            } else {
+                Some(extracted)
+            }
+        })
+}
+
 pub async fn rechunk_page(
     pool: &SqlitePool,
     pdfium: &PdfiumWorker,
@@ -905,6 +1334,7 @@ pub async fn rechunk_page(
     page_number: i64,
     provider: LlmProvider,
     model_override: Option<String>,
+    zai_transcription_semaphore: Arc<Semaphore>,
 ) -> Result<(), String> {
     info!(
         target: "gloss_lib::chunking",
@@ -913,7 +1343,18 @@ pub async fn rechunk_page(
         page_number,
         provider
     );
-    match rechunk_inner(pool, pdfium, app, doc_id, page_number, provider, model_override).await {
+    match rechunk_inner(
+        pool,
+        pdfium,
+        app,
+        doc_id,
+        page_number,
+        provider,
+        model_override,
+        &zai_transcription_semaphore,
+    )
+    .await
+    {
         Ok(()) => {
             info!(
                 target: "gloss_lib::chunking",
@@ -948,6 +1389,7 @@ async fn rechunk_inner(
     page_number: i64,
     provider: LlmProvider,
     model_override: Option<String>,
+    _zai_transcription_semaphore: &Arc<Semaphore>,
 ) -> Result<(), String> {
     if page_number < 1 {
         return Err(format!("invalid page number {}", page_number));
@@ -963,8 +1405,18 @@ async fn rechunk_inner(
         let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
         let relative_path: String = row.get("file_path");
         let abs_path = data_dir.join(relative_path);
-        return run_past_paper_document(pool, pdfium, app, doc_id, page_number, &abs_path, true)
-            .await;
+        return run_past_paper_document(
+            pool,
+            pdfium,
+            app,
+            doc_id,
+            page_number,
+            provider,
+            model_override.as_deref(),
+            &abs_path,
+            true,
+        )
+        .await;
     }
 
     let page_id = get_or_create_page(pool, doc_id, page_number).await?;
@@ -1609,6 +2061,32 @@ async fn transcribe_blocks_for_page(
     Ok(updated)
 }
 
+async fn render_page_as_base64(
+    pdfium: &PdfiumWorker,
+    abs_path: &PathBuf,
+    page_index: usize,
+) -> Result<String, String> {
+    let p = abs_path.clone();
+    let (w, h, rgba_bytes) = pdfium
+        .run(move |pdf| render_page_rgba(pdf, &p, page_index, TRANSCRIPTION_RENDER_WIDTH))
+        .await
+        .map_err(|e| format!("failed to render page {}: {}", page_index + 1, e))?;
+
+    let img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_raw(w, h, rgba_bytes)
+        .ok_or_else(|| format!("failed to create image buffer for page {}", page_index + 1))?;
+    let dynamic = image::DynamicImage::ImageRgba8(img);
+
+    let mut png_bytes = Vec::new();
+    dynamic
+        .write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .map_err(|e| format!("failed to encode page {} as PNG: {}", page_index + 1, e))?;
+
+    Ok(STANDARD.encode(&png_bytes))
+}
+
 /// Renders a PDF page to raw RGBA bytes. Runs synchronously on the pdfium worker thread.
 fn render_page_rgba(
     pdfium: &Pdfium,
@@ -1986,7 +2464,11 @@ fn extract_lines_from_chars(text: &PdfPageText<'_>, page_w: f32, page_h: f32) ->
         a.top
             .partial_cmp(&b.top)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.left.partial_cmp(&b.left).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| {
+                a.left
+                    .partial_cmp(&b.left)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
     let mut grouped: Vec<Vec<Glyph>> = Vec::new();
@@ -1994,8 +2476,8 @@ fn extract_lines_from_chars(text: &PdfPageText<'_>, page_w: f32, page_h: f32) ->
         let glyph_center = (glyph.top + glyph.bottom) * 0.5;
         let glyph_h = (glyph.bottom - glyph.top).max(1e-4);
         let target_line = grouped.iter().position(|line| {
-            let line_center = line.iter().map(|g| (g.top + g.bottom) * 0.5).sum::<f32>()
-                / line.len() as f32;
+            let line_center =
+                line.iter().map(|g| (g.top + g.bottom) * 0.5).sum::<f32>() / line.len() as f32;
             let line_h = line
                 .iter()
                 .map(|g| (g.bottom - g.top).max(1e-4))
@@ -2165,4 +2647,24 @@ fn group_lines_into_blocks(lines: Vec<Line>) -> Vec<Line> {
         blocks.push(c);
     }
     blocks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_instruction_page_ranges() {
+        assert_eq!(
+            resolve_instruction_page_range(Some(1), Some(1)).unwrap(),
+            Some(InstructionPageRange {
+                start_page: 1,
+                end_page: 1,
+            })
+        );
+        assert_eq!(resolve_instruction_page_range(None, None).unwrap(), None);
+        assert!(resolve_instruction_page_range(Some(0), Some(1)).is_err());
+        assert!(resolve_instruction_page_range(Some(4), Some(2)).is_err());
+        assert!(resolve_instruction_page_range(Some(1), None).is_err());
+    }
 }

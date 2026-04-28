@@ -473,12 +473,89 @@ struct SurfaceStrokeOutput {
     max_y: f32,
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct GraphPointInput {
+    x: f64,
+    y: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct SurfaceGraphObjectInput {
+    mode: String,
+    equation: Option<String>,
+    #[serde(alias = "pointsJson")]
+    points_json: Option<String>,
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+    bbox_x: f64,
+    bbox_y: f64,
+    bbox_w: f64,
+    bbox_h: f64,
+    #[serde(alias = "lineColour")]
+    line_colour: String,
+    #[serde(alias = "lineWidth")]
+    line_width: f64,
+}
+
+#[derive(serde::Serialize)]
+struct SurfaceGraphObjectOutput {
+    id: i64,
+    surface_id: i64,
+    mode: String,
+    equation: Option<String>,
+    points_json: Option<String>,
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+    bbox_x: f64,
+    bbox_y: f64,
+    bbox_w: f64,
+    bbox_h: f64,
+    line_colour: String,
+    line_width: f64,
+}
+
+struct NormalizedSurfaceGraphObject {
+    mode: String,
+    equation: Option<String>,
+    points_json: Option<String>,
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+    bbox_x: f64,
+    bbox_y: f64,
+    bbox_w: f64,
+    bbox_h: f64,
+    line_colour: String,
+    line_width: f64,
+}
+
 #[derive(serde::Serialize)]
 struct SourceDocument {
     id: i64,
     title: String,
     file_path: String,
     document_mode: String,
+    instruction_page_start: Option<i64>,
+    instruction_page_end: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+struct PastPaperInstructionContextDebug {
+    source_document_id: i64,
+    chunking_status: String,
+    instruction_page_start: Option<i64>,
+    instruction_page_end: Option<i64>,
+    expected_instruction_pages: Vec<i64>,
+    extracted_instruction_pages: Vec<i64>,
+    missing_instruction_pages: Vec<i64>,
+    instruction_block_count: i64,
+    instruction_transcribed_block_count: i64,
+    preview_text: String,
 }
 
 fn stroke_bounds(points: &[Point]) -> Result<StrokeBounds, String> {
@@ -522,6 +599,101 @@ fn decode_stroke_points(data: Vec<u8>) -> Result<Vec<Point>, String> {
     bincode::decode_from_slice::<Vec<Point>, _>(&data, bincode::config::standard())
         .map(|(points, _)| points)
         .map_err(|e| e.to_string())
+}
+
+fn require_finite(value: f64, name: &str) -> Result<f64, String> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(format!("{} must be finite", name))
+    }
+}
+
+fn normalize_surface_graph_input(
+    graph: SurfaceGraphObjectInput,
+) -> Result<NormalizedSurfaceGraphObject, String> {
+    let mode = graph.mode.trim().to_ascii_lowercase();
+    if mode != "equation" && mode != "points" {
+        return Err("graph mode must be 'equation' or 'points'".into());
+    }
+
+    let x_min = require_finite(graph.x_min, "x_min")?;
+    let x_max = require_finite(graph.x_max, "x_max")?;
+    let y_min = require_finite(graph.y_min, "y_min")?;
+    let y_max = require_finite(graph.y_max, "y_max")?;
+    let bbox_x = require_finite(graph.bbox_x, "bbox_x")?;
+    let bbox_y = require_finite(graph.bbox_y, "bbox_y")?;
+    let bbox_w = require_finite(graph.bbox_w, "bbox_w")?;
+    let bbox_h = require_finite(graph.bbox_h, "bbox_h")?;
+    let line_width = require_finite(graph.line_width, "line_width")?;
+
+    if x_max <= x_min {
+        return Err("x_max must be greater than x_min".into());
+    }
+    if y_max <= y_min {
+        return Err("y_max must be greater than y_min".into());
+    }
+    if bbox_w <= 0.0 || bbox_h <= 0.0 {
+        return Err("graph bbox width and height must be positive".into());
+    }
+    if line_width <= 0.0 {
+        return Err("graph line_width must be positive".into());
+    }
+
+    let line_colour = graph.line_colour.trim().to_string();
+    if line_colour.is_empty() {
+        return Err("graph line_colour cannot be empty".into());
+    }
+
+    let equation = graph
+        .equation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let points = graph
+        .points_json
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let (equation, points_json) = if mode == "equation" {
+        let equation = equation.ok_or_else(|| "equation mode requires an equation".to_string())?;
+        (Some(equation), None)
+    } else {
+        let points = points.ok_or_else(|| "points mode requires points_json".to_string())?;
+        let parsed: Vec<GraphPointInput> = serde_json::from_str(points)
+            .map_err(|e| format!("points_json must be valid JSON: {}", e))?;
+        if parsed.is_empty() {
+            return Err("points_json must include at least one point".into());
+        }
+        for (index, point) in parsed.iter().enumerate() {
+            if !point.x.is_finite() || !point.y.is_finite() {
+                return Err(format!(
+                    "points_json contains a non-finite point at index {}",
+                    index
+                ));
+            }
+        }
+        let canonical = serde_json::to_string(&parsed).map_err(|e| e.to_string())?;
+        (None, Some(canonical))
+    };
+
+    Ok(NormalizedSurfaceGraphObject {
+        mode,
+        equation,
+        points_json,
+        x_min,
+        x_max,
+        y_min,
+        y_max,
+        bbox_x,
+        bbox_y,
+        bbox_w,
+        bbox_h,
+        line_colour,
+        line_width,
+    })
 }
 
 async fn get_or_create_note_surface_id(
@@ -2252,20 +2424,67 @@ fn validate_achieved_marks(
     Ok(())
 }
 
+fn validate_available_marks(
+    available_marks: Option<i64>,
+    achieved_marks: Option<f64>,
+) -> Result<(), String> {
+    if let Some(value) = available_marks {
+        if value < 0 {
+            return Err("available_marks must be a non-negative integer".to_string());
+        }
+        if let Some(achieved) = achieved_marks {
+            if achieved > value as f64 {
+                return Err(format!(
+                    "available_marks ({value}) cannot be less than achieved_marks ({achieved})"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn save_question_available_marks(
+    chunk_id: i64,
+    available_marks: Option<i64>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<(), String> {
+    let row = sqlx::query("SELECT chunk_type, achieved_marks FROM chunks WHERE id = ?")
+        .bind(chunk_id)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("chunk {} not found", chunk_id))?;
+
+    let chunk_type: String = row.get("chunk_type");
+    if chunk_type != "question" {
+        return Err("available marks can only be saved for question chunks".to_string());
+    }
+    let achieved_marks: Option<f64> = row.get("achieved_marks");
+    validate_available_marks(available_marks, achieved_marks)?;
+
+    sqlx::query("UPDATE chunks SET available_marks = ? WHERE id = ?")
+        .bind(available_marks)
+        .bind(chunk_id)
+        .execute(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 #[tauri::command]
 async fn save_question_achieved_marks(
     chunk_id: i64,
     achieved_marks: Option<f64>,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<(), String> {
-    let row = sqlx::query(
-        "SELECT chunk_type, available_marks FROM chunks WHERE id = ?",
-    )
-    .bind(chunk_id)
-    .fetch_optional(pool.inner())
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| format!("chunk {} not found", chunk_id))?;
+    let row = sqlx::query("SELECT chunk_type, available_marks FROM chunks WHERE id = ?")
+        .bind(chunk_id)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("chunk {} not found", chunk_id))?;
 
     let chunk_type: String = row.get("chunk_type");
     if chunk_type != "question" {
@@ -2430,14 +2649,12 @@ async fn apply_question_mark_attempt(
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string());
 
-    let row = sqlx::query(
-        "SELECT chunk_type, available_marks FROM chunks WHERE id = ?",
-    )
-    .bind(chunk_id)
-    .fetch_optional(pool.inner())
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| format!("chunk {} not found", chunk_id))?;
+    let row = sqlx::query("SELECT chunk_type, available_marks FROM chunks WHERE id = ?")
+        .bind(chunk_id)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("chunk {} not found", chunk_id))?;
 
     let chunk_type: String = row.get("chunk_type");
     if chunk_type != "question" {
@@ -2852,6 +3069,7 @@ async fn ensure_chunking_for_page_range(
                     1,
                     provider,
                     model.clone(),
+                    Arc::clone(&zai_transcription_semaphore),
                 )
                 .await;
             } else {
@@ -2958,6 +3176,7 @@ async fn ensure_chunking_for_page_range(
                         page_number,
                         provider,
                         model.clone(),
+                        Arc::clone(&zai_transcription_semaphore),
                     )
                     .await;
                 } else {
@@ -3026,6 +3245,7 @@ async fn rechunk_page(
         effective_page,
         provider,
         model,
+        Arc::clone(&state.zai_transcription_semaphore),
     )
     .await;
     finish_chunking_job(&state.chunking_jobs, source_document_id, effective_page);
@@ -3125,12 +3345,22 @@ async fn import_pdf(
         _ => "textbook",
     };
 
+    let (instruction_page_start, instruction_page_end) = if document_mode == "past_paper" {
+        (Some(1_i64), Some(1_i64))
+    } else {
+        (None, None)
+    };
+
     let row = sqlx::query(
-        "INSERT INTO source_documents (title, file_path, document_mode) VALUES (?, ?, ?) RETURNING id",
+        "INSERT INTO source_documents \
+         (title, file_path, document_mode, instruction_page_start, instruction_page_end) \
+         VALUES (?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(&title)
     .bind(&relative_path)
     .bind(document_mode)
+    .bind(instruction_page_start)
+    .bind(instruction_page_end)
     .fetch_one(pool.inner())
     .await
     .map_err(|e| e.to_string())?;
@@ -3149,6 +3379,8 @@ async fn import_pdf(
         title,
         file_path: relative_path,
         document_mode: document_mode.to_string(),
+        instruction_page_start,
+        instruction_page_end,
     })
 }
 
@@ -3162,11 +3394,12 @@ async fn get_pdf_path(app: tauri::AppHandle, relative_path: String) -> Result<St
 #[tauri::command]
 async fn list_textbooks(pool: tauri::State<'_, SqlitePool>) -> Result<Vec<SourceDocument>, String> {
     let rows = sqlx::query(
-        "SELECT id, title, file_path, document_mode FROM source_documents ORDER BY id DESC",
+        "SELECT id, title, file_path, document_mode, instruction_page_start, instruction_page_end \
+         FROM source_documents ORDER BY id DESC",
     )
-        .fetch_all(pool.inner())
-        .await
-        .map_err(|e| e.to_string())?;
+    .fetch_all(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
 
     Ok(rows
         .into_iter()
@@ -3175,8 +3408,217 @@ async fn list_textbooks(pool: tauri::State<'_, SqlitePool>) -> Result<Vec<Source
             title: r.get("title"),
             file_path: r.get("file_path"),
             document_mode: r.get("document_mode"),
+            instruction_page_start: r.get("instruction_page_start"),
+            instruction_page_end: r.get("instruction_page_end"),
         })
         .collect())
+}
+
+#[tauri::command]
+async fn save_past_paper_instruction_range(
+    source_document_id: i64,
+    start_page: Option<i64>,
+    end_page: Option<i64>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<SourceDocument, String> {
+    let mode_row = sqlx::query("SELECT document_mode FROM source_documents WHERE id = ?")
+        .bind(source_document_id)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("source document {} not found", source_document_id))?;
+
+    let is_past_paper = mode_row
+        .get::<String, _>("document_mode")
+        .eq_ignore_ascii_case("past_paper");
+    if !is_past_paper {
+        return Err("instruction page range can only be set for past papers".to_string());
+    }
+
+    match (start_page, end_page) {
+        (None, None) => {}
+        (Some(start), Some(end)) => {
+            if start < 1 || end < 1 {
+                return Err("instruction page range must use page numbers >= 1".to_string());
+            }
+            if start > end {
+                return Err(format!(
+                    "invalid instruction page range {}-{} (end before start)",
+                    start, end
+                ));
+            }
+        }
+        _ => {
+            return Err(
+                "instruction page range must provide both start_page and end_page, or neither"
+                    .to_string(),
+            );
+        }
+    }
+
+    sqlx::query(
+        "UPDATE source_documents \
+         SET instruction_page_start = ?, instruction_page_end = ? \
+         WHERE id = ?",
+    )
+    .bind(start_page)
+    .bind(end_page)
+    .bind(source_document_id)
+    .execute(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let row = sqlx::query(
+        "SELECT id, title, file_path, document_mode, instruction_page_start, instruction_page_end \
+         FROM source_documents WHERE id = ?",
+    )
+    .bind(source_document_id)
+    .fetch_one(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(SourceDocument {
+        id: row.get("id"),
+        title: row.get("title"),
+        file_path: row.get("file_path"),
+        document_mode: row.get("document_mode"),
+        instruction_page_start: row.get("instruction_page_start"),
+        instruction_page_end: row.get("instruction_page_end"),
+    })
+}
+
+#[tauri::command]
+async fn inspect_past_paper_instruction_context(
+    source_document_id: i64,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<PastPaperInstructionContextDebug, String> {
+    let row = sqlx::query(
+        "SELECT document_mode, chunking_status, instruction_page_start, instruction_page_end \
+         FROM source_documents WHERE id = ?",
+    )
+    .bind(source_document_id)
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("source document {} not found", source_document_id))?;
+
+    let document_mode: String = row.get("document_mode");
+    if !document_mode.eq_ignore_ascii_case("past_paper") {
+        return Err("instruction context is only available for past papers".to_string());
+    }
+
+    let chunking_status: String = row.get("chunking_status");
+    let start_page: Option<i64> = row.get("instruction_page_start");
+    let end_page: Option<i64> = row.get("instruction_page_end");
+
+    let mut expected_instruction_pages = Vec::new();
+    let mut extracted_instruction_pages = Vec::new();
+    let mut missing_instruction_pages = Vec::new();
+    let mut instruction_block_count = 0i64;
+    let mut instruction_transcribed_block_count = 0i64;
+    let mut preview_segments: Vec<String> = Vec::new();
+
+    match (start_page, end_page) {
+        (None, None) => {}
+        (Some(start), Some(end)) => {
+            if start < 1 || end < 1 || start > end {
+                return Err(format!(
+                    "invalid instruction page range {}-{} (save a valid range first)",
+                    start, end
+                ));
+            }
+
+            expected_instruction_pages = (start..=end).collect();
+
+            let rows = sqlx::query(
+                "SELECT p.page_number, tb.id AS block_id, tb.order_idx, tb.text, tb.transcribed_text \
+                 FROM pages p \
+                 LEFT JOIN text_blocks tb ON tb.page_id = p.id \
+                 WHERE p.source_document_id = ? AND p.page_number BETWEEN ? AND ? \
+                 ORDER BY p.page_number ASC, tb.order_idx ASC",
+            )
+            .bind(source_document_id)
+            .bind(start)
+            .bind(end)
+            .fetch_all(pool.inner())
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let mut extracted_page_set = HashSet::new();
+            for result_row in rows {
+                let page_number: i64 = result_row.get("page_number");
+                let block_id: Option<i64> = result_row.get("block_id");
+                if block_id.is_none() {
+                    continue;
+                }
+
+                extracted_page_set.insert(page_number);
+                instruction_block_count += 1;
+
+                let transcribed_text = result_row.get::<Option<String>, _>("transcribed_text");
+                let raw_text = result_row.get::<String, _>("text");
+
+                let preferred = transcribed_text
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                if preferred.is_some() {
+                    instruction_transcribed_block_count += 1;
+                }
+
+                if let Some(text) = preferred.or_else(|| {
+                    let trimmed = raw_text.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
+                }) {
+                    preview_segments.push(text.to_string());
+                }
+            }
+
+            extracted_instruction_pages = expected_instruction_pages
+                .iter()
+                .copied()
+                .filter(|page| extracted_page_set.contains(page))
+                .collect();
+            missing_instruction_pages = expected_instruction_pages
+                .iter()
+                .copied()
+                .filter(|page| !extracted_page_set.contains(page))
+                .collect();
+        }
+        _ => {
+            return Err(
+                "instruction page range is partially set; save both start and end page".to_string(),
+            );
+        }
+    }
+
+    let preview_text = if preview_segments.is_empty() {
+        String::new()
+    } else {
+        let joined = preview_segments.join("\n\n");
+        let mut truncated = String::new();
+        for ch in joined.chars().take(1600) {
+            truncated.push(ch);
+        }
+        truncated
+    };
+
+    Ok(PastPaperInstructionContextDebug {
+        source_document_id,
+        chunking_status,
+        instruction_page_start: start_page,
+        instruction_page_end: end_page,
+        expected_instruction_pages,
+        extracted_instruction_pages,
+        missing_instruction_pages,
+        instruction_block_count,
+        instruction_transcribed_block_count,
+        preview_text,
+    })
 }
 
 #[tauri::command]
@@ -3370,6 +3812,126 @@ async fn delete_surface_stroke(
     Ok(())
 }
 
+#[tauri::command]
+async fn save_surface_graph_object(
+    surface_id: i64,
+    graph: SurfaceGraphObjectInput,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<i64, String> {
+    let normalized = normalize_surface_graph_input(graph)?;
+    let row = sqlx::query(
+        "INSERT INTO surface_graph_objects \
+         (surface_id, mode, equation, points_json, x_min, x_max, y_min, y_max, bbox_x, bbox_y, bbox_w, bbox_h, line_colour, line_width) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+    )
+    .bind(surface_id)
+    .bind(&normalized.mode)
+    .bind(normalized.equation.as_deref())
+    .bind(normalized.points_json.as_deref())
+    .bind(normalized.x_min)
+    .bind(normalized.x_max)
+    .bind(normalized.y_min)
+    .bind(normalized.y_max)
+    .bind(normalized.bbox_x)
+    .bind(normalized.bbox_y)
+    .bind(normalized.bbox_w)
+    .bind(normalized.bbox_h)
+    .bind(&normalized.line_colour)
+    .bind(normalized.line_width)
+    .fetch_one(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(row.get("id"))
+}
+
+#[tauri::command]
+async fn load_surface_graph_objects(
+    surface_id: i64,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<Vec<SurfaceGraphObjectOutput>, String> {
+    let rows = sqlx::query(
+        "SELECT id, surface_id, mode, equation, points_json, x_min, x_max, y_min, y_max, bbox_x, bbox_y, bbox_w, bbox_h, line_colour, line_width \
+         FROM surface_graph_objects WHERE surface_id = ? ORDER BY id",
+    )
+    .bind(surface_id)
+    .fetch_all(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| SurfaceGraphObjectOutput {
+            id: r.get("id"),
+            surface_id: r.get("surface_id"),
+            mode: r.get("mode"),
+            equation: r.get("equation"),
+            points_json: r.get("points_json"),
+            x_min: r.get("x_min"),
+            x_max: r.get("x_max"),
+            y_min: r.get("y_min"),
+            y_max: r.get("y_max"),
+            bbox_x: r.get("bbox_x"),
+            bbox_y: r.get("bbox_y"),
+            bbox_w: r.get("bbox_w"),
+            bbox_h: r.get("bbox_h"),
+            line_colour: r.get("line_colour"),
+            line_width: r.get("line_width"),
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn update_surface_graph_object(
+    graph_id: i64,
+    graph: SurfaceGraphObjectInput,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<(), String> {
+    let normalized = normalize_surface_graph_input(graph)?;
+    let result = sqlx::query(
+        "UPDATE surface_graph_objects \
+         SET mode = ?, equation = ?, points_json = ?, x_min = ?, x_max = ?, y_min = ?, y_max = ?, \
+             bbox_x = ?, bbox_y = ?, bbox_w = ?, bbox_h = ?, line_colour = ?, line_width = ?, updated_at = CURRENT_TIMESTAMP \
+         WHERE id = ?",
+    )
+    .bind(&normalized.mode)
+    .bind(normalized.equation.as_deref())
+    .bind(normalized.points_json.as_deref())
+    .bind(normalized.x_min)
+    .bind(normalized.x_max)
+    .bind(normalized.y_min)
+    .bind(normalized.y_max)
+    .bind(normalized.bbox_x)
+    .bind(normalized.bbox_y)
+    .bind(normalized.bbox_w)
+    .bind(normalized.bbox_h)
+    .bind(&normalized.line_colour)
+    .bind(normalized.line_width)
+    .bind(graph_id)
+    .execute(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if result.rows_affected() == 0 {
+        return Err(format!("surface graph object {} not found", graph_id));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_surface_graph_object(
+    graph_id: i64,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM surface_graph_objects WHERE id = ?")
+        .bind(graph_id)
+        .execute(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Return the number of pages in the PDF at the given relative path.
 #[tauri::command]
 async fn get_page_count(
@@ -3557,6 +4119,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             import_pdf,
             list_textbooks,
+            save_past_paper_instruction_range,
+            inspect_past_paper_instruction_context,
             get_pdf_path,
             get_or_create_page,
             get_or_create_page_surface,
@@ -3567,6 +4131,10 @@ pub fn run() {
             save_surface_stroke,
             load_surface_strokes,
             delete_surface_stroke,
+            save_surface_graph_object,
+            load_surface_graph_objects,
+            update_surface_graph_object,
+            delete_surface_graph_object,
             render_pdf_page,
             get_page_count,
             get_chunks_for_page,
@@ -3587,6 +4155,7 @@ pub fn run() {
             get_chunk_preview,
             get_question_source_slices,
             get_proof_chunk_for_target,
+            save_question_available_marks,
             save_question_achieved_marks,
             list_question_mark_attempts,
             mark_question_answer_with_ai,
