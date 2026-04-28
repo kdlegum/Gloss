@@ -22,12 +22,13 @@ use pdfium_render::prelude::*;
 use percent_encoding::percent_decode_str;
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
-use tauri_plugin_fs::{FilePath, FsExt};
+use tauri_plugin_fs::{FilePath, FsExt, OpenOptions};
 use tauri_plugin_log::{Target, TargetKind, TimezoneStrategy};
 use tokio::sync::Semaphore;
 
@@ -146,6 +147,12 @@ impl PdfCache {
         let arc = Arc::new(value);
         self.data.insert(key, Arc::clone(&arc));
         arc
+    }
+
+    fn remove_document(&mut self, relative_path: &str) {
+        self.order.retain(|(path, _, _)| path != relative_path);
+        self.data
+            .retain(|(path, _, _), _| path.as_str() != relative_path);
     }
 }
 
@@ -3384,6 +3391,249 @@ async fn import_pdf(
     })
 }
 
+fn file_path_label(path: &FilePath) -> String {
+    match path {
+        FilePath::Path(path) => path.to_string_lossy().to_string(),
+        FilePath::Url(url) => url.to_string(),
+    }
+}
+
+fn quote_sqlite_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn open_file_for_overwrite(
+    app: &tauri::AppHandle,
+    path: FilePath,
+) -> Result<std::fs::File, String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    app.fs().open(path, options).map_err(|e| e.to_string())
+}
+
+async fn replace_main_database_from_staged_import(
+    pool: &SqlitePool,
+    staged_import_path: &std::path::Path,
+) -> Result<(), String> {
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let attach_result = sqlx::query("ATTACH DATABASE ? AS imported")
+        .bind(staged_import_path.to_string_lossy().to_string())
+        .execute(pool)
+        .await;
+    if let Err(err) = attach_result {
+        let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(pool).await;
+        return Err(err.to_string());
+    }
+
+    let table_rows = match sqlx::query(
+        "SELECT name FROM main.sqlite_master \
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+         ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            let _ = sqlx::query("DETACH DATABASE imported").execute(pool).await;
+            let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(pool).await;
+            return Err(err.to_string());
+        }
+    };
+
+    let mut restore_result = sqlx::query("BEGIN IMMEDIATE TRANSACTION")
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+
+    if restore_result.is_ok() {
+        for row in table_rows {
+            let table_name: String = row.get("name");
+            let quoted = quote_sqlite_identifier(&table_name);
+            let delete_sql = format!("DELETE FROM {quoted}");
+            if let Err(err) = sqlx::query(&delete_sql).execute(pool).await {
+                restore_result = Err(format!(
+                    "failed clearing table {table_name} during import: {err}"
+                ));
+                break;
+            }
+
+            let insert_sql = format!("INSERT INTO {quoted} SELECT * FROM imported.{quoted}");
+            if let Err(err) = sqlx::query(&insert_sql).execute(pool).await {
+                restore_result = Err(format!(
+                    "failed copying table {table_name} during import: {err}"
+                ));
+                break;
+            }
+        }
+    }
+
+    if restore_result.is_ok() {
+        let imported_has_sqlite_sequence = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM imported.sqlite_master \
+             WHERE type = 'table' AND name = 'sqlite_sequence' \
+             LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some();
+
+        if imported_has_sqlite_sequence {
+            if let Err(err) = sqlx::query("DELETE FROM sqlite_sequence").execute(pool).await {
+                restore_result = Err(format!("failed clearing sqlite_sequence during import: {err}"));
+            } else if let Err(err) = sqlx::query(
+                "INSERT INTO sqlite_sequence(name, seq) \
+                 SELECT name, seq FROM imported.sqlite_sequence",
+            )
+            .execute(pool)
+            .await
+            {
+                restore_result = Err(format!("failed copying sqlite_sequence during import: {err}"));
+            }
+        }
+    }
+
+    if restore_result.is_ok() {
+        if let Err(err) = sqlx::query("COMMIT").execute(pool).await {
+            restore_result = Err(err.to_string());
+        }
+    } else {
+        let _ = sqlx::query("ROLLBACK").execute(pool).await;
+    }
+
+    let detach_result = sqlx::query("DETACH DATABASE imported")
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string());
+    let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(pool).await;
+
+    restore_result?;
+    detach_result?;
+
+    let fk_violation = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    if fk_violation.is_some() {
+        return Err("import finished but foreign key checks failed".to_string());
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn export_database_file(
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<String, String> {
+    let destination = app
+        .dialog()
+        .file()
+        .add_filter("SQLite DB", &["db", "sqlite", "sqlite3"])
+        .set_file_name("gloss-backup.db")
+        .blocking_save_file();
+    let destination = match destination {
+        Some(path) => path,
+        None => return Err("cancelled".into()),
+    };
+    let destination_label = file_path_label(&destination);
+
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+    let temp_export_path = data_dir.join("gloss-db-export.tmp.db");
+    if temp_export_path.exists() {
+        std::fs::remove_file(&temp_export_path).map_err(|e| e.to_string())?;
+    }
+
+    let export_result = async {
+        sqlx::query("VACUUM INTO ?")
+            .bind(temp_export_path.to_string_lossy().to_string())
+            .execute(pool.inner())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let bytes = std::fs::read(&temp_export_path).map_err(|e| e.to_string())?;
+        let mut output = open_file_for_overwrite(&app, destination)?;
+        output.write_all(&bytes).map_err(|e| e.to_string())?;
+        output.flush().map_err(|e| e.to_string())?;
+        Ok::<String, String>(destination_label)
+    }
+    .await;
+
+    let _ = std::fs::remove_file(&temp_export_path);
+
+    if let Ok(path) = &export_result {
+        info!(target: "gloss_lib::sync", "exported database backup to {}", path);
+    }
+    export_result
+}
+
+#[tauri::command]
+async fn import_database_file(
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<String, String> {
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("SQLite DB", &["db", "sqlite", "sqlite3"])
+        .blocking_pick_file();
+
+    let picked = match picked {
+        Some(path) => path,
+        None => return Err("cancelled".into()),
+    };
+    let picked_label = file_path_label(&picked);
+    let picked_label_result = picked_label.clone();
+
+    let bytes = app.fs().read(picked).map_err(|e| e.to_string())?;
+
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+    let staged_import_path = data_dir.join("gloss-db-import.tmp.db");
+    if staged_import_path.exists() {
+        std::fs::remove_file(&staged_import_path).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&staged_import_path, &bytes).map_err(|e| e.to_string())?;
+
+    let import_result = async {
+        let staged_db_url = format!("sqlite://{}?mode=rwc", staged_import_path.display());
+        let staged_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&staged_db_url)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        sqlx::migrate!("./migrations")
+            .run(&staged_pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        staged_pool.close().await;
+
+        replace_main_database_from_staged_import(pool.inner(), &staged_import_path).await?;
+        sqlx::migrate!("./migrations")
+            .run(pool.inner())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok::<String, String>(picked_label_result)
+    }
+    .await;
+
+    let _ = std::fs::remove_file(&staged_import_path);
+
+    if let Ok(path) = &import_result {
+        info!(target: "gloss_lib::sync", "imported database backup from {}", path);
+    }
+    import_result
+}
+
 #[tauri::command]
 async fn get_pdf_path(app: tauri::AppHandle, relative_path: String) -> Result<String, String> {
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -3412,6 +3662,202 @@ async fn list_textbooks(pool: tauri::State<'_, SqlitePool>) -> Result<Vec<Source
             instruction_page_end: r.get("instruction_page_end"),
         })
         .collect())
+}
+
+fn resolve_document_pdf_path(
+    data_dir: &std::path::Path,
+    relative_path: &str,
+) -> Result<std::path::PathBuf, String> {
+    let relative = std::path::Path::new(relative_path);
+    if relative.is_absolute() {
+        return Err(format!(
+            "invalid stored file path '{}' (expected relative path)",
+            relative_path
+        ));
+    }
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(format!(
+            "invalid stored file path '{}' (path traversal not allowed)",
+            relative_path
+        ));
+    }
+    Ok(data_dir.join(relative))
+}
+
+#[tauri::command]
+async fn delete_source_document(
+    source_document_id: i64,
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let jobs = state.chunking_jobs.lock().map_err(|e| e.to_string())?;
+        if jobs.iter().any(|(doc_id, _)| *doc_id == source_document_id) {
+            return Err("cannot delete document while chunking is active".to_string());
+        }
+    }
+
+    let row = sqlx::query("SELECT title, file_path FROM source_documents WHERE id = ?")
+        .bind(source_document_id)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("source document {} not found", source_document_id))?;
+
+    let title: String = row.get("title");
+    let relative_path: String = row.get("file_path");
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let abs_pdf_path = resolve_document_pdf_path(&data_dir, &relative_path)?;
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "DELETE FROM surface_graph_objects \
+         WHERE surface_id IN ( \
+             SELECT ns.id \
+             FROM note_surfaces ns \
+             LEFT JOIN pages p ON p.id = ns.page_id \
+             LEFT JOIN chunks c ON c.id = ns.chunk_id \
+             WHERE p.source_document_id = ? OR c.source_document_id = ? \
+         )",
+    )
+    .bind(source_document_id)
+    .bind(source_document_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "DELETE FROM surface_strokes \
+         WHERE surface_id IN ( \
+             SELECT ns.id \
+             FROM note_surfaces ns \
+             LEFT JOIN pages p ON p.id = ns.page_id \
+             LEFT JOIN chunks c ON c.id = ns.chunk_id \
+             WHERE p.source_document_id = ? OR c.source_document_id = ? \
+         )",
+    )
+    .bind(source_document_id)
+    .bind(source_document_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "DELETE FROM note_surfaces \
+         WHERE page_id IN (SELECT id FROM pages WHERE source_document_id = ?) \
+            OR chunk_id IN (SELECT id FROM chunks WHERE source_document_id = ?)",
+    )
+    .bind(source_document_id)
+    .bind(source_document_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "DELETE FROM question_page_slices \
+         WHERE page_id IN (SELECT id FROM pages WHERE source_document_id = ?) \
+            OR chunk_id IN (SELECT id FROM chunks WHERE source_document_id = ?)",
+    )
+    .bind(source_document_id)
+    .bind(source_document_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "DELETE FROM question_mark_attempts \
+         WHERE chunk_id IN (SELECT id FROM chunks WHERE source_document_id = ?)",
+    )
+    .bind(source_document_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "DELETE FROM chunk_aliases \
+         WHERE chunk_id IN (SELECT id FROM chunks WHERE source_document_id = ?)",
+    )
+    .bind(source_document_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "DELETE FROM chunk_references \
+         WHERE source_chunk_id IN (SELECT id FROM chunks WHERE source_document_id = ?)",
+    )
+    .bind(source_document_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM text_blocks WHERE page_id IN (SELECT id FROM pages WHERE source_document_id = ?)")
+        .bind(source_document_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM strokes WHERE page_id IN (SELECT id FROM pages WHERE source_document_id = ?)")
+        .bind(source_document_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM chunks WHERE source_document_id = ?")
+        .bind(source_document_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM pages WHERE source_document_id = ?")
+        .bind(source_document_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM source_documents WHERE id = ?")
+        .bind(source_document_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    if let Ok(mut cache) = state.pdf_cache.lock() {
+        cache.remove_document(&relative_path);
+    }
+
+    if let Err(err) = std::fs::remove_file(&abs_pdf_path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            log::warn!(
+                target: "gloss_lib::library",
+                "deleted doc_id={} title=\"{}\" but failed to remove file {}: {}",
+                source_document_id,
+                title,
+                abs_pdf_path.display(),
+                err
+            );
+        }
+    }
+
+    info!(
+        target: "gloss_lib::library",
+        "deleted source document doc_id={} title=\"{}\" relative_path=\"{}\"",
+        source_document_id,
+        title,
+        relative_path
+    );
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -4118,7 +4564,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             import_pdf,
+            export_database_file,
+            import_database_file,
             list_textbooks,
+            delete_source_document,
             save_past_paper_instruction_range,
             inspect_past_paper_instruction_context,
             get_pdf_path,

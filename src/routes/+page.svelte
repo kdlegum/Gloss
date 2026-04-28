@@ -35,6 +35,7 @@
   import { fade } from "svelte/transition";
 
   type DocumentMode = "textbook" | "past_paper";
+  type DatabaseTransferMode = "export" | "import";
 
   interface SourceDocument {
     id: number;
@@ -257,6 +258,12 @@
 
   let sourceDocuments = $state<SourceDocument[]>([]);
   let importing = $state(false);
+  let dbTransferBusy = $state(false);
+  let dbTransferMode = $state<DatabaseTransferMode | null>(null);
+  let dbTransferError = $state<string | null>(null);
+  let dbTransferFeedback = $state<string | null>(null);
+  let pendingDeleteSourceDocumentId = $state<number | null>(null);
+  let deletingSourceDocumentId = $state<number | null>(null);
   let error = $state<string | null>(null);
   let detachLogConsole: (() => void) | null = null;
   let aiTaskSettings = $state<AiTaskSettings>(defaultAiTaskSettings());
@@ -2732,6 +2739,12 @@
 
   async function loadSourceDocuments() {
     sourceDocuments = await invoke<SourceDocument[]>("list_textbooks");
+    if (
+      pendingDeleteSourceDocumentId !== null
+      && !sourceDocuments.some((doc) => doc.id === pendingDeleteSourceDocumentId)
+    ) {
+      pendingDeleteSourceDocumentId = null;
+    }
     void appLogInfo(`[library] loaded ${sourceDocuments.length} documents`);
   }
 
@@ -2877,8 +2890,61 @@
     }
   }
 
+  async function exportDatabaseFile() {
+    if (importing || deletingSourceDocumentId !== null || dbTransferBusy) return;
+
+    error = null;
+    dbTransferError = null;
+    dbTransferFeedback = null;
+    dbTransferBusy = true;
+    dbTransferMode = "export";
+    try {
+      const destination = await invoke<string>("export_database_file");
+      dbTransferFeedback = `Database exported to ${destination}.`;
+      await appLogInfo(`[sync] database exported to ${destination}`);
+    } catch (err) {
+      if (err !== "cancelled") {
+        dbTransferError = formatLogError(err);
+        await appLogError(`[sync] database export failed: ${dbTransferError}`);
+      }
+    } finally {
+      dbTransferBusy = false;
+      dbTransferMode = null;
+    }
+  }
+
+  async function importDatabaseFile() {
+    if (importing || deletingSourceDocumentId !== null || dbTransferBusy) return;
+
+    const confirmed = window.confirm(
+      "Import a database backup?\n\nThis replaces your current local Gloss database (notes, chunk data, and settings). PDFs are not included, so keep your PDF files synced separately.",
+    );
+    if (!confirmed) return;
+
+    error = null;
+    dbTransferError = null;
+    dbTransferFeedback = null;
+    dbTransferBusy = true;
+    dbTransferMode = "import";
+    try {
+      const source = await invoke<string>("import_database_file");
+      await loadSourceDocuments();
+      dbTransferFeedback = `Database imported from ${source}.`;
+      await appLogInfo(`[sync] database imported from ${source}`);
+    } catch (err) {
+      if (err !== "cancelled") {
+        dbTransferError = formatLogError(err);
+        await appLogError(`[sync] database import failed: ${dbTransferError}`);
+      }
+    } finally {
+      dbTransferBusy = false;
+      dbTransferMode = null;
+    }
+  }
+
   async function importPdf(documentMode: DocumentMode = "textbook") {
     error = null;
+    pendingDeleteSourceDocumentId = null;
     importing = true;
     try {
       const doc = await invoke<SourceDocument>("import_pdf", { documentMode });
@@ -2900,8 +2966,43 @@
     }
   }
 
+  async function deleteSourceDocument(book: SourceDocument) {
+    if (
+      importing
+      || deletingSourceDocumentId !== null
+      || pendingDeleteSourceDocumentId !== book.id
+    ) return;
+
+    error = null;
+    deletingSourceDocumentId = book.id;
+    try {
+      await invoke("delete_source_document", { sourceDocumentId: book.id });
+      await loadSourceDocuments();
+      pendingDeleteSourceDocumentId = null;
+      await appLogInfo(`[library] deleted doc=${book.id} title="${book.title}"`);
+    } catch (err) {
+      error = formatLogError(err);
+      await appLogError(
+        `[library] delete failed doc=${book.id} title="${book.title}": ${formatLogError(err)}`,
+      );
+    } finally {
+      deletingSourceDocumentId = null;
+    }
+  }
+
+  function requestSourceDocumentDelete(bookId: number) {
+    if (importing || deletingSourceDocumentId !== null) return;
+    pendingDeleteSourceDocumentId = bookId;
+  }
+
+  function cancelSourceDocumentDelete() {
+    if (deletingSourceDocumentId !== null) return;
+    pendingDeleteSourceDocumentId = null;
+  }
+
   async function openBook(book: SourceDocument) {
     error = null;
+    pendingDeleteSourceDocumentId = null;
     if (batchChunkProgress && batchChunkProgress.docId !== book.id) {
       batchChunkProgress = null;
     }
@@ -9215,10 +9316,58 @@
         <ul>
           {#each sourceDocuments as book (book.id)}
             <li>
-              <button class="book-item" onclick={() => openBook(book)}>
-                <span class="title">{book.title}</span>
-                <span class="path">{book.file_path}</span>
-              </button>
+              <div class="book-row">
+                <button
+                  class="book-item"
+                  onclick={() => openBook(book)}
+                  disabled={deletingSourceDocumentId !== null}
+                >
+                  <span class="title">{book.title}</span>
+                  <span class="path">{book.file_path}</span>
+                </button>
+                <div class="book-delete-group">
+                  {#if pendingDeleteSourceDocumentId === book.id}
+                    <button
+                      class="book-delete-confirm"
+                      class:loading={deletingSourceDocumentId === book.id}
+                      type="button"
+                      onclick={() => void deleteSourceDocument(book)}
+                      disabled={importing || deletingSourceDocumentId !== null}
+                      aria-label={`Confirm delete ${book.title}`}
+                      title={`Confirm delete ${book.title}`}
+                    >
+                      {deletingSourceDocumentId === book.id ? "Deleting..." : "Confirm"}
+                    </button>
+                    <button
+                      class="book-delete-cancel"
+                      type="button"
+                      onclick={cancelSourceDocumentDelete}
+                      disabled={deletingSourceDocumentId !== null}
+                      aria-label={`Cancel delete ${book.title}`}
+                      title={`Cancel delete ${book.title}`}
+                    >
+                      Cancel
+                    </button>
+                  {:else}
+                    <button
+                      class="book-delete"
+                      type="button"
+                      onclick={() => requestSourceDocumentDelete(book.id)}
+                      disabled={importing || deletingSourceDocumentId !== null}
+                      aria-label={`Delete ${book.title}`}
+                      title={`Delete ${book.title}`}
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <polyline points="3 6 5 6 21 6" />
+                        <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" />
+                        <path d="M19 6l-1 14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1L5 6" />
+                        <line x1="10" y1="11" x2="10" y2="17" />
+                        <line x1="14" y1="11" x2="14" y2="17" />
+                      </svg>
+                    </button>
+                  {/if}
+                </div>
+              </div>
             </li>
           {/each}
         </ul>
@@ -9930,7 +10079,13 @@
     overflow: hidden;
   }
 
+  .book-row {
+    display: flex;
+    align-items: stretch;
+  }
+
   .book-item {
+    flex: 1;
     display: flex;
     flex-direction: column;
     gap: 0.15rem;
@@ -9945,8 +10100,84 @@
     transition: background 0.15s;
   }
 
-  .book-item:hover {
+  .book-item:hover:not(:disabled) {
     background: #e0e0e0 !important;
+  }
+
+  .book-delete {
+    width: 46px;
+    min-width: 46px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: #efe4e6;
+    color: #8f2532;
+    border-left: 1px solid #dfc7cc;
+    transition: background 0.15s, color 0.15s;
+    font-weight: 700;
+  }
+
+  .book-delete svg {
+    width: 17px;
+    height: 17px;
+  }
+
+  .book-delete:hover:not(:disabled) {
+    background: #e8d4d8 !important;
+    color: #7e1d2a;
+  }
+
+  .book-delete:disabled {
+    opacity: 0.7;
+  }
+
+  .book-delete.loading {
+    color: #7a4b51;
+  }
+
+  .book-delete-group {
+    display: flex;
+    align-items: stretch;
+  }
+
+  .book-delete-confirm,
+  .book-delete-cancel {
+    min-width: 72px;
+    padding: 0 0.65rem;
+    font-size: 0.78rem;
+    font-weight: 700;
+    border-left: 1px solid #d3d7de;
+    transition: background 0.15s, color 0.15s, opacity 0.15s;
+  }
+
+  .book-delete-confirm {
+    background: #fbe6e8;
+    color: #8f2532;
+  }
+
+  .book-delete-confirm:hover:not(:disabled) {
+    background: #f6d7dc !important;
+    color: #7e1d2a;
+  }
+
+  .book-delete-confirm.loading {
+    color: #7a4b51;
+  }
+
+  .book-delete-cancel {
+    background: #e9edf3;
+    color: #3f4d63;
+  }
+
+  .book-delete-cancel:hover:not(:disabled) {
+    background: #dde4ee !important;
+    color: #2f3d54;
+  }
+
+  .book-delete-confirm:disabled,
+  .book-delete-cancel:disabled {
+    opacity: 0.72;
   }
 
   .title { font-weight: 600; }
