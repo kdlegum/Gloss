@@ -2894,6 +2894,7 @@
     if (importing || deletingSourceDocumentId !== null || dbTransferBusy) return;
 
     error = null;
+    pendingDeleteSourceDocumentId = null;
     dbTransferError = null;
     dbTransferFeedback = null;
     dbTransferBusy = true;
@@ -2922,6 +2923,7 @@
     if (!confirmed) return;
 
     error = null;
+    pendingDeleteSourceDocumentId = null;
     dbTransferError = null;
     dbTransferFeedback = null;
     dbTransferBusy = true;
@@ -2943,6 +2945,7 @@
   }
 
   async function importPdf(documentMode: DocumentMode = "textbook") {
+    if (dbTransferBusy) return;
     error = null;
     pendingDeleteSourceDocumentId = null;
     importing = true;
@@ -2969,6 +2972,7 @@
   async function deleteSourceDocument(book: SourceDocument) {
     if (
       importing
+      || dbTransferBusy
       || deletingSourceDocumentId !== null
       || pendingDeleteSourceDocumentId !== book.id
     ) return;
@@ -2991,7 +2995,7 @@
   }
 
   function requestSourceDocumentDelete(bookId: number) {
-    if (importing || deletingSourceDocumentId !== null) return;
+    if (importing || dbTransferBusy || deletingSourceDocumentId !== null) return;
     pendingDeleteSourceDocumentId = bookId;
   }
 
@@ -9290,25 +9294,52 @@
 	          <div class="import-mode-group">
 	            <button
 	              onclick={() => void importPdf("textbook")}
-	              disabled={importing}
+	              disabled={importing || dbTransferBusy}
 	              class="import-btn import-btn-secondary"
 	            >
 	              {importing ? "Importingâ€¦" : "Import Textbook"}
 	            </button>
 	            <button
 	              onclick={() => void importPdf("past_paper")}
-	              disabled={importing}
+	              disabled={importing || dbTransferBusy}
 	              class="import-btn"
 	            >
 	              {importing ? "Importingâ€¦" : "Import Past Paper"}
 	            </button>
 	          </div>
+            <div class="db-sync-group">
+              <button
+                class="import-btn import-btn-secondary"
+                type="button"
+                onclick={() => void exportDatabaseFile()}
+                disabled={importing || deletingSourceDocumentId !== null || dbTransferBusy}
+              >
+                {dbTransferBusy && dbTransferMode === "export" ? "Exporting..." : "Export DB"}
+              </button>
+              <button
+                class="import-btn import-btn-secondary"
+                type="button"
+                onclick={() => void importDatabaseFile()}
+                disabled={importing || deletingSourceDocumentId !== null || dbTransferBusy}
+              >
+                {dbTransferBusy && dbTransferMode === "import" ? "Importing..." : "Import DB"}
+              </button>
+            </div>
 	        </div>
 	      </div>
 
       {#if error}
         <p class="error">{error}</p>
       {/if}
+      {#if dbTransferError}
+        <p class="error">{dbTransferError}</p>
+      {/if}
+      {#if dbTransferFeedback}
+        <p class="db-transfer-feedback">{dbTransferFeedback}</p>
+      {/if}
+      <p class="db-transfer-hint">
+        DB export/import is for notes/settings sync. Keep PDF files synced separately.
+      </p>
 
 	      {#if sourceDocuments.length === 0}
 	        <p class="empty">No documents yet. Import a textbook or past paper to get started.</p>
@@ -9320,7 +9351,7 @@
                 <button
                   class="book-item"
                   onclick={() => openBook(book)}
-                  disabled={deletingSourceDocumentId !== null}
+                  disabled={deletingSourceDocumentId !== null || dbTransferBusy}
                 >
                   <span class="title">{book.title}</span>
                   <span class="path">{book.file_path}</span>
@@ -9332,7 +9363,7 @@
                       class:loading={deletingSourceDocumentId === book.id}
                       type="button"
                       onclick={() => void deleteSourceDocument(book)}
-                      disabled={importing || deletingSourceDocumentId !== null}
+                      disabled={importing || dbTransferBusy || deletingSourceDocumentId !== null}
                       aria-label={`Confirm delete ${book.title}`}
                       title={`Confirm delete ${book.title}`}
                     >
@@ -9342,7 +9373,7 @@
                       class="book-delete-cancel"
                       type="button"
                       onclick={cancelSourceDocumentDelete}
-                      disabled={deletingSourceDocumentId !== null}
+                      disabled={dbTransferBusy || deletingSourceDocumentId !== null}
                       aria-label={`Cancel delete ${book.title}`}
                       title={`Cancel delete ${book.title}`}
                     >
@@ -9353,7 +9384,7 @@
                       class="book-delete"
                       type="button"
                       onclick={() => requestSourceDocumentDelete(book.id)}
-                      disabled={importing || deletingSourceDocumentId !== null}
+                      disabled={importing || dbTransferBusy || deletingSourceDocumentId !== null}
                       aria-label={`Delete ${book.title}`}
                       title={`Delete ${book.title}`}
                     >
@@ -9900,6 +9931,14 @@
     justify-content: flex-end;
   }
 
+  .db-sync-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
   .import-btn-secondary {
     background: #eef2f8;
     color: #243149;
@@ -9921,6 +9960,18 @@
   .import-btn-secondary:disabled {
     background: #eff3f8;
     color: #8a96aa;
+  }
+
+  .db-transfer-feedback {
+    color: #1f5133;
+    font-size: 0.9em;
+    margin: 0.5rem 0 0;
+  }
+
+  .db-transfer-hint {
+    margin: 0.3rem 0 0;
+    color: #667085;
+    font-size: 0.8rem;
   }
 
   .ai-settings-btn {
@@ -9951,6 +10002,10 @@
     }
 
     .import-mode-group {
+      width: 100%;
+    }
+
+    .db-sync-group {
       width: 100%;
     }
 
