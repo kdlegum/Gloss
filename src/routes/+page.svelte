@@ -4109,13 +4109,17 @@
     await cancelChunkChatForReset();
   }
 
-  function blobToBase64(blob: Blob): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve((reader.result as string).split(",")[1]);
-      reader.onerror = reject;
-      reader.readAsDataURL(blob);
-    });
+  // OffscreenCanvas.convertToBlob() hangs on some Android WebViews.
+  // Use transferToImageBitmap + regular canvas + toDataURL instead.
+  function offscreenToBase64(offscreen: OffscreenCanvas): string {
+    const tmp = document.createElement("canvas");
+    tmp.width = offscreen.width;
+    tmp.height = offscreen.height;
+    const ctx = tmp.getContext("2d")!;
+    const bitmap = offscreen.transferToImageBitmap();
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+    return tmp.toDataURL("image/png").split(",")[1];
   }
 
   async function rasteriseSelection(): Promise<string> {
@@ -4175,8 +4179,7 @@
       ctx.drawImage(inkCanvas, 0, 0);
     }
 
-    const blob = await offscreen.convertToBlob({ type: "image/png" });
-    return blobToBase64(blob);
+    return offscreenToBase64(offscreen);
   }
 
   async function onAiClick() {
@@ -4273,8 +4276,7 @@
       );
     }
 
-    const blob = await offscreen.convertToBlob({ type: "image/png" });
-    return blobToBase64(blob);
+    return offscreenToBase64(offscreen);
   }
 
   async function onChunkAiClick() {
@@ -5818,6 +5820,13 @@
     const pages: ChunkVisualPageImage[] = [];
 
     for (let pageIndex = pageBounds.minPage; pageIndex <= pageBounds.maxPage; pageIndex += 1) {
+      const pageHasContent = drawableStrokes.some((s) =>
+        chunkVisualIntersectsPage(pageIndex, s.bbox.minY, s.bbox.maxY),
+      ) || drawableGraphs.some((g) =>
+        chunkVisualIntersectsPage(pageIndex, g.bboxY, g.bboxY + g.bboxH),
+      );
+      if (!pageHasContent) continue;
+
       const offscreen = new OffscreenCanvas(width, height);
       const ctx = offscreen.getContext("2d");
       if (!ctx) throw new Error("Failed to create chunk ink context canvas");
@@ -5857,8 +5866,7 @@
         );
       }
 
-      const blob = await offscreen.convertToBlob({ type: "image/png" });
-      const imageBase64 = await blobToBase64(blob);
+      const imageBase64 = offscreenToBase64(offscreen);
       pages.push({
         pageIndex,
         imageBase64,
@@ -6929,8 +6937,7 @@
     if (!ctx) throw new Error("Failed to create chunk transcription canvas");
     ctx.drawImage(rendered.bitmap, sx, sy, sw, sh, 0, 0, sw, sh);
 
-    const blob = await offscreen.convertToBlob({ type: "image/png" });
-    return blobToBase64(blob);
+    return offscreenToBase64(offscreen);
   }
 
   function applyChunkFormattedBody(chunkId: number, bodyMarkdown: string) {
