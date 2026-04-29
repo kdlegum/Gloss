@@ -405,14 +405,10 @@ fn build_chat_messages(prompt: &str, history: &[ChunkChatMessage]) -> Value {
             "content": message.content
         });
         if role == "user" {
-            if let Some(image_base64) = message
-                .image_base64
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
+            let images = message.image_items();
+            if !images.is_empty() {
                 if let Some(obj) = entry.as_object_mut() {
-                    obj.insert("images".to_string(), json!([image_base64]));
+                    obj.insert("images".to_string(), json!(images));
                 }
             }
         }

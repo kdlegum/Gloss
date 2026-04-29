@@ -392,10 +392,33 @@ impl OpenAiClient {
             chunk.subject.is_some()
         );
 
+        let images = chunk.image_base64_list.iter()
+            .map(|b64| b64.trim())
+            .filter(|b64| !b64.is_empty())
+            .collect::<Vec<_>>();
+        let input: Value = if images.is_empty() {
+            json!(prompt)
+        } else {
+            let mut content_items = vec![json!({
+                "type": "input_text",
+                "text": prompt
+            })];
+            for image_base64 in &images {
+                content_items.push(json!({
+                    "type": "input_image",
+                    "image_url": format!("data:image/png;base64,{image_base64}"),
+                    "detail": "high"
+                }));
+            }
+            json!([{
+                "role": "user",
+                "content": content_items
+            }])
+        };
         let mut request = json!({
             "model": self.model,
             "store": false,
-            "input": prompt,
+            "input": input,
             "text": {
                 "format": {
                     "type": "json_schema",
@@ -477,11 +500,22 @@ fn build_chat_input(prompt: &str, history: &[ChunkChatMessage]) -> Value {
     })];
 
     for message in history {
-        let role = if message.role == "assistant" {
-            "assistant"
-        } else {
-            "user"
-        };
+        let role = message.role.trim();
+        if role == "assistant" {
+            let content = message.content.trim();
+            if content.is_empty() {
+                continue;
+            }
+            messages.push(json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": content
+                }]
+            }));
+            continue;
+        }
+
         let mut content_items: Vec<Value> = Vec::new();
         if !message.content.trim().is_empty() {
             content_items.push(json!({
@@ -489,25 +523,18 @@ fn build_chat_input(prompt: &str, history: &[ChunkChatMessage]) -> Value {
                 "text": message.content
             }));
         }
-        if role == "user" {
-            if let Some(image_base64) = message
-                .image_base64
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                content_items.push(json!({
-                    "type": "input_image",
-                    "image_url": format!("data:image/png;base64,{image_base64}"),
-                    "detail": "high"
-                }));
-            }
+        for image_base64 in message.image_items() {
+            content_items.push(json!({
+                "type": "input_image",
+                "image_url": format!("data:image/png;base64,{image_base64}"),
+                "detail": "high"
+            }));
         }
         if content_items.is_empty() {
             continue;
         }
         messages.push(json!({
-            "role": role,
+            "role": "user",
             "content": content_items
         }));
     }

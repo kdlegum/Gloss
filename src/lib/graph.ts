@@ -315,7 +315,7 @@ export function buildGraphGeometry(specInput: GraphSpec, options: GraphBuildOpti
 }
 
 export function drawGraphCard(
-  ctx: CanvasRenderingContext2D,
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
   specInput: GraphSpec,
   x: number,
   y: number,

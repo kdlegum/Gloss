@@ -1418,22 +1418,22 @@ fn sanitize_chunk_chat_history(
             return Err(format!("invalid chat role {:?}", message.role));
         }
         let content = message.content.trim();
-        let image_base64 = message
-            .image_base64
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        if role != "user" && image_base64.is_some() {
+        let image_base64_list: Vec<String> = message
+            .image_items()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        if role != "user" && !image_base64_list.is_empty() {
             return Err("image attachments are only allowed on user messages".into());
         }
-        if content.is_empty() && image_base64.is_none() {
+        if content.is_empty() && image_base64_list.is_empty() {
             continue;
         }
         cleaned.push(ChunkChatMessage {
             role: role.to_string(),
             content: content.to_string(),
-            image_base64,
+            image_base64: None,
+            image_base64_list,
         });
     }
 
@@ -1978,6 +1978,7 @@ async fn rewrite_chunk_text_with_prompt(
         subject: context.subject.as_deref(),
         body_markdown: &context.body_markdown,
         user_prompt: &prompt,
+        image_base64_list: vec![],
     };
     let result = run_chunk_rewrite_request(pool.inner(), provider, model, &rewrite_prompt).await?;
 
@@ -2065,6 +2066,7 @@ async fn rewrite_chunk_glossary_with_prompt(
         subject: subject.as_deref(),
         body_markdown: &glossary_markdown,
         user_prompt: &wrapped_prompt,
+        image_base64_list: vec![],
     };
 
     let result = run_chunk_rewrite_request(pool.inner(), provider, model, &rewrite_prompt).await?;
@@ -2532,12 +2534,19 @@ async fn mark_question_answer_with_ai(
     provider: String,
     model: Option<String>,
     include_visuals: Option<bool>,
+    visual_context_images: Option<Vec<String>>,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<QuestionMarkSuggestion, String> {
     let provider = provider.parse::<LlmProvider>()?;
     validate_chat_provider(provider)?;
     let model = normalize_model_override(model);
     let include_visuals = include_visuals.unwrap_or(false);
+    let visual_context_images: Vec<String> = visual_context_images
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
 
     let row = sqlx::query(
         "SELECT sd.title AS book_title, c.chunk_type, c.question_label, c.available_marks, \
@@ -2567,8 +2576,11 @@ async fn mark_question_answer_with_ai(
     let answer_body = row
         .get::<Option<String>, _>("answer_body")
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "No answer text found. Add answer content before marking.".to_string())?;
+        .filter(|value| !value.is_empty());
+    if answer_body.is_none() && visual_context_images.is_empty() {
+        return Err("No answer text found. Add answer content before marking.".to_string());
+    }
+    let answer_body = answer_body.unwrap_or_default();
 
     let user_prompt = format!(
         "Mark the student's answer to this exam question.\n\
@@ -2579,17 +2591,16 @@ async fn mark_question_answer_with_ai(
          1. Score against available marks when provided.\n\
          2. Keep feedback actionable and specific.\n\
          3. If score is uncertain, set title to null and explain what is missing.\n\
-         4. Do not include headings in feedback.\n\n\
+         4. Do not include headings in feedback.\n\
+         5. If images of the student's working are attached, use them as the primary answer source.\n\n\
          Question label: {}\n\
-         Available marks: {}\n\
-         Include visuals hint: {}\n\n\
+         Available marks: {}\n\n\
          Question text:\n---\n{}\n---\n\n\
-         Student answer:\n---\n{}\n---",
+         Student answer (text):\n---\n{}\n---",
         question_label.as_deref().unwrap_or("unknown"),
         available_marks
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
-        if include_visuals { "on" } else { "off" },
         question_body.trim(),
         answer_body.trim(),
     );
@@ -2601,6 +2612,7 @@ async fn mark_question_answer_with_ai(
         subject: None,
         body_markdown: question_body.trim(),
         user_prompt: &user_prompt,
+        image_base64_list: if include_visuals { visual_context_images } else { vec![] },
     };
     let result = run_chunk_rewrite_request(pool.inner(), provider, model, &rewrite_prompt).await?;
 
@@ -4120,6 +4132,35 @@ async fn save_stroke(
 }
 
 #[tauri::command]
+async fn update_stroke(
+    stroke_id: i64,
+    stroke: StrokeInput,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<(), String> {
+    let bounds = stroke_bounds(&stroke.points)?;
+    let data = encode_stroke_points(&stroke.points)?;
+
+    sqlx::query(
+        "UPDATE strokes SET data = ?, colour = ?, thickness = ?, min_x = ?, min_y = ?, max_x = ?, max_y = ?, chunk_id = ? \
+         WHERE id = ?",
+    )
+    .bind(&data)
+    .bind(&stroke.colour)
+    .bind(stroke.thickness)
+    .bind(bounds.min_x)
+    .bind(bounds.min_y)
+    .bind(bounds.max_x)
+    .bind(bounds.max_y)
+    .bind(stroke.chunk_id)
+    .bind(stroke_id)
+    .execute(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
 async fn delete_stroke(stroke_id: i64, pool: tauri::State<'_, SqlitePool>) -> Result<(), String> {
     sqlx::query("DELETE FROM strokes WHERE id = ?")
         .bind(stroke_id)
@@ -4211,6 +4252,34 @@ async fn save_surface_stroke(
     .map_err(|e| e.to_string())?;
 
     Ok(row.get("id"))
+}
+
+#[tauri::command]
+async fn update_surface_stroke(
+    stroke_id: i64,
+    stroke: SurfaceStrokeInput,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<(), String> {
+    let bounds = stroke_bounds(&stroke.points)?;
+    let data = encode_stroke_points(&stroke.points)?;
+
+    sqlx::query(
+        "UPDATE surface_strokes SET data = ?, colour = ?, thickness = ?, min_x = ?, min_y = ?, max_x = ?, max_y = ? \
+         WHERE id = ?",
+    )
+    .bind(&data)
+    .bind(&stroke.colour)
+    .bind(stroke.thickness)
+    .bind(bounds.min_x)
+    .bind(bounds.min_y)
+    .bind(bounds.max_x)
+    .bind(bounds.max_y)
+    .bind(stroke_id)
+    .execute(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -4575,9 +4644,11 @@ pub fn run() {
             get_or_create_page_surface,
             get_or_create_chunk_surface,
             save_stroke,
+            update_stroke,
             load_strokes,
             delete_stroke,
             save_surface_stroke,
+            update_surface_stroke,
             load_surface_strokes,
             delete_surface_stroke,
             save_surface_graph_object,

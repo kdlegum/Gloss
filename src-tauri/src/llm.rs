@@ -128,6 +128,7 @@ pub struct ChunkRewritePrompt<'a> {
     pub subject: Option<&'a str>,
     pub body_markdown: &'a str,
     pub user_prompt: &'a str,
+    pub image_base64_list: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -140,6 +141,33 @@ pub struct ChunkChatMessage {
         skip_serializing_if = "Option::is_none"
     )]
     pub image_base64: Option<String>,
+    #[serde(
+        default,
+        alias = "imageBase64List",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub image_base64_list: Vec<String>,
+}
+
+impl ChunkChatMessage {
+    pub fn image_items(&self) -> Vec<&str> {
+        let mut images: Vec<&str> = Vec::with_capacity(self.image_base64_list.len() + 1);
+        if let Some(image_base64) = self
+            .image_base64
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            images.push(image_base64);
+        }
+        for image_base64 in &self.image_base64_list {
+            let trimmed = image_base64.trim();
+            if !trimmed.is_empty() {
+                images.push(trimmed);
+            }
+        }
+        images
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -561,6 +561,7 @@
       chunkId: s.chunk_id,
     }));
     redoStack = [];
+    clearPageStrokeTransformHistory();
     markDirty();
   }
 
@@ -760,11 +761,71 @@
   // â”€â”€ Tool mode â”€â”€
   type Mode = 'draw' | 'shape' | 'erase' | 'select';
   type ShapeKind = InkShapeKind;
+  type InkClipboardScope = "page" | "chunk";
   interface ShapeDraft {
     origin: Point;
     current: Point;
   }
+  interface InkClipboardStrokeData {
+    colour: string;
+    thickness: number;
+    points: Point[];
+  }
+  interface InkClipboardPayload {
+    type: "gloss-ink-selection";
+    version: 1;
+    scope: InkClipboardScope;
+    serial: string;
+    strokes: InkClipboardStrokeData[];
+  }
+  interface InkClipboardState extends InkClipboardPayload {
+    pasteCount: number;
+    systemSynced: boolean;
+  }
+  interface InkAnchorPoint {
+    x: number;
+    y: number;
+  }
+  interface InkPasteHoldState {
+    pointerId: number;
+    startClientX: number;
+    startClientY: number;
+    startPoint: InkAnchorPoint;
+    startedAt: number;
+  }
+  interface SelectionBounds {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }
+  interface StrokeDragSnapshot {
+    stroke: Stroke;
+    points: Point[];
+    bbox: Stroke["bbox"];
+  }
+  interface InkStrokeDragState {
+    startPoint: { x: number; y: number };
+    startSelection: SelectionBounds;
+    strokes: StrokeDragSnapshot[];
+  }
+  interface StrokeTransformHistoryItem {
+    stroke: Stroke;
+    beforePoints: Point[];
+    beforeBBox: Stroke["bbox"];
+    afterPoints: Point[];
+    afterBBox: Stroke["bbox"];
+  }
+  interface StrokeTransformHistoryEntry {
+    strokes: StrokeTransformHistoryItem[];
+  }
   const MIN_SHAPE_DRAG_WORLD = 4;
+  const INK_CLIPBOARD_PREFIX = "__GLOSS_INK_SELECTION__";
+  const INK_PASTE_OFFSET_WORLD = 24;
+  const INK_PASTE_HOLD_MS = 420;
+  const INK_PASTE_HOLD_MOVE_PX = 8;
+  const INK_POPOVER_EDGE_PADDING_PX = 22;
+  const INK_POPOVER_TOP_PADDING_PX = 52;
   let mode = $state<Mode>('draw');
   // Point, Stroke, Rect, pen defaults, bbox, and shape helpers are imported from $lib/ink.
   const PEN_COLOURS = [
@@ -801,6 +862,18 @@
   let selectRect   = $state<Rect | null>(null);
   let selectedStrokes = $state<Set<Stroke>>(new Set());
   let selection = $state<{ x: number; y: number; width: number; height: number } | null>(null);
+  let pageStrokeDrag = $state<InkStrokeDragState | null>(null);
+  let pageStrokeTransformUndo = $state<StrokeTransformHistoryEntry | null>(null);
+  let pageStrokeTransformRedo = $state<StrokeTransformHistoryEntry | null>(null);
+  let inkClipboard = $state<InkClipboardState | null>(null);
+  let hasPageInkClipboard = $derived.by(
+    () => !!inkClipboard && inkClipboard.scope === "page" && inkClipboard.strokes.length > 0,
+  );
+  let hasChunkInkClipboard = $derived.by(
+    () => !!inkClipboard && inkClipboard.scope === "chunk" && inkClipboard.strokes.length > 0,
+  );
+  let pagePasteMenuAnchor = $state<InkAnchorPoint | null>(null);
+  let pagePasteHold = $state<InkPasteHoldState | null>(null);
 
   // â”€â”€ Drawing state â”€â”€
   let isDrawing = $state(false);
@@ -1177,6 +1250,435 @@
     return `shape-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   }
 
+  function makeInkClipboardSerial(): string {
+    return `ink-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  function cloneInkPoints(points: Point[]): Point[] {
+    return points.map(({ x, y, pressure }) => ({ x, y, pressure }));
+  }
+
+  function cloneStrokeBBox(bbox: Stroke["bbox"]): Stroke["bbox"] {
+    return {
+      minX: bbox.minX,
+      minY: bbox.minY,
+      maxX: bbox.maxX,
+      maxY: bbox.maxY,
+    };
+  }
+
+  function serialisePageStrokeInput(stroke: Stroke) {
+    return {
+      colour: stroke.colour,
+      thickness: stroke.thickness,
+      points: stroke.points.map(({ x, y }) => ({ x, y })),
+      chunkId: stroke.chunkId,
+    };
+  }
+
+  function serialiseSurfaceStrokeInput(stroke: Stroke) {
+    return {
+      colour: stroke.colour,
+      thickness: stroke.thickness,
+      points: stroke.points.map(({ x, y }) => ({ x, y })),
+    };
+  }
+
+  function strokePointsMatch(
+    a: Array<{ x: number; y: number }>,
+    b: Array<{ x: number; y: number }>,
+  ): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+      if (a[i].x !== b[i].x || a[i].y !== b[i].y) return false;
+    }
+    return true;
+  }
+
+  function pageStrokeInputsMatch(
+    a: ReturnType<typeof serialisePageStrokeInput>,
+    b: ReturnType<typeof serialisePageStrokeInput>,
+  ): boolean {
+    return (
+      a.colour === b.colour
+      && a.thickness === b.thickness
+      && a.chunkId === b.chunkId
+      && strokePointsMatch(a.points, b.points)
+    );
+  }
+
+  function surfaceStrokeInputsMatch(
+    a: ReturnType<typeof serialiseSurfaceStrokeInput>,
+    b: ReturnType<typeof serialiseSurfaceStrokeInput>,
+  ): boolean {
+    return (
+      a.colour === b.colour
+      && a.thickness === b.thickness
+      && strokePointsMatch(a.points, b.points)
+    );
+  }
+
+  async function persistPageStrokeCreate(
+    pageId: number,
+    stroke: Stroke,
+    stillPresent: () => boolean = () => true,
+  ): Promise<void> {
+    const initial = serialisePageStrokeInput(stroke);
+    try {
+      const id = await invoke<number>("save_stroke", { pageId, stroke: initial });
+      stroke.id = id;
+      if (!stillPresent()) {
+        await invoke("delete_stroke", { strokeId: id });
+        return;
+      }
+      const latest = serialisePageStrokeInput(stroke);
+      if (!pageStrokeInputsMatch(initial, latest)) {
+        await invoke("update_stroke", { strokeId: id, stroke: latest });
+      }
+    } catch (err) {
+      void appLogWarn(`[ink] save_stroke failed: ${formatLogError(err)}`);
+    }
+  }
+
+  async function persistChunkStrokeCreate(
+    surfaceId: number,
+    stroke: Stroke,
+    stillPresent: () => boolean = () => true,
+  ): Promise<void> {
+    const initial = serialiseSurfaceStrokeInput(stroke);
+    try {
+      const id = await invoke<number>("save_surface_stroke", { surfaceId, stroke: initial });
+      stroke.id = id;
+      if (!stillPresent()) {
+        await invoke("delete_surface_stroke", { strokeId: id });
+        return;
+      }
+      const latest = serialiseSurfaceStrokeInput(stroke);
+      if (!surfaceStrokeInputsMatch(initial, latest)) {
+        await invoke("update_surface_stroke", { strokeId: id, stroke: latest });
+      }
+    } catch (err) {
+      console.error("save_surface_stroke failed", err);
+    }
+  }
+
+  async function persistPageStrokeUpdates(targetStrokes: Stroke[]): Promise<void> {
+    const pageId = currentPageId;
+    if (pageId === null || targetStrokes.length === 0) return;
+    cacheEvict(pageId);
+    await Promise.all(targetStrokes.map(async (stroke) => {
+      if (stroke.id === null) return;
+      await invoke("update_stroke", {
+        strokeId: stroke.id,
+        stroke: serialisePageStrokeInput(stroke),
+      });
+    })).catch((err) => {
+      void appLogWarn(`[ink] update_stroke failed: ${formatLogError(err)}`);
+    });
+  }
+
+  async function persistChunkStrokeUpdates(targetStrokes: Stroke[]): Promise<void> {
+    if (targetStrokes.length === 0) return;
+    await Promise.all(targetStrokes.map(async (stroke) => {
+      if (stroke.id === null) return;
+      await invoke("update_surface_stroke", {
+        strokeId: stroke.id,
+        stroke: serialiseSurfaceStrokeInput(stroke),
+      });
+    })).catch((err) => {
+      console.error("update_surface_stroke failed", err);
+    });
+  }
+
+  function clearPageStrokeTransformHistory() {
+    pageStrokeDrag = null;
+    pageStrokeTransformUndo = null;
+    pageStrokeTransformRedo = null;
+  }
+
+  function clearChunkStrokeTransformHistory() {
+    chunkStrokeDrag = null;
+    chunkStrokeTransformUndo = null;
+    chunkStrokeTransformRedo = null;
+  }
+
+  function getOrderedSelectedStrokes(allStrokes: Stroke[], selected: Set<Stroke>): Stroke[] {
+    if (selected.size === 0) return [];
+    return allStrokes.filter((stroke) => selected.has(stroke));
+  }
+
+  function buildInkClipboardState(
+    scope: InkClipboardScope,
+    allStrokes: Stroke[],
+    selected: Set<Stroke>,
+  ): InkClipboardState | null {
+    const ordered = getOrderedSelectedStrokes(allStrokes, selected);
+    if (ordered.length === 0) return null;
+    return {
+      type: "gloss-ink-selection",
+      version: 1,
+      scope,
+      serial: makeInkClipboardSerial(),
+      strokes: ordered.map((stroke) => ({
+        colour: stroke.colour,
+        thickness: stroke.thickness,
+        points: cloneInkPoints(stroke.points),
+      })),
+      pasteCount: 0,
+      systemSynced: false,
+    };
+  }
+
+  function serialiseInkClipboard(payload: InkClipboardPayload): string {
+    return `${INK_CLIPBOARD_PREFIX}${JSON.stringify({
+      type: payload.type,
+      version: payload.version,
+      scope: payload.scope,
+      serial: payload.serial,
+      strokes: payload.strokes.map((stroke) => ({
+        colour: stroke.colour,
+        thickness: stroke.thickness,
+        points: cloneInkPoints(stroke.points),
+      })),
+    } satisfies InkClipboardPayload)}`;
+  }
+
+  function normaliseClipboardPoint(value: unknown): Point | null {
+    if (!value || typeof value !== "object") return null;
+    const point = value as { x?: unknown; y?: unknown; pressure?: unknown };
+    if (typeof point.x !== "number" || !Number.isFinite(point.x)) return null;
+    if (typeof point.y !== "number" || !Number.isFinite(point.y)) return null;
+    const pressure =
+      typeof point.pressure === "number" && Number.isFinite(point.pressure)
+        ? point.pressure
+        : 0.5;
+    return { x: point.x, y: point.y, pressure };
+  }
+
+  function parseInkClipboardText(text: string | null | undefined): InkClipboardPayload | null {
+    if (!text || !text.startsWith(INK_CLIPBOARD_PREFIX)) return null;
+    try {
+      const parsed = JSON.parse(text.slice(INK_CLIPBOARD_PREFIX.length)) as {
+        type?: unknown;
+        version?: unknown;
+        scope?: unknown;
+        serial?: unknown;
+        strokes?: unknown;
+      };
+      if (parsed.type !== "gloss-ink-selection" || parsed.version !== 1) return null;
+      if (parsed.scope !== "page" && parsed.scope !== "chunk") return null;
+      if (!Array.isArray(parsed.strokes)) return null;
+      const strokes = parsed.strokes
+        .map((stroke) => {
+          if (!stroke || typeof stroke !== "object") return null;
+          const candidate = stroke as {
+            colour?: unknown;
+            thickness?: unknown;
+            points?: unknown;
+          };
+          if (typeof candidate.colour !== "string") return null;
+          if (typeof candidate.thickness !== "number" || !Number.isFinite(candidate.thickness)) {
+            return null;
+          }
+          if (!Array.isArray(candidate.points)) return null;
+          const points = candidate.points
+            .map((point) => normaliseClipboardPoint(point))
+            .filter((point): point is Point => point !== null);
+          if (points.length < 2) return null;
+          return {
+            colour: candidate.colour,
+            thickness: candidate.thickness,
+            points,
+          } satisfies InkClipboardStrokeData;
+        })
+        .filter((stroke): stroke is InkClipboardStrokeData => stroke !== null);
+      if (strokes.length === 0) return null;
+      return {
+        type: "gloss-ink-selection",
+        version: 1,
+        scope: parsed.scope,
+        serial:
+          typeof parsed.serial === "string" && parsed.serial.trim().length > 0
+            ? parsed.serial
+            : makeInkClipboardSerial(),
+        strokes,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function resolvePasteDelta(
+    sourceMin: number,
+    sourceMax: number,
+    targetMin: number,
+    targetMax: number,
+    desired: number,
+  ): number {
+    const minAllowed = targetMin - sourceMin;
+    const maxAllowed = targetMax - sourceMax;
+    if (desired >= minAllowed && desired <= maxAllowed) return desired;
+    const opposite = -desired;
+    if (opposite >= minAllowed && opposite <= maxAllowed) return opposite;
+    return Math.max(minAllowed, Math.min(maxAllowed, desired));
+  }
+
+  function preparePastedStrokes(
+    clipboard: InkClipboardState,
+    surfaceSize: { w: number; h: number },
+    chunkId: number | null,
+    bounds: { minX: number; maxX: number; minY: number; maxY: number },
+    anchorPoint: InkAnchorPoint | null = null,
+  ): { strokes: Stroke[]; nextPasteCount: number } | null {
+    if (clipboard.strokes.length === 0 || surfaceSize.w <= 0 || surfaceSize.h <= 0) return null;
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const stroke of clipboard.strokes) {
+      const bbox = computeBBox(stroke.points);
+      if (bbox.minX < minX) minX = bbox.minX;
+      if (bbox.minY < minY) minY = bbox.minY;
+      if (bbox.maxX > maxX) maxX = bbox.maxX;
+      if (bbox.maxY > maxY) maxY = bbox.maxY;
+    }
+
+    if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
+      return null;
+    }
+
+    const nextPasteCount = clipboard.pasteCount + 1;
+    const desiredDeltaX = anchorPoint
+      ? anchorPoint.x - ((minX + maxX) * 0.5)
+      : (INK_PASTE_OFFSET_WORLD * nextPasteCount) / surfaceSize.w;
+    const desiredDeltaY = anchorPoint
+      ? anchorPoint.y - ((minY + maxY) * 0.5)
+      : (INK_PASTE_OFFSET_WORLD * nextPasteCount) / surfaceSize.h;
+    const deltaX = resolvePasteDelta(minX, maxX, bounds.minX, bounds.maxX, desiredDeltaX);
+    const deltaY = resolvePasteDelta(minY, maxY, bounds.minY, bounds.maxY, desiredDeltaY);
+    const groupId = clipboard.strokes.length > 1 ? makeStrokeGroupId() : null;
+
+    const strokes = clipboard.strokes.map((stroke) => {
+      const points = stroke.points.map(({ x, y, pressure }) => ({
+        x: x + deltaX,
+        y: y + deltaY,
+        pressure,
+      }));
+      return {
+        id: null,
+        colour: stroke.colour,
+        thickness: stroke.thickness,
+        points,
+        bbox: computeBBox(points),
+        chunkId,
+        groupId,
+      } satisfies Stroke;
+    });
+
+    return {
+      strokes,
+      nextPasteCount,
+    };
+  }
+
+  function hasDocumentTextSelection(): boolean {
+    const selectedText = window.getSelection();
+    return !!selectedText && !selectedText.isCollapsed && selectedText.toString().length > 0;
+  }
+
+  function pointerMovedPastHoldThreshold(
+    hold: InkPasteHoldState,
+    clientX: number,
+    clientY: number,
+  ): boolean {
+    return Math.hypot(clientX - hold.startClientX, clientY - hold.startClientY) > INK_PASTE_HOLD_MOVE_PX;
+  }
+
+  function screenPointToPopoverStyle(
+    screenX: number,
+    screenY: number,
+    viewportW: number,
+    viewportH: number,
+  ): string {
+    const clampedX = Math.max(
+      INK_POPOVER_EDGE_PADDING_PX,
+      Math.min(viewportW - INK_POPOVER_EDGE_PADDING_PX, screenX),
+    );
+    const clampedY = Math.max(
+      INK_POPOVER_TOP_PADDING_PX,
+      Math.min(viewportH - INK_POPOVER_EDGE_PADDING_PX, screenY),
+    );
+    return `left: ${clampedX}px; top: ${clampedY}px;`;
+  }
+
+  function pageWorldToScreen(worldX: number, worldY: number): { x: number; y: number } {
+    return {
+      x: worldX * camera.scale + camera.x,
+      y: worldY * camera.scale + camera.y,
+    };
+  }
+
+  function getPageSelectionPopoverStyle(): string {
+    if (!selection || !canvasContainer) return "";
+    const topLeft = normToWorld(selection.x, selection.y);
+    const bottomRight = normToWorld(selection.x + selection.width, selection.y + selection.height);
+    const screen = pageWorldToScreen((topLeft.x + bottomRight.x) * 0.5, topLeft.y);
+    return screenPointToPopoverStyle(
+      screen.x,
+      screen.y - 12,
+      canvasContainer.clientWidth,
+      canvasContainer.clientHeight,
+    );
+  }
+
+  function getPagePastePopoverStyle(): string {
+    if (!pagePasteMenuAnchor || !canvasContainer) return "";
+    const anchor = normToWorld(pagePasteMenuAnchor.x, pagePasteMenuAnchor.y);
+    const screen = pageWorldToScreen(anchor.x, anchor.y);
+    return screenPointToPopoverStyle(
+      screen.x,
+      screen.y - 12,
+      canvasContainer.clientWidth,
+      canvasContainer.clientHeight,
+    );
+  }
+
+  function chunkWorldToScreen(worldX: number, worldY: number): { x: number; y: number } {
+    return {
+      x: worldX * chunkCamera.scale + chunkCamera.x,
+      y: worldY * chunkCamera.scale + chunkCamera.y,
+    };
+  }
+
+  function getChunkSelectionPopoverStyle(): string {
+    if (!chunkSelection) return "";
+    const topLeft = chunkPointToWorld({ x: chunkSelection.x, y: chunkSelection.y });
+    const bottomRight = chunkPointToWorld({
+      x: chunkSelection.x + chunkSelection.width,
+      y: chunkSelection.y + chunkSelection.height,
+    });
+    const screen = chunkWorldToScreen((topLeft.x + bottomRight.x) * 0.5, topLeft.y);
+    return screenPointToPopoverStyle(
+      screen.x,
+      screen.y - 12,
+      chunkSurfaceSize.w,
+      chunkSurfaceSize.h,
+    );
+  }
+
+  function getChunkPastePopoverStyle(): string {
+    if (!chunkPasteMenuAnchor) return "";
+    const anchor = chunkPointToWorld(chunkPasteMenuAnchor);
+    const screen = chunkWorldToScreen(anchor.x, anchor.y);
+    return screenPointToPopoverStyle(
+      screen.x,
+      screen.y - 12,
+      chunkSurfaceSize.w,
+      chunkSurfaceSize.h,
+    );
+  }
+
   function getTrailingStrokeGroup(allStrokes: Stroke[]): Stroke[] {
     if (allStrokes.length === 0) return [];
     const last = allStrokes[allStrokes.length - 1];
@@ -1220,18 +1722,11 @@
 
     strokes = [...strokes, ...newStrokes];
     redoStack = [];
+    clearPageStrokeTransformHistory();
     if (currentPageId !== null) {
       cacheEvict(currentPageId);
       for (const stroke of newStrokes) {
-        invoke<number>("save_stroke", {
-          pageId: currentPageId,
-          stroke: {
-            colour: stroke.colour,
-            thickness: stroke.thickness,
-            points: stroke.points.map(({ x, y }) => ({ x, y })),
-            chunkId: stroke.chunkId,
-          },
-        }).then(id => { stroke.id = id; }).catch(() => {});
+        void persistPageStrokeCreate(currentPageId, stroke, () => strokes.includes(stroke));
       }
     }
   }
@@ -1264,6 +1759,26 @@
     size: { w: number; h: number },
   ) {
     return clampGraphRect({
+      x: center.x - size.w * 0.5,
+      y: center.y - size.h * 0.5,
+      w: size.w,
+      h: size.h,
+    });
+  }
+
+  function clampChunkGraphRect(rect: { x: number; y: number; w: number; h: number }) {
+    const w = clampNorm(Math.max(MIN_GRAPH_BBOX_SIZE, rect.w));
+    const h = Math.max(MIN_GRAPH_BBOX_SIZE, rect.h);
+    const x = Math.max(0, Math.min(1 - w, rect.x));
+    const y = Math.max(0, rect.y);
+    return { x, y, w, h };
+  }
+
+  function chunkGraphRectFromCenter(
+    center: { x: number; y: number },
+    size: { w: number; h: number },
+  ) {
+    return clampChunkGraphRect({
       x: center.x - size.w * 0.5,
       y: center.y - size.h * 0.5,
       w: size.w,
@@ -1418,6 +1933,9 @@
     selection = null;
     selectedPageGraphId = null;
     pageGraphDrag = null;
+    pageStrokeDrag = null;
+    pagePasteHold = null;
+    pagePasteMenuAnchor = null;
   }
 
   function activateDrawTool() {
@@ -1517,6 +2035,15 @@
     if (toDelete.length === 0) return;
     strokes = toKeep;
     redoStack = [...redoStack, toDelete];
+    clearPageStrokeTransformHistory();
+    if (selectedStrokes.size > 0) {
+      const keepSet = new Set(toKeep);
+      const nextSelected = new Set(
+        [...selectedStrokes].filter((stroke) => keepSet.has(stroke)),
+      );
+      selectedStrokes = nextSelected;
+      selection = nextSelected.size > 0 ? unionBBox(nextSelected) : null;
+    }
     if (currentPageId !== null) cacheEvict(currentPageId);
     for (const s of toDelete) {
       if (s.id !== null) invoke("delete_stroke", { strokeId: s.id }).catch(() => {});
@@ -1621,6 +2148,8 @@
     if (mode === 'select') {
       activePointerId = e.pointerId;
       wetCanvas.setPointerCapture(e.pointerId);
+      pagePasteMenuAnchor = null;
+      pagePasteHold = null;
       const { x, y } = pointerToNorm(e.clientX, e.clientY);
       const graphHit = hitTestPageGraph({ x, y });
       if (graphHit) {
@@ -1648,12 +2177,41 @@
           return;
         }
       }
+      if (selectedStrokes.size > 0 && selection) {
+        const padding = pageSelectionHitPadding();
+        if (pointInSelectionBounds({ x, y }, selection, padding.x, padding.y)) {
+          const strokeDrag = buildStrokeDragState(strokes, selectedStrokes, { x, y }, selection);
+          if (strokeDrag) {
+            selectedPageGraphId = null;
+            pageGraphDrag = null;
+            pageStrokeDrag = strokeDrag;
+            selectOrigin = null;
+            selectRect = null;
+            markDirty();
+            e.preventDefault();
+            return;
+          }
+        }
+      }
+      const canAttemptPaste = !!inkClipboard && inkClipboard.scope === "page" && inkClipboard.strokes.length > 0;
       selectedPageGraphId = null;
       pageGraphDrag = null;
-      selectOrigin = { x, y };
-      selectRect = null;
+      pageStrokeDrag = null;
       selectedStrokes = new Set();
       selection = null;
+      selectRect = null;
+      if (canAttemptPaste) {
+        pagePasteHold = {
+          pointerId: e.pointerId,
+          startClientX: e.clientX,
+          startClientY: e.clientY,
+          startPoint: { x, y },
+          startedAt: Date.now(),
+        };
+        selectOrigin = null;
+      } else {
+        selectOrigin = { x, y };
+      }
       markDirty();
       e.preventDefault();
       return;
@@ -1848,6 +2406,22 @@
         return;
       }
 
+      const strokeDrag = pageStrokeDrag;
+      if (strokeDrag) {
+        const { x, y } = pointerToNorm(e.clientX, e.clientY);
+        const deltaX = x - strokeDrag.startPoint.x;
+        const deltaY = y - strokeDrag.startPoint.y;
+        translateDraggedStrokes(strokeDrag, deltaX, deltaY);
+        selection = {
+          x: strokeDrag.startSelection.x + deltaX,
+          y: strokeDrag.startSelection.y + deltaY,
+          width: strokeDrag.startSelection.width,
+          height: strokeDrag.startSelection.height,
+        };
+        markDirty();
+        return;
+      }
+
       if (!selectOrigin) return;
       const { x, y } = pointerToNorm(e.clientX, e.clientY);
       selectRect = {
@@ -1950,6 +2524,25 @@
         e.preventDefault();
         return;
       }
+      if (pageStrokeDrag) {
+        const history = buildStrokeTransformHistory(pageStrokeDrag);
+        pageStrokeDrag = null;
+        if (history) {
+          pageStrokeTransformUndo = history;
+          pageStrokeTransformRedo = null;
+          redoStack = [];
+          selectedStrokes = new Set(history.strokes.map((entry) => entry.stroke));
+          selection = unionBBox(selectedStrokes);
+          void persistPageStrokeUpdates(history.strokes.map((entry) => entry.stroke));
+        } else if (selectedStrokes.size > 0) {
+          selection = unionBBox(selectedStrokes);
+        }
+        selectOrigin = null;
+        selectRect = null;
+        markDirty();
+        e.preventDefault();
+        return;
+      }
       if (selectRect) {
         selectedStrokes = hitTestStrokes(selectRect);
         selectedPageGraphId = null;
@@ -1986,17 +2579,10 @@
       };
       strokes = [...strokes, stroke];
       redoStack = [];
+      clearPageStrokeTransformHistory();
       if (currentPageId !== null) {
         cacheEvict(currentPageId);
-        invoke<number>("save_stroke", {
-          pageId: currentPageId,
-          stroke: {
-            colour: stroke.colour,
-            thickness: stroke.thickness,
-            points: completed.map(({ x, y }) => ({ x, y })),
-            chunkId: stroke.chunkId,
-          },
-        }).then(id => { stroke.id = id; }).catch(() => {});
+        void persistPageStrokeCreate(currentPageId, stroke, () => strokes.includes(stroke));
       }
     }
     isDrawing = false;
@@ -2027,6 +2613,7 @@
       selectOrigin = null;
       selectRect = null;
       pageGraphDrag = null;
+      pageStrokeDrag = null;
       shapeDraft = null;
       markDirty();
       return;
@@ -2224,9 +2811,19 @@
         if (previewStroke.length < 2) continue;
         drawStrokePoints(ctx, previewStroke, penColour, penThickness, 0);
       }
-    } else if (selectRect) {
-      const tl = normToWorld(selectRect.x, selectRect.y);
-      const br = normToWorld(selectRect.x + selectRect.w, selectRect.y + selectRect.h);
+    } else if (mode === "select") {
+      const activeRect = selectRect
+        ?? (selection
+          ? {
+            x: selection.x,
+            y: selection.y,
+            w: selection.width,
+            h: selection.height,
+          }
+          : null);
+      if (!activeRect) return;
+      const tl = normToWorld(activeRect.x, activeRect.y);
+      const br = normToWorld(activeRect.x + activeRect.w, activeRect.y + activeRect.h);
       ctx.save();
       ctx.strokeStyle = "rgba(57, 108, 216, 0.9)";
       ctx.lineWidth = 1.5 / camera.scale;
@@ -2263,6 +2860,125 @@
       if (s.bbox.maxY > maxY) maxY = s.bbox.maxY;
     }
     return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+  }
+
+  function pointInSelectionBounds(
+    point: { x: number; y: number },
+    bounds: SelectionBounds,
+    padX = 0,
+    padY = 0,
+  ): boolean {
+    return (
+      point.x >= bounds.x - padX
+      && point.x <= bounds.x + bounds.width + padX
+      && point.y >= bounds.y - padY
+      && point.y <= bounds.y + bounds.height + padY
+    );
+  }
+
+  function buildStrokeDragState(
+    allStrokes: Stroke[],
+    selected: Set<Stroke>,
+    startPoint: { x: number; y: number },
+    startSelection: SelectionBounds,
+  ): InkStrokeDragState | null {
+    const ordered = getOrderedSelectedStrokes(allStrokes, selected);
+    if (ordered.length === 0) return null;
+    return {
+      startPoint,
+      startSelection: {
+        x: startSelection.x,
+        y: startSelection.y,
+        width: startSelection.width,
+        height: startSelection.height,
+      },
+      strokes: ordered.map((stroke) => ({
+        stroke,
+        points: cloneInkPoints(stroke.points),
+        bbox: cloneStrokeBBox(stroke.bbox),
+      })),
+    };
+  }
+
+  function translateDraggedStrokes(
+    drag: InkStrokeDragState,
+    deltaX: number,
+    deltaY: number,
+  ) {
+    for (const snapshot of drag.strokes) {
+      snapshot.stroke.points = snapshot.points.map(({ x, y, pressure }) => ({
+        x: x + deltaX,
+        y: y + deltaY,
+        pressure,
+      }));
+      snapshot.stroke.bbox = {
+        minX: snapshot.bbox.minX + deltaX,
+        minY: snapshot.bbox.minY + deltaY,
+        maxX: snapshot.bbox.maxX + deltaX,
+        maxY: snapshot.bbox.maxY + deltaY,
+      };
+    }
+  }
+
+  function buildStrokeTransformHistory(drag: InkStrokeDragState): StrokeTransformHistoryEntry | null {
+    const transformed = drag.strokes
+      .map((snapshot) => ({
+        stroke: snapshot.stroke,
+        beforePoints: cloneInkPoints(snapshot.points),
+        beforeBBox: cloneStrokeBBox(snapshot.bbox),
+        afterPoints: cloneInkPoints(snapshot.stroke.points),
+        afterBBox: cloneStrokeBBox(snapshot.stroke.bbox),
+      }))
+      .filter((entry) => (
+        entry.beforeBBox.minX !== entry.afterBBox.minX
+        || entry.beforeBBox.minY !== entry.afterBBox.minY
+        || entry.beforeBBox.maxX !== entry.afterBBox.maxX
+        || entry.beforeBBox.maxY !== entry.afterBBox.maxY
+      ));
+    if (transformed.length === 0) return null;
+    return { strokes: transformed };
+  }
+
+  function applyStrokeTransformHistory(
+    entry: StrokeTransformHistoryEntry,
+    direction: "before" | "after",
+  ) {
+    for (const item of entry.strokes) {
+      item.stroke.points = cloneInkPoints(
+        direction === "before" ? item.beforePoints : item.afterPoints,
+      );
+      item.stroke.bbox = cloneStrokeBBox(
+        direction === "before" ? item.beforeBBox : item.afterBBox,
+      );
+    }
+  }
+
+  function pageSelectionHitPadding() {
+    const hitRadiusWorld = 12 / Math.max(camera.scale, 0.001);
+    return {
+      x: pageSize.w > 0 ? hitRadiusWorld / pageSize.w : 0.02,
+      y: pageSize.h > 0 ? hitRadiusWorld / pageSize.h : 0.02,
+    };
+  }
+
+  function chunkSelectionHitPadding() {
+    const hitRadiusWorld = 12 / Math.max(chunkCamera.scale, 0.001);
+    const { w, h } = getChunkPageWorldSize();
+    return {
+      x: w > 0 ? hitRadiusWorld / w : 0.02,
+      y: h > 0 ? hitRadiusWorld / h : 0.02,
+    };
+  }
+
+  function clampChunkStrokeDragDelta(
+    bounds: SelectionBounds,
+    deltaX: number,
+    deltaY: number,
+  ) {
+    return {
+      deltaX: Math.max(-bounds.x, Math.min(1 - (bounds.x + bounds.width), deltaX)),
+      deltaY: Math.max(-bounds.y, deltaY),
+    };
   }
 
   function hitTestStrokes(rect: Rect): Set<Stroke> {
@@ -3024,6 +3740,7 @@
     totalPages = 0;
     strokes = [];
     redoStack = [];
+    clearPageStrokeTransformHistory();
     pageGraphs = [];
     selectedPageGraphId = null;
     pageGraphDrag = null;
@@ -3074,6 +3791,7 @@
     currentPageSurfaceId = null;
     strokes = [];
     redoStack = [];
+    clearPageStrokeTransformHistory();
     pageGraphs = [];
     selectedPageGraphId = null;
     pageGraphDrag = null;
@@ -3166,6 +3884,18 @@
   // â”€â”€ Undo / Redo â”€â”€
 
   async function undoStroke() {
+    if (pageStrokeTransformUndo) {
+      const entry = pageStrokeTransformUndo;
+      pageStrokeTransformUndo = null;
+      applyStrokeTransformHistory(entry, "before");
+      pageStrokeTransformRedo = entry;
+      selectedPageGraphId = null;
+      selectedStrokes = new Set(entry.strokes.map((item) => item.stroke));
+      selection = unionBBox(selectedStrokes);
+      await persistPageStrokeUpdates(entry.strokes.map((item) => item.stroke));
+      markDirty();
+      return;
+    }
     if (pageGraphUndoStack.length > 0) {
       const entry = pageGraphUndoStack[pageGraphUndoStack.length - 1];
       pageGraphUndoStack = pageGraphUndoStack.slice(0, -1);
@@ -3183,6 +3913,15 @@
     if (removed.length === 0) return;
     strokes = strokes.slice(0, strokes.length - removed.length);
     redoStack = [...redoStack, removed];
+    clearPageStrokeTransformHistory();
+    if (selectedStrokes.size > 0) {
+      const keepSet = new Set(strokes);
+      const nextSelected = new Set(
+        [...selectedStrokes].filter((stroke) => keepSet.has(stroke)),
+      );
+      selectedStrokes = nextSelected;
+      selection = nextSelected.size > 0 ? unionBBox(nextSelected) : null;
+    }
     if (currentPageId !== null) cacheEvict(currentPageId);
     for (const stroke of removed) {
       if (stroke.id !== null) invoke("delete_stroke", { strokeId: stroke.id }).catch(() => {});
@@ -3191,6 +3930,18 @@
   }
 
   async function redoStroke() {
+    if (pageStrokeTransformRedo) {
+      const entry = pageStrokeTransformRedo;
+      pageStrokeTransformRedo = null;
+      applyStrokeTransformHistory(entry, "after");
+      pageStrokeTransformUndo = entry;
+      selectedPageGraphId = null;
+      selectedStrokes = new Set(entry.strokes.map((item) => item.stroke));
+      selection = unionBBox(selectedStrokes);
+      await persistPageStrokeUpdates(entry.strokes.map((item) => item.stroke));
+      markDirty();
+      return;
+    }
     if (pageGraphRedoStack.length > 0) {
       const entry = pageGraphRedoStack[pageGraphRedoStack.length - 1];
       pageGraphRedoStack = pageGraphRedoStack.slice(0, -1);
@@ -3207,18 +3958,11 @@
     const entry = redoStack[redoStack.length - 1];
     redoStack = redoStack.slice(0, -1);
     strokes = [...strokes, ...entry];
+    clearPageStrokeTransformHistory();
     if (currentPageId !== null) cacheEvict(currentPageId);
     for (const restored of entry) {
       if (currentPageId !== null) {
-        invoke<number>("save_stroke", {
-          pageId: currentPageId,
-          stroke: {
-            colour: restored.colour,
-            thickness: restored.thickness,
-            points: restored.points.map(({ x, y }) => ({ x, y })),
-            chunkId: restored.chunkId,
-          },
-        }).then(id => { restored.id = id; }).catch(() => {});
+        void persistPageStrokeCreate(currentPageId, restored, () => strokes.includes(restored));
       }
     }
     markDirty();
@@ -3233,6 +3977,7 @@
     }
     if (selectedStrokes.size === 0) return;
     const deleted = [...selectedStrokes];
+    clearPageStrokeTransformHistory();
     if (currentPageId !== null) cacheEvict(currentPageId);
     for (const s of deleted) {
       if (s.id !== null) invoke("delete_stroke", { strokeId: s.id }).catch(() => {});
@@ -3242,6 +3987,70 @@
     selectedStrokes = new Set();
     selection = null;
     markDirty();
+  }
+
+  async function copySelectedPageInk(): Promise<boolean> {
+    const nextClipboard = buildInkClipboardState("page", strokes, selectedStrokes);
+    if (!nextClipboard) return false;
+    inkClipboard = nextClipboard;
+    try {
+      await copyTextToClipboard(serialiseInkClipboard(nextClipboard));
+      inkClipboard = { ...nextClipboard, systemSynced: true };
+    } catch {
+      // Keep an in-memory copy so paste still works inside Gloss when clipboard APIs are unavailable.
+    }
+    return true;
+  }
+
+  async function openPagePasteMenuAt(anchor: InkAnchorPoint): Promise<boolean> {
+    const clipboard = await getInkClipboardForScope("page");
+    if (!clipboard) return false;
+    pagePasteMenuAnchor = anchor;
+    return true;
+  }
+
+  async function pastePageInk(anchorPoint: InkAnchorPoint | null = null): Promise<boolean> {
+    if (mode !== "select") return false;
+    const clipboard = await getInkClipboardForScope("page");
+    if (!clipboard) return false;
+    const prepared = preparePastedStrokes(
+      clipboard,
+      { w: pageSize.w, h: pageSize.h },
+      null,
+      { minX: 0, maxX: 1, minY: 0, maxY: 1 },
+      anchorPoint,
+    );
+    if (!prepared) return false;
+
+    const pastedSelection = new Set(prepared.strokes);
+    strokes = [...strokes, ...prepared.strokes];
+    redoStack = [];
+    clearPageStrokeTransformHistory();
+    selectedPageGraphId = null;
+    pageGraphDrag = null;
+    selectOrigin = null;
+    selectRect = null;
+    selectedStrokes = pastedSelection;
+    selection = unionBBox(pastedSelection);
+    pagePasteHold = null;
+    pagePasteMenuAnchor = null;
+
+    const pageId = currentPageId;
+    if (pageId !== null) {
+      cacheEvict(pageId);
+      for (const stroke of prepared.strokes) {
+        void persistPageStrokeCreate(pageId, stroke, () => strokes.includes(stroke));
+      }
+    }
+
+    inkClipboard = { ...clipboard, pasteCount: prepared.nextPasteCount };
+    markDirty();
+    return true;
+  }
+
+  async function pastePageInkFromMenu() {
+    if (!pagePasteMenuAnchor) return;
+    await pastePageInk(pagePasteMenuAnchor);
   }
 
   // â”€â”€ AI rasterisation + chat attachments â”€â”€
@@ -3262,7 +4071,7 @@
   const CHUNK_INK_CONTEXT_TARGET_EDGE = 1200;
   const CHUNK_INK_CONTEXT_MIN_EDGE = 320;
   const CHUNK_INK_CONTEXT_MAX_EDGE = 1600;
-  const CHUNK_INK_CONTEXT_PADDING = 0.03;
+  const CHUNK_DOCUMENT_BUFFER_PAGES = 1;
 
   interface ChunkFormattedBodyOutput {
     body_markdown: string;
@@ -3397,8 +4206,7 @@
 
   async function rasteriseChunkSelection(): Promise<string> {
     if (!chunkSelection || !chunkView) throw new Error("Nothing selected");
-    const baseWidth = chunkHomeViewSize.w > 0 ? chunkHomeViewSize.w : chunkSurfaceSize.w;
-    const baseHeight = chunkHomeViewSize.h > 0 ? chunkHomeViewSize.h : chunkSurfaceSize.h;
+    const { w: baseWidth, h: baseHeight } = getChunkPageWorldSize();
     const selectionWidth = Math.max(0.001, chunkSelection.width);
     const selectionHeight = Math.max(0.001, chunkSelection.height);
     const sourceWidth = Math.max(1, Math.round(selectionWidth * baseWidth));
@@ -3619,11 +4427,16 @@
   let chunkSelectOrigin = $state<{ x: number; y: number } | null>(null);
   let chunkSelectRect = $state<Rect | null>(null);
   let chunkSelectedStrokes = $state<Set<Stroke>>(new Set());
+  let chunkStrokeDrag = $state<InkStrokeDragState | null>(null);
+  let chunkStrokeTransformUndo = $state<StrokeTransformHistoryEntry | null>(null);
+  let chunkStrokeTransformRedo = $state<StrokeTransformHistoryEntry | null>(null);
   let chunkSelectedGraphId = $state<number | null>(null);
   let chunkGraphDrag = $state<GraphPointerDrag | null>(null);
   let chunkGraphUndoStack = $state<GraphHistoryEntry[]>([]);
   let chunkGraphRedoStack = $state<GraphHistoryEntry[]>([]);
   let chunkSelection = $state<{ x: number; y: number; width: number; height: number } | null>(null);
+  let chunkPasteMenuAnchor = $state<InkAnchorPoint | null>(null);
+  let chunkPasteHold = $state<InkPasteHoldState | null>(null);
   const CHUNK_LEFT_PANEL_DEFAULT_WIDTH = 360;
   const CHUNK_LEFT_PANEL_MIN_WIDTH = 260;
   const CHUNK_LEFT_PANEL_MAX_WIDTH = 760;
@@ -3658,6 +4471,9 @@
     chunkSelectedGraphId = null;
     chunkGraphDrag = null;
     chunkSelection = null;
+    chunkStrokeDrag = null;
+    chunkPasteHold = null;
+    chunkPasteMenuAnchor = null;
   }
 
   function activateChunkDrawTool() {
@@ -4098,15 +4914,15 @@
     content: string;
     state: ChunkChatMessageState;
     historyContent?: string;
-    historyImageBase64?: string;
-    imageDataUrl?: string;
+    historyImageBase64List?: string[];
+    imageDataUrls?: string[];
     html?: string;
   }
 
   interface ChunkChatHistoryItem {
     role: "user" | "assistant";
     content: string;
-    image_base64?: string;
+    image_base64_list?: string[];
   }
 
   interface ChunkAiStreamEventPayload {
@@ -4129,15 +4945,24 @@
   let chunkInkContextTranscribing = $state(false);
   let chunkChatTranscript = $state<HTMLDivElement>(null!);
   const CHUNK_CODE_COPY_RESET_MS = 1400;
-  let includeChunkInkContext = $state(false);
+  let includeChunkAiVisuals = $state(false);
   let chunkHasInkContext = $derived(
-    !!chunkView && chunkView.strokes.some((stroke) => stroke.points.length > 1),
+    !!chunkView && (
+      getLikelyChunkInkStrokes(chunkView.strokes).length > 0
+      || getRenderableChunkGraphs(chunkView.graphs).length > 0
+    ),
   );
 
   interface ChunkInkContextCache {
     chunkId: number;
     fingerprint: string;
     transcription: string | null;
+  }
+
+  interface ChunkVisualPageImage {
+    pageIndex: number;
+    imageBase64: string;
+    imageDataUrl: string;
   }
 
   let chunkInkContextCache = $state<ChunkInkContextCache | null>(null);
@@ -4171,7 +4996,6 @@
       })
       : "",
   );
-  let includeQuestionMarkVisuals = $state(false);
   let questionMarkingLoading = $state(false);
   let questionMarkingApplying = $state(false);
   let questionMarkingError = $state<string | null>(null);
@@ -4719,6 +5543,43 @@
     }
   }
 
+  async function readTextFromClipboard(): Promise<string | null> {
+    if (!navigator.clipboard?.readText) return null;
+    try {
+      return await navigator.clipboard.readText();
+    } catch {
+      return null;
+    }
+  }
+
+  async function getInkClipboardForScope(scope: InkClipboardScope): Promise<InkClipboardState | null> {
+    const fallback = inkClipboard?.scope === scope ? inkClipboard : null;
+    const text = await readTextFromClipboard();
+    if (text === null) return fallback;
+
+    const parsed = parseInkClipboardText(text);
+    if (!parsed) {
+      if (inkClipboard?.systemSynced) inkClipboard = null;
+      return fallback && !fallback.systemSynced ? fallback : null;
+    }
+
+    if (fallback && fallback.serial === parsed.serial) {
+      if (!fallback.systemSynced) {
+        inkClipboard = { ...fallback, systemSynced: true };
+        return inkClipboard;
+      }
+      return fallback;
+    }
+
+    const syncedState: InkClipboardState = {
+      ...parsed,
+      pasteCount: 0,
+      systemSynced: true,
+    };
+    inkClipboard = syncedState;
+    return syncedState.scope === scope ? syncedState : null;
+  }
+
   async function onChunkChatTranscriptClick(event: MouseEvent) {
     const target = event.target;
     if (!(target instanceof HTMLElement)) return;
@@ -4771,7 +5632,7 @@
       .map((message) => ({
         role: message.role,
         content: (message.historyContent ?? message.content).trim(),
-        image_base64: message.role === "user" ? message.historyImageBase64 : undefined,
+        image_base64_list: message.role === "user" ? message.historyImageBase64List : undefined,
       }));
   }
 
@@ -4805,7 +5666,31 @@
     chunkInkContextCache = null;
   }
 
-  function chunkInkContextFingerprint(strokes: Stroke[]): string {
+  function strokeHasFiniteBounds(stroke: Stroke): boolean {
+    return Number.isFinite(stroke.bbox.minX)
+      && Number.isFinite(stroke.bbox.minY)
+      && Number.isFinite(stroke.bbox.maxX)
+      && Number.isFinite(stroke.bbox.maxY);
+  }
+
+  function graphHasFiniteChunkBounds(graph: SurfaceGraphObject): boolean {
+    return Number.isFinite(graph.bboxX)
+      && Number.isFinite(graph.bboxY)
+      && Number.isFinite(graph.bboxW)
+      && Number.isFinite(graph.bboxH)
+      && graph.bboxW > 0
+      && graph.bboxH > 0;
+  }
+
+  function getLikelyChunkInkStrokes(strokes: Stroke[]): Stroke[] {
+    return strokes.filter((stroke) => stroke.points.length > 1 && strokeHasFiniteBounds(stroke));
+  }
+
+  function getRenderableChunkGraphs(graphs: SurfaceGraphObject[]): SurfaceGraphObject[] {
+    return graphs.filter(graphHasFiniteChunkBounds);
+  }
+
+  function chunkInkContextFingerprint(strokes: Stroke[], graphs: SurfaceGraphObject[]): string {
     let totalPoints = 0;
     let checksum = 0;
     for (const stroke of strokes) {
@@ -4821,7 +5706,57 @@
         checksum += Math.round((first.x + first.y + last.x + last.y) * 1000);
       }
     }
-    return `${strokes.length}:${totalPoints}:${checksum}`;
+    for (const graph of graphs) {
+      checksum += Math.round(graph.bboxX * 1000);
+      checksum += Math.round(graph.bboxY * 1000);
+      checksum += Math.round(graph.bboxW * 1000);
+      checksum += Math.round(graph.bboxH * 1000);
+      checksum += Math.round(graph.lineWidth * 10);
+      if (graph.equation?.trim()) {
+        checksum += graph.equation.trim().length * 17;
+      }
+      if (graph.pointsJson?.trim()) {
+        checksum += graph.pointsJson.trim().length * 13;
+      }
+    }
+    return `${strokes.length}:${graphs.length}:${totalPoints}:${checksum}`;
+  }
+
+  function getChunkVisualPageBounds(
+    strokes: Stroke[],
+    graphs: SurfaceGraphObject[],
+  ): { minPage: number; maxPage: number } | null {
+    let minPage = Number.POSITIVE_INFINITY;
+    let maxPage = Number.NEGATIVE_INFINITY;
+    const includeRange = (minY: number, maxY: number) => {
+      if (!Number.isFinite(minY) || !Number.isFinite(maxY)) return;
+      const firstPage = Math.max(0, Math.floor(minY));
+      const lastPage = Math.max(firstPage, Math.ceil(maxY) - 1);
+      if (firstPage < minPage) minPage = firstPage;
+      if (lastPage > maxPage) maxPage = lastPage;
+    };
+
+    for (const stroke of strokes) {
+      includeRange(stroke.bbox.minY, stroke.bbox.maxY);
+    }
+    for (const graph of graphs) {
+      includeRange(graph.bboxY, graph.bboxY + graph.bboxH);
+    }
+
+    if (!Number.isFinite(minPage) || !Number.isFinite(maxPage)) {
+      return null;
+    }
+    return { minPage, maxPage };
+  }
+
+  function chunkVisualIntersectsPage(
+    pageIndex: number,
+    minY: number,
+    maxY: number,
+  ): boolean {
+    const pageTop = pageIndex;
+    const pageBottom = pageIndex + 1;
+    return maxY > pageTop && minY < pageBottom;
   }
 
   function drawChunkInkContextStroke(
@@ -4862,80 +5797,87 @@
     ctx.stroke();
   }
 
-  async function rasteriseChunkInkContext(chunkId: number): Promise<string | null> {
+  async function rasteriseChunkVisualPages(chunkId: number): Promise<ChunkVisualPageImage[]> {
     const view = chunkView;
-    if (!view || view.chunk.id !== chunkId) return null;
-    const drawableStrokes = view.strokes.filter((stroke) => stroke.points.length > 1);
-    if (drawableStrokes.length === 0) return null;
+    if (!view || view.chunk.id !== chunkId) return [];
+    const drawableStrokes = getLikelyChunkInkStrokes(view.strokes);
+    const drawableGraphs = getRenderableChunkGraphs(view.graphs);
+    if (drawableStrokes.length === 0 && drawableGraphs.length === 0) return [];
 
-    let minX = 1;
-    let minY = 1;
-    let maxX = 0;
-    let maxY = 0;
-    for (const stroke of drawableStrokes) {
-      if (stroke.bbox.minX < minX) minX = stroke.bbox.minX;
-      if (stroke.bbox.minY < minY) minY = stroke.bbox.minY;
-      if (stroke.bbox.maxX > maxX) maxX = stroke.bbox.maxX;
-      if (stroke.bbox.maxY > maxY) maxY = stroke.bbox.maxY;
+    const pageBounds = getChunkVisualPageBounds(drawableStrokes, drawableGraphs);
+    if (!pageBounds) return [];
+
+    const pageAspect = getChunkPageAspect();
+    const pageWidthWorld = getChunkPageWorldSize().w;
+    const width = CHUNK_INK_CONTEXT_TARGET_EDGE;
+    const height = Math.max(
+      CHUNK_INK_CONTEXT_MIN_EDGE,
+      Math.min(CHUNK_INK_CONTEXT_MAX_EDGE, Math.round(width * pageAspect)),
+    );
+    const lineWidthScale = width / Math.max(1, pageWidthWorld);
+    const pages: ChunkVisualPageImage[] = [];
+
+    for (let pageIndex = pageBounds.minPage; pageIndex <= pageBounds.maxPage; pageIndex += 1) {
+      const offscreen = new OffscreenCanvas(width, height);
+      const ctx = offscreen.getContext("2d");
+      if (!ctx) throw new Error("Failed to create chunk ink context canvas");
+
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, width, height);
+
+      for (const stroke of drawableStrokes) {
+        if (!chunkVisualIntersectsPage(pageIndex, stroke.bbox.minY, stroke.bbox.maxY)) continue;
+        const lineWidth = Math.max(1, stroke.thickness * lineWidthScale);
+        drawChunkInkContextStroke(
+          ctx,
+          stroke,
+          0,
+          pageIndex,
+          width,
+          height,
+          lineWidth,
+        );
+      }
+
+      for (const graph of drawableGraphs) {
+        const graphMinY = graph.bboxY;
+        const graphMaxY = graph.bboxY + graph.bboxH;
+        if (!chunkVisualIntersectsPage(pageIndex, graphMinY, graphMaxY)) continue;
+        drawGraphCard(
+          ctx,
+          graphObjectToSpec(graph),
+          graph.bboxX * width,
+          (graph.bboxY - pageIndex) * height,
+          graph.bboxW * width,
+          graph.bboxH * height,
+          {
+            selected: false,
+            showResizeHandle: false,
+          },
+        );
+      }
+
+      const blob = await offscreen.convertToBlob({ type: "image/png" });
+      const imageBase64 = await blobToBase64(blob);
+      pages.push({
+        pageIndex,
+        imageBase64,
+        imageDataUrl: `data:image/png;base64,${imageBase64}`,
+      });
     }
-    if (maxX <= minX || maxY <= minY) return null;
 
-    const cropMinX = Math.max(0, minX - CHUNK_INK_CONTEXT_PADDING);
-    const cropMinY = Math.max(0, minY - CHUNK_INK_CONTEXT_PADDING);
-    const cropMaxX = Math.min(1, maxX + CHUNK_INK_CONTEXT_PADDING);
-    const cropMaxY = Math.min(1, maxY + CHUNK_INK_CONTEXT_PADDING);
-    const normW = Math.max(0.01, cropMaxX - cropMinX);
-    const normH = Math.max(0.01, cropMaxY - cropMinY);
-
-    let width: number;
-    let height: number;
-    if (normW >= normH) {
-      width = CHUNK_INK_CONTEXT_TARGET_EDGE;
-      height = Math.round(CHUNK_INK_CONTEXT_TARGET_EDGE * (normH / normW));
-    } else {
-      height = CHUNK_INK_CONTEXT_TARGET_EDGE;
-      width = Math.round(CHUNK_INK_CONTEXT_TARGET_EDGE * (normW / normH));
-    }
-    width = Math.max(CHUNK_INK_CONTEXT_MIN_EDGE, Math.min(CHUNK_INK_CONTEXT_MAX_EDGE, width));
-    height = Math.max(CHUNK_INK_CONTEXT_MIN_EDGE, Math.min(CHUNK_INK_CONTEXT_MAX_EDGE, height));
-
-    const offscreen = new OffscreenCanvas(width, height);
-    const ctx = offscreen.getContext("2d");
-    if (!ctx) throw new Error("Failed to create chunk ink context canvas");
-
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, width, height);
-
-    const pxPerNormX = width / normW;
-    const pxPerNormY = height / normH;
-    const baseChunkWidth = chunkHomeViewSize.w > 0 ? chunkHomeViewSize.w : 1000;
-    const lineWidthScale = pxPerNormX / baseChunkWidth;
-
-    for (const stroke of drawableStrokes) {
-      const lineWidth = Math.max(1, stroke.thickness * lineWidthScale);
-      drawChunkInkContextStroke(
-        ctx,
-        stroke,
-        cropMinX,
-        cropMinY,
-        pxPerNormX,
-        pxPerNormY,
-        lineWidth,
-      );
-    }
-
-    const blob = await offscreen.convertToBlob({ type: "image/png" });
-    return blobToBase64(blob);
+    return pages;
   }
 
   async function transcribeChunkInkContext(chunkId: number): Promise<string | null> {
-    if (!includeChunkInkContext) return null;
+    if (!includeChunkAiVisuals) return null;
     const view = chunkView;
     if (!view || view.chunk.id !== chunkId) return null;
-    const drawableStrokes = view.strokes.filter((stroke) => stroke.points.length > 1);
-    if (drawableStrokes.length === 0) return null;
+    const drawableStrokes = getLikelyChunkInkStrokes(view.strokes);
+    const drawableGraphs = getRenderableChunkGraphs(view.graphs);
+    if (drawableStrokes.length === 0 && drawableGraphs.length === 0) return null;
 
-    const fingerprint = chunkInkContextFingerprint(drawableStrokes);
+    const fingerprint = chunkInkContextFingerprint(drawableStrokes, drawableGraphs);
     if (
       chunkInkContextCache
       && chunkInkContextCache.chunkId === chunkId
@@ -4952,17 +5894,27 @@
 
     chunkInkContextTranscribing = true;
     try {
-      const imageBase64 = await rasteriseChunkInkContext(chunkId);
-      if (!imageBase64) return null;
-      const result = await invoke<ChunkFormattedBodyOutput>("transcribe_ai_chat_image", {
-        provider: visionProvider,
-        model: visionModel.length > 0 ? visionModel : null,
-        imageBase64,
-        chunkType,
-        title,
-        subject,
-      });
-      const transcription = result.body_markdown.trim();
+      const pages = await rasteriseChunkVisualPages(chunkId);
+      if (pages.length === 0) return null;
+      const sections: string[] = [];
+      for (const page of pages) {
+        const result = await invoke<ChunkFormattedBodyOutput>("transcribe_ai_chat_image", {
+          provider: visionProvider,
+          model: visionModel.length > 0 ? visionModel : null,
+          imageBase64: page.imageBase64,
+          chunkType,
+          title,
+          subject,
+        });
+        const body = result.body_markdown.trim();
+        if (!body) continue;
+        if (pages.length === 1) {
+          sections.push(body);
+        } else {
+          sections.push(`Chunk visuals page ${page.pageIndex + 1}:\n---\n${body}\n---`);
+        }
+      }
+      const transcription = sections.join("\n\n").trim();
       if (chunkView?.chunk.id === chunkId) {
         chunkInkContextCache = {
           chunkId,
@@ -4977,7 +5929,7 @@
   }
 
   async function enrichPromptWithChunkInkContext(chunkId: number, prompt: string): Promise<string> {
-    if (!includeChunkInkContext) return prompt;
+    if (!includeChunkAiVisuals) return prompt;
     try {
       const transcription = await transcribeChunkInkContext(chunkId);
       if (!transcription) return prompt;
@@ -5030,8 +5982,8 @@
   interface PreparedChatUserMessage {
     displayContent: string;
     historyContent: string;
-    imageBase64?: string;
-    imageDataUrl?: string;
+    imageBase64List?: string[];
+    imageDataUrls?: string[];
     attachmentCreatedAt?: number;
   }
 
@@ -5047,15 +5999,37 @@
     const supportsDirectImage = chatProviderSupportsDirectImage(aiTaskSettings.chat.provider);
     const historyParts: string[] = [];
 
-    let imageBase64: string | undefined;
-    let imageDataUrl: string | undefined;
+    const imageBase64List: string[] = [];
+    const imageDataUrls: string[] = [];
     let attachmentCreatedAt: number | undefined;
     let attachedImageLabel: string | null = null;
 
+    const shouldAttachChunkVisuals = chunkId != null && includeChunkAiVisuals;
+    let attachedChunkVisualPages = 0;
+    if (shouldAttachChunkVisuals && supportsDirectImage) {
+      try {
+        const visualPages = await rasteriseChunkVisualPages(chunkId);
+        if (visualPages.length > 0) {
+          attachedChunkVisualPages = visualPages.length;
+          imageBase64List.push(...visualPages.map((page) => page.imageBase64));
+          imageDataUrls.push(...visualPages.map((page) => page.imageDataUrl));
+          attachedImageLabel = visualPages.length === 1
+            ? "Attached visuals"
+            : `Attached ${visualPages.length} visual pages`;
+        }
+      } catch (err) {
+        await appLogWarn(`[chunk-ai] chunk ink rasterisation failed chunkId=${chunkId}: ${formatLogError(err)}`);
+      }
+    }
+
     if (attachment) {
-      attachedImageLabel = "Attached selection";
+      attachmentCreatedAt = attachment.createdAt;
       if (supportsDirectImage) {
-        imageBase64 = attachment.imageBase64;
+        imageBase64List.push(attachment.imageBase64);
+        imageDataUrls.push(attachment.imageDataUrl);
+        attachedImageLabel = imageBase64List.length > 1
+          ? `Attached ${imageBase64List.length} images`
+          : "Attached selection";
       } else {
         let transcription: string | null = null;
         try {
@@ -5069,37 +6043,22 @@
           historyParts.push("Attached selection image context was provided, but transcription was unavailable.");
         }
       }
-      imageDataUrl = attachment.imageDataUrl;
-      attachmentCreatedAt = attachment.createdAt;
     }
 
-    if (chunkId != null && includeChunkInkContext) {
-      if (supportsDirectImage && !imageBase64) {
-        try {
-          const inkImageBase64 = await rasteriseChunkInkContext(chunkId);
-          if (inkImageBase64) {
-            imageBase64 = inkImageBase64;
-            imageDataUrl = `data:image/png;base64,${inkImageBase64}`;
-            attachedImageLabel = "Attached ink";
-          }
-        } catch (err) {
-          await appLogWarn(`[chunk-ai] chunk ink rasterisation failed chunkId=${chunkId}: ${formatLogError(err)}`);
+    if (shouldAttachChunkVisuals && (!supportsDirectImage || attachedChunkVisualPages === 0)) {
+      try {
+        const inkTranscription = await transcribeChunkInkContext(chunkId);
+        if (inkTranscription) {
+          historyParts.push(`Chunk ink notes transcription:\n---\n${inkTranscription}\n---`);
         }
-      } else if (!supportsDirectImage) {
-        try {
-          const inkTranscription = await transcribeChunkInkContext(chunkId);
-          if (inkTranscription) {
-            historyParts.push(`Chunk ink notes transcription:\n---\n${inkTranscription}\n---`);
-          }
-        } catch (err) {
-          await appLogWarn(`[chunk-ai] chunk ink context failed chunkId=${chunkId}: ${formatLogError(err)}`);
-        }
+      } catch (err) {
+        await appLogWarn(`[chunk-ai] chunk ink context failed chunkId=${chunkId}: ${formatLogError(err)}`);
       }
     }
 
     const leadText = draftContent || (
-      imageBase64 || attachment
-        ? "Use the attached image as additional context."
+      imageBase64List.length > 0 || attachment
+        ? `Use the attached ${imageBase64List.length > 1 ? "images" : "image"} as additional context.`
         : chunkId != null
           ? "Use the available chunk context."
           : "Use the current page context."
@@ -5109,8 +6068,8 @@
     return {
       displayContent: draftContent || attachedImageLabel || "Message",
       historyContent: historyParts.join("\n\n"),
-      imageBase64,
-      imageDataUrl,
+      imageBase64List: imageBase64List.length > 0 ? imageBase64List : undefined,
+      imageDataUrls: imageDataUrls.length > 0 ? imageDataUrls : undefined,
       attachmentCreatedAt,
     };
   }
@@ -5197,8 +6156,8 @@
         role: "user",
         content: prepared.displayContent,
         historyContent: prepared.historyContent,
-        historyImageBase64: prepared.imageBase64,
-        imageDataUrl: prepared.imageDataUrl,
+        historyImageBase64List: prepared.imageBase64List,
+        imageDataUrls: prepared.imageDataUrls,
         state: "complete",
       },
       {
@@ -6218,14 +7177,19 @@
       await flushGlossarySave();
       const chatProvider = aiTaskSettings.chat.provider;
       const chatModel = aiTaskSettings.chat.model.trim();
+      const visualContextImages = includeChunkAiVisuals
+        ? (await rasteriseChunkVisualPages(view.chunk.id)).map(p => p.imageBase64)
+        : [];
+      if (chunkView?.chunk.id !== view.chunk.id) return;
       const suggestion = await invoke<QuestionMarkSuggestion>("mark_question_answer_with_ai", {
         chunkId: view.chunk.id,
         provider: chatProvider,
         model: chatModel.length > 0 ? chatModel : null,
-        includeVisuals: includeQuestionMarkVisuals,
+        includeVisuals: includeChunkAiVisuals,
+        visualContextImages,
       });
       questionMarkingSuggestion = suggestion;
-      questionMarkingSuggestionIncludeVisuals = includeQuestionMarkVisuals;
+      questionMarkingSuggestionIncludeVisuals = includeChunkAiVisuals;
     } catch (err) {
       questionMarkingError = formatLogError(err);
       await appLogWarn(`[question] AI marking failed chunkId=${view.chunk.id}: ${questionMarkingError}`);
@@ -6299,9 +7263,19 @@
     showChunkPenOptions = false;
     showChunkShapeOptions = false;
     chunkCamera = { x: 0, y: 0, scale: 1 };
-    chunkHomeCamera = { ...chunkCamera };
-    chunkSurfaceSize = { w: 1, h: 1 };
-    chunkHomeViewSize = { w: 0, h: 0 };
+    cachedChunkRect = null;
+    if (chunkWetCanvas) {
+      // Canvas is already mounted (chunk-to-chunk navigation). Use actual layout dimensions
+      // so coordinate math is correct immediately — avoids strokes being recorded at wrong
+      // normalised positions while chunkSurfaceSize = {w:1,h:1}.
+      const sw = Math.max(1, chunkWetCanvas.offsetWidth);
+      const sh = Math.max(1, chunkWetCanvas.offsetHeight);
+      chunkSurfaceSize = { w: sw, h: sh };
+      chunkHomeViewSize = { w: sw, h: sh };
+    } else {
+      chunkSurfaceSize = { w: 1, h: 1 };
+      chunkHomeViewSize = { w: 0, h: 0 };
+    }
     chunkTouchPointers = [];
     chunkLastPinchDist = 0;
     chunkLastPinchMid = { x: 0, y: 0 };
@@ -6309,6 +7283,7 @@
     clearChunkSelectionState();
     chunkGraphUndoStack = [];
     chunkGraphRedoStack = [];
+    clearChunkStrokeTransformHistory();
     chunkView = {
       chunk,
       pageNumber,
@@ -6341,7 +7316,7 @@
       clearTimeout(glossarySaveTimer);
       glossarySaveTimer = null;
     }
-    includeChunkInkContext = false;
+    includeChunkAiVisuals = false;
     clearChunkInkContextCache();
     chunkAiRewriteTab = 'body';
     chunkRewritePrompt = "";
@@ -6370,7 +7345,6 @@
     questionMarkingError = null;
     questionMarkingSuggestion = null;
     questionMarkingSuggestionIncludeVisuals = false;
-    includeQuestionMarkVisuals = false;
     questionSourceSlices = [];
     questionSourceError = null;
     questionSourceLoading = false;
@@ -6381,6 +7355,7 @@
     }
     redoStack = [];
     markDirty();
+    redrawChunkCanvases();
     if (!chunkHasFormattedBody(chunk)) {
       void ensureChunkFormattedBody(chunk.id);
     }
@@ -6406,6 +7381,7 @@
       }
     }
     chunkView = null;
+    clearChunkStrokeTransformHistory();
     chunkNavigationPageChunks = [];
     chunkMode = 'draw';
     showChunkPenOptions = false;
@@ -6420,7 +7396,6 @@
     chunkShapeDraft = null;
     chunkActivePointerId = null;
     chunkCamera = { x: 0, y: 0, scale: 1 };
-    chunkHomeCamera = { ...chunkCamera };
     chunkSurfaceSize = { w: 1, h: 1 };
     chunkHomeViewSize = { w: 0, h: 0 };
     chunkTouchPointers = [];
@@ -6438,7 +7413,7 @@
     redoStack = [];
     chunkTitleEditing = false;
     chunkBodyEditing = false;
-    includeChunkInkContext = false;
+    includeChunkAiVisuals = false;
     clearChunkInkContextCache();
     chunkAiRewriteTab = 'body';
     chunkRewritePrompt = "";
@@ -6463,7 +7438,6 @@
     questionMarkingError = null;
     questionMarkingSuggestion = null;
     questionMarkingSuggestionIncludeVisuals = false;
-    includeQuestionMarkVisuals = false;
     questionSourceSlices = [];
     questionSourceLoading = false;
     questionSourceError = null;
@@ -6476,12 +7450,20 @@
   interface ChunkCamera { x: number; y: number; scale: number }
   const CHUNK_ZOOM_MIN = 0.35;
   const CHUNK_ZOOM_MAX = 8.0;
+  const CHUNK_GRID_WORLD = 40;
   const CHUNK_ERASE_RADIUS_WORLD = 8;
   let chunkCamera = $state<ChunkCamera>({ x: 0, y: 0, scale: 1 });
-  let chunkHomeCamera: ChunkCamera = { x: 0, y: 0, scale: 1 };
   let chunkSurfaceSize = { w: 1, h: 1 };
   let chunkHomeViewSize = { w: 0, h: 0 };
   let chunkZoomPercent = $derived(Math.round(chunkCamera.scale * 100));
+  let chunkGridStyle = $derived.by(() => {
+    const step = CHUNK_GRID_WORLD * chunkCamera.scale;
+    return [
+      `--chunk-grid-size: ${step}px`,
+      `--chunk-grid-offset-x: ${chunkCamera.x + step / 2}px`,
+      `--chunk-grid-offset-y: ${chunkCamera.y + step / 2}px`,
+    ].join("; ");
+  });
 
   let chunkWetCanvas = $state<HTMLCanvasElement>(null!);
   let chunkDryCanvas = $state<HTMLCanvasElement>(null!);
@@ -6497,28 +7479,117 @@
   let chunkLastPinchDist = 0;
   let chunkLastPinchMid = { x: 0, y: 0 };
 
-  function chunkPointToWorld(point: Pick<Point, "x" | "y">): { x: number; y: number } {
+  function getChunkPageAspect(): number {
+    const baseW = chunkHomeViewSize.w > 0 ? chunkHomeViewSize.w : chunkSurfaceSize.w;
+    const baseH = chunkHomeViewSize.h > 0 ? chunkHomeViewSize.h : chunkSurfaceSize.h;
+    if (baseW <= 0 || baseH <= 0) return 1;
+    return baseH / baseW;
+  }
+
+  function getChunkPageWorldSize(): { w: number; h: number } {
+    const w = Math.max(1, chunkSurfaceSize.w);
     return {
-      x: point.x * chunkSurfaceSize.w,
-      y: point.y * chunkSurfaceSize.h,
+      w,
+      h: Math.max(1, w * getChunkPageAspect()),
+    };
+  }
+
+  function chunkStrokeWorldBounds(stroke: Stroke) {
+    const { w, h } = getChunkPageWorldSize();
+    return {
+      minX: stroke.bbox.minX * w,
+      minY: stroke.bbox.minY * h,
+      maxX: stroke.bbox.maxX * w,
+      maxY: stroke.bbox.maxY * h,
+    };
+  }
+
+  function chunkGraphWorldBounds(graph: SurfaceGraphObject) {
+    const { w, h } = getChunkPageWorldSize();
+    return {
+      minX: graph.bboxX * w,
+      minY: graph.bboxY * h,
+      maxX: (graph.bboxX + graph.bboxW) * w,
+      maxY: (graph.bboxY + graph.bboxH) * h,
+      width: graph.bboxW * w,
+      height: graph.bboxH * h,
+    };
+  }
+
+  function getChunkDocumentPageCount(): number {
+    let maxPage = 1;
+    if (chunkView) {
+      for (const stroke of chunkView.strokes) {
+        if (!strokeHasFiniteBounds(stroke)) continue;
+        maxPage = Math.max(maxPage, Math.ceil(Math.max(0, stroke.bbox.maxY)));
+      }
+      for (const graph of chunkView.graphs) {
+        if (!graphHasFiniteChunkBounds(graph)) continue;
+        maxPage = Math.max(maxPage, Math.ceil(Math.max(0, graph.bboxY + graph.bboxH)));
+      }
+    }
+    return maxPage + CHUNK_DOCUMENT_BUFFER_PAGES;
+  }
+
+  function getChunkDocumentWorldHeight(): number {
+    return getChunkPageWorldSize().h * getChunkDocumentPageCount();
+  }
+
+  function clampChunkCamera() {
+    const scale = Math.max(CHUNK_ZOOM_MIN, Math.min(CHUNK_ZOOM_MAX, chunkCamera.scale || 1));
+    const { w: docWidth } = getChunkPageWorldSize();
+    const docHeight = getChunkDocumentWorldHeight();
+    const viewportWorldW = chunkSurfaceSize.w / scale;
+    const viewportWorldH = chunkSurfaceSize.h / scale;
+
+    let x: number;
+    if (viewportWorldW >= docWidth) {
+      x = (chunkSurfaceSize.w - docWidth * scale) / 2;
+    } else {
+      const currentLeft = -chunkCamera.x / scale;
+      const maxLeft = docWidth - viewportWorldW;
+      const left = Math.max(0, Math.min(maxLeft, currentLeft));
+      x = -left * scale;
+    }
+
+    let y: number;
+    if (viewportWorldH >= docHeight) {
+      y = 0;
+    } else {
+      const currentTop = -chunkCamera.y / scale;
+      const maxTop = docHeight - viewportWorldH;
+      const top = Math.max(0, Math.min(maxTop, currentTop));
+      y = -top * scale;
+    }
+
+    chunkCamera = { x, y, scale };
+  }
+
+  function chunkPointToWorld(point: Pick<Point, "x" | "y">): { x: number; y: number } {
+    const { w, h } = getChunkPageWorldSize();
+    return {
+      x: point.x * w,
+      y: point.y * h,
     };
   }
 
   function chunkWorldToPoint(worldX: number, worldY: number, pressure = 0.5): Point {
+    const { w, h } = getChunkPageWorldSize();
     return {
-      x: worldX / chunkSurfaceSize.w,
-      y: worldY / chunkSurfaceSize.h,
+      x: clampNorm(worldX / w),
+      y: Math.max(0, worldY / h),
       pressure,
     };
   }
 
   function getChunkShapeStrokes(draft: ShapeDraft): Point[][] {
+    const { w, h } = getChunkPageWorldSize();
     return buildShapeStrokes(
       shapeKind,
       draft.origin,
       draft.current,
-      chunkSurfaceSize.w,
-      chunkSurfaceSize.h,
+      w,
+      h,
       0.5,
     );
   }
@@ -6526,7 +7597,8 @@
   async function commitChunkShape(draft: ShapeDraft) {
     const view = chunkView;
     if (!view) return;
-    const dragWorld = shapeDragLengthWorld(draft.origin, draft.current, chunkSurfaceSize.w, chunkSurfaceSize.h);
+    const { w, h } = getChunkPageWorldSize();
+    const dragWorld = shapeDragLengthWorld(draft.origin, draft.current, w, h);
     if (dragWorld < MIN_SHAPE_DRAG_WORLD) return;
     const generated = getChunkShapeStrokes(draft);
     if (generated.length === 0) return;
@@ -6546,23 +7618,41 @@
 
     view.strokes = [...view.strokes, ...newStrokes];
     clearChunkInkContextCache();
+    clearChunkStrokeTransformHistory();
     redrawChunkDry();
 
     for (const stroke of newStrokes) {
-      try {
-        const id = await invoke<number>("save_surface_stroke", {
-          surfaceId: view.surfaceId,
-          stroke: {
-            colour: stroke.colour,
-            thickness: stroke.thickness,
-            points: stroke.points.map(({ x, y }) => ({ x, y })),
-          },
-        });
-        stroke.id = id;
-      } catch (err) {
-        console.error("save_surface_stroke failed", err);
-      }
+      await persistChunkStrokeCreate(
+        view.surfaceId,
+        stroke,
+        () => !!chunkView?.strokes.includes(stroke),
+      );
     }
+  }
+
+  function commitChunkStrokePoints(pts: Point[]) {
+    const view = chunkView;
+    if (!view || pts.length < 2) return;
+
+    const stroke: Stroke = {
+      id: null,
+      colour: penColour,
+      thickness: penThickness,
+      points: pts,
+      bbox: computeBBox(pts),
+      chunkId: view.chunk.id,
+      groupId: null,
+    };
+    view.strokes = [...view.strokes, stroke];
+    clearChunkInkContextCache();
+    clearChunkStrokeTransformHistory();
+    redrawChunkDry();
+
+    void persistChunkStrokeCreate(
+      view.surfaceId,
+      stroke,
+      () => !!chunkView?.strokes.includes(stroke),
+    );
   }
 
   function updateChunkSurfaceCacheGraphs(next: SurfaceGraphObject[]) {
@@ -6610,8 +7700,9 @@
     point: { x: number; y: number },
   ): { graphId: number; mode: "move" | "resize" } | null {
     if (!chunkView || chunkView.graphs.length === 0) return null;
-    const handleNormX = chunkSurfaceSize.w > 0 ? (12 / chunkCamera.scale) / chunkSurfaceSize.w : 0.03;
-    const handleNormY = chunkSurfaceSize.h > 0 ? (12 / chunkCamera.scale) / chunkSurfaceSize.h : 0.03;
+    const { w, h } = getChunkPageWorldSize();
+    const handleNormX = w > 0 ? (12 / chunkCamera.scale) / w : 0.03;
+    const handleNormY = h > 0 ? (12 / chunkCamera.scale) / h : 0.03;
 
     for (let index = chunkView.graphs.length - 1; index >= 0; index -= 1) {
       const graph = chunkView.graphs[index];
@@ -6636,7 +7727,7 @@
   async function placePendingChunkGraphAt(point: { x: number; y: number }): Promise<boolean> {
     if (!chunkView) return false;
     if (!pendingGraphPlacement || pendingGraphPlacement.scope !== "chunk") return false;
-    const rect = graphRectFromCenter(point, CHUNK_GRAPH_DEFAULT_SIZE);
+    const rect = chunkGraphRectFromCenter(point, CHUNK_GRAPH_DEFAULT_SIZE);
     const graph = buildGraphObjectFromSpec(pendingGraphPlacement.spec, rect);
     const before = cloneGraphObjects(chunkView.graphs);
     const target = [...before, graph];
@@ -6697,9 +7788,10 @@
     colour: string,
     thickness: number,
   ) {
+    const { w, h } = getChunkPageWorldSize();
     drawStrokePointsFn(
       ctx, pts, colour, thickness, 0,
-      chunkCamera.scale, 0, 0, chunkSurfaceSize.w, chunkSurfaceSize.h,
+      chunkCamera.scale, 0, 0, w, h,
     );
   }
 
@@ -6715,6 +7807,7 @@
     chunkCamera.x = screenX - wx * newScale;
     chunkCamera.y = screenY - wy * newScale;
     chunkCamera.scale = newScale;
+    clampChunkCamera();
     redrawChunkCanvases();
   }
 
@@ -6742,83 +7835,57 @@
     return hit;
   }
 
-  function drawChunkDefaultViewGuide(
+  function drawChunkPageGuides(
     ctx: CanvasRenderingContext2D,
     visMinX: number,
     visMinY: number,
     visMaxX: number,
     visMaxY: number,
   ) {
-    const homeW = chunkHomeViewSize.w > 0 ? chunkHomeViewSize.w : chunkSurfaceSize.w;
-    const homeH = chunkHomeViewSize.h > 0 ? chunkHomeViewSize.h : chunkSurfaceSize.h;
-    if (homeW <= 0 || homeH <= 0) return;
-    if (homeW < visMinX || 0 > visMaxX || homeH < visMinY || 0 > visMaxY) return;
-
+    const { w: pageWidth, h: pageHeight } = getChunkPageWorldSize();
+    const pageCount = getChunkDocumentPageCount();
+    if (pageWidth <= 0 || pageHeight <= 0 || pageCount <= 0) return;
     const px = 1 / chunkCamera.scale;
-    const lineW = 1.25 * px;
-    const dash = 8 * px;
-    const gap = 6 * px;
-    const inset = lineW * 0.5;
-    const rx = inset;
-    const ry = inset;
-    const rw = Math.max(0, homeW - inset * 2);
-    const rh = Math.max(0, homeH - inset * 2);
-    const cornerLen = Math.min(28 * px, Math.max(10 * px, Math.min(homeW, homeH) * 0.1));
+    const startPage = Math.max(0, Math.floor(visMinY / pageHeight));
+    const endPage = Math.min(pageCount - 1, Math.floor(visMaxY / pageHeight));
 
-    ctx.save();
-    ctx.fillStyle = "rgba(148, 163, 184, 0.045)";
-    ctx.fillRect(0, 0, homeW, homeH);
+    for (let pageIndex = startPage; pageIndex <= endPage; pageIndex += 1) {
+      const pageTop = pageIndex * pageHeight;
+      const inset = px * 0.5;
+      const label = `Page ${pageIndex + 1}`;
+      const fontSize = 11 * px;
+      const padX = 8 * px;
+      const padY = 4 * px;
+      const labelX = 14 * px;
+      const labelY = pageTop + 14 * px;
 
-    ctx.strokeStyle = "rgba(71, 85, 105, 0.38)";
-    ctx.lineWidth = lineW;
-    ctx.setLineDash([dash, gap]);
-    ctx.strokeRect(rx, ry, rw, rh);
-    ctx.setLineDash([]);
+      ctx.save();
+      ctx.strokeStyle = "rgba(100, 116, 139, 0.32)";
+      ctx.lineWidth = 1.2 * px;
+      ctx.strokeRect(inset, pageTop + inset, Math.max(0, pageWidth - px), Math.max(0, pageHeight - px));
 
-    ctx.strokeStyle = "rgba(71, 85, 105, 0.56)";
-    ctx.lineWidth = 1.8 * px;
-    ctx.beginPath();
-    // top-left
-    ctx.moveTo(0, cornerLen); ctx.lineTo(0, 0); ctx.lineTo(cornerLen, 0);
-    // top-right
-    ctx.moveTo(homeW - cornerLen, 0); ctx.lineTo(homeW, 0); ctx.lineTo(homeW, cornerLen);
-    // bottom-left
-    ctx.moveTo(0, homeH - cornerLen); ctx.lineTo(0, homeH); ctx.lineTo(cornerLen, homeH);
-    // bottom-right
-    ctx.moveTo(homeW - cornerLen, homeH); ctx.lineTo(homeW, homeH); ctx.lineTo(homeW, homeH - cornerLen);
-    ctx.stroke();
-
-    const label = "Default view";
-    const fontSize = 11 * px;
-    const padX = 8 * px;
-    const padY = 4 * px;
-    const labelX = 12 * px;
-    const labelY = 12 * px;
-    ctx.font = `${fontSize}px Inter, system-ui, sans-serif`;
-    ctx.textBaseline = "top";
-    const textWidth = ctx.measureText(label).width;
-    const labelW = textWidth + padX * 2;
-    const labelH = fontSize + padY * 2;
-    ctx.fillStyle = "rgba(248, 250, 252, 0.92)";
-    ctx.fillRect(labelX, labelY, labelW, labelH);
-    ctx.strokeStyle = "rgba(100, 116, 139, 0.42)";
-    ctx.lineWidth = px;
-    ctx.strokeRect(labelX, labelY, labelW, labelH);
-    ctx.fillStyle = "rgba(51, 65, 85, 0.88)";
-    ctx.fillText(label, labelX + padX, labelY + padY);
-    ctx.restore();
+      ctx.font = `${fontSize}px Inter, system-ui, sans-serif`;
+      ctx.textBaseline = "top";
+      const labelW = ctx.measureText(label).width + padX * 2;
+      const labelH = fontSize + padY * 2;
+      ctx.fillStyle = "rgba(248, 250, 252, 0.94)";
+      ctx.fillRect(labelX, labelY, labelW, labelH);
+      ctx.strokeStyle = "rgba(148, 163, 184, 0.45)";
+      ctx.lineWidth = px;
+      ctx.strokeRect(labelX, labelY, labelW, labelH);
+      ctx.fillStyle = "rgba(51, 65, 85, 0.82)";
+      ctx.fillText(label, labelX + padX, labelY + padY);
+      ctx.restore();
+    }
   }
 
   function restoreChunkHomeView() {
-    const homeScale = chunkHomeCamera.scale || 1;
-    const currentScale = chunkCamera.scale;
-    const homeLeft = -chunkHomeCamera.x / homeScale;
-    const homeTop = -chunkHomeCamera.y / homeScale;
     chunkCamera = {
-      x: -homeLeft * currentScale,
-      y: -homeTop * currentScale,
-      scale: currentScale,
+      x: 0,
+      y: 0,
+      scale: 1,
     };
+    clampChunkCamera();
     redrawChunkCanvases();
   }
 
@@ -6841,6 +7908,7 @@
       chunkWetCtx = chunkWetCanvas.getContext("2d");
       if (chunkDryCtx) { chunkDryCtx.lineCap = "round"; chunkDryCtx.lineJoin = "round"; }
       if (chunkWetCtx) { chunkWetCtx.lineCap = "round"; chunkWetCtx.lineJoin = "round"; }
+      clampChunkCamera();
       redrawChunkCanvases();
     };
     resize();
@@ -6852,6 +7920,7 @@
 
   function redrawChunkDry() {
     if (!chunkDryCtx || !chunkDryCanvas || !chunkView) return;
+    clampChunkCamera();
     const ctx = chunkDryCtx;
     const dpr = window.devicePixelRatio || 1;
     ctx.setTransform(
@@ -6873,13 +7942,10 @@
     const visMinY = -chunkCamera.y / chunkCamera.scale;
     const visMaxX = visMinX + chunkSurfaceSize.w / chunkCamera.scale;
     const visMaxY = visMinY + chunkSurfaceSize.h / chunkCamera.scale;
-    drawChunkDefaultViewGuide(ctx, visMinX, visMinY, visMaxX, visMaxY);
+    drawChunkPageGuides(ctx, visMinX, visMinY, visMaxX, visMaxY);
     for (const stroke of chunkView.strokes) {
       if (stroke.points.length < 2) continue;
-      const minX = stroke.bbox.minX * chunkSurfaceSize.w;
-      const minY = stroke.bbox.minY * chunkSurfaceSize.h;
-      const maxX = stroke.bbox.maxX * chunkSurfaceSize.w;
-      const maxY = stroke.bbox.maxY * chunkSurfaceSize.h;
+      const { minX, minY, maxX, maxY } = chunkStrokeWorldBounds(stroke);
       if (
         maxX < visMinX || minX > visMaxX ||
         maxY < visMinY || minY > visMaxY
@@ -6888,10 +7954,7 @@
     }
 
     for (const graph of chunkView.graphs) {
-      const minX = graph.bboxX * chunkSurfaceSize.w;
-      const minY = graph.bboxY * chunkSurfaceSize.h;
-      const maxX = (graph.bboxX + graph.bboxW) * chunkSurfaceSize.w;
-      const maxY = (graph.bboxY + graph.bboxH) * chunkSurfaceSize.h;
+      const { minX, minY, maxX, maxY, width, height } = chunkGraphWorldBounds(graph);
       if (
         maxX < visMinX || minX > visMaxX ||
         maxY < visMinY || minY > visMaxY
@@ -6902,8 +7965,8 @@
         graphObjectToSpec(graph),
         minX,
         minY,
-        graph.bboxW * chunkSurfaceSize.w,
-        graph.bboxH * chunkSurfaceSize.h,
+        width,
+        height,
         {
           selected: chunkSelectedGraphId != null && graph.id === chunkSelectedGraphId,
           showResizeHandle: chunkMode === "select" && chunkSelectedGraphId != null && graph.id === chunkSelectedGraphId,
@@ -7038,8 +8101,30 @@
           return;
         }
       }
+      if (chunkSelectedStrokes.size > 0 && chunkSelection) {
+        const padding = chunkSelectionHitPadding();
+        if (pointInSelectionBounds(point, chunkSelection, padding.x, padding.y)) {
+          const strokeDrag = buildStrokeDragState(
+            chunkView.strokes,
+            chunkSelectedStrokes,
+            { x: point.x, y: point.y },
+            chunkSelection,
+          );
+          if (strokeDrag) {
+            chunkSelectedGraphId = null;
+            chunkGraphDrag = null;
+            chunkStrokeDrag = strokeDrag;
+            chunkSelectOrigin = null;
+            chunkSelectRect = null;
+            redrawChunkCanvases();
+            e.preventDefault();
+            return;
+          }
+        }
+      }
       chunkSelectedGraphId = null;
       chunkGraphDrag = null;
+      chunkStrokeDrag = null;
       chunkSelectOrigin = { x: point.x, y: point.y };
       chunkSelectRect = null;
       chunkSelectedStrokes = new Set();
@@ -7112,6 +8197,7 @@
         chunkLastPinchMid = { x: touch.x, y: touch.y };
       }
 
+      clampChunkCamera();
       redrawChunkCanvases();
       e.preventDefault();
       return;
@@ -7137,14 +8223,14 @@
           h: drag.startGraph.bboxH,
         };
         if (drag.mode === "move") {
-          rect = clampGraphRect({
+          rect = clampChunkGraphRect({
             x: drag.startGraph.bboxX + deltaX,
             y: drag.startGraph.bboxY + deltaY,
             w: drag.startGraph.bboxW,
             h: drag.startGraph.bboxH,
           });
         } else {
-          rect = clampGraphRect({
+          rect = clampChunkGraphRect({
             x: drag.startGraph.bboxX,
             y: drag.startGraph.bboxY,
             w: drag.startGraph.bboxW + deltaX,
@@ -7160,6 +8246,22 @@
         };
         updateChunkGraphInState(drag.graphId, updated);
         chunkSelection = { x: rect.x, y: rect.y, width: rect.w, height: rect.h };
+        return;
+      }
+      if (chunkStrokeDrag) {
+        const delta = clampChunkStrokeDragDelta(
+          chunkStrokeDrag.startSelection,
+          point.x - chunkStrokeDrag.startPoint.x,
+          point.y - chunkStrokeDrag.startPoint.y,
+        );
+        translateDraggedStrokes(chunkStrokeDrag, delta.deltaX, delta.deltaY);
+        chunkSelection = {
+          x: chunkStrokeDrag.startSelection.x + delta.deltaX,
+          y: chunkStrokeDrag.startSelection.y + delta.deltaY,
+          width: chunkStrokeDrag.startSelection.width,
+          height: chunkStrokeDrag.startSelection.height,
+        };
+        redrawChunkCanvases();
         return;
       }
       if (chunkSelectOrigin) {
@@ -7201,7 +8303,8 @@
   }
 
   async function onChunkPointerUp(e: PointerEvent) {
-    if (e.pointerType === "touch") {
+    const isActivePointer = chunkView && e.pointerId === chunkActivePointerId;
+    if (!isActivePointer && e.pointerType === "touch") {
       chunkTouchPointers = chunkTouchPointers.filter((p) => p.id !== e.pointerId);
       if (chunkTouchPointers.length === 1) {
         chunkLastPinchMid = { x: chunkTouchPointers[0].x, y: chunkTouchPointers[0].y };
@@ -7228,6 +8331,23 @@
           });
         }
         chunkGraphDrag = null;
+        chunkSelectOrigin = null;
+        chunkSelectRect = null;
+        redrawChunkCanvases();
+        return;
+      }
+      if (chunkStrokeDrag) {
+        const history = buildStrokeTransformHistory(chunkStrokeDrag);
+        chunkStrokeDrag = null;
+        if (history) {
+          chunkStrokeTransformUndo = history;
+          chunkStrokeTransformRedo = null;
+          chunkSelectedStrokes = new Set(history.strokes.map((entry) => entry.stroke));
+          chunkSelection = unionBBox(chunkSelectedStrokes);
+          void persistChunkStrokeUpdates(history.strokes.map((entry) => entry.stroke));
+        } else if (chunkSelectedStrokes.size > 0) {
+          chunkSelection = unionBBox(chunkSelectedStrokes);
+        }
         chunkSelectOrigin = null;
         chunkSelectRect = null;
         redrawChunkCanvases();
@@ -7265,38 +8385,12 @@
     const pts = chunkCurrentStroke;
     chunkCurrentStroke = [];
     drawChunkWet();
-    if (pts.length < 2) return;
-
-    const stroke: Stroke = {
-      id: null,
-      colour: penColour,
-      thickness: penThickness,
-      points: pts,
-      bbox: computeBBox(pts),
-      chunkId: chunkView.chunk.id,
-      groupId: null,
-    };
-    chunkView.strokes = [...chunkView.strokes, stroke];
-    clearChunkInkContextCache();
-    redrawChunkDry();
-
-    try {
-      const id = await invoke<number>("save_surface_stroke", {
-        surfaceId: chunkView.surfaceId,
-        stroke: {
-          colour: stroke.colour,
-          thickness: stroke.thickness,
-          points: pts.map(({ x, y }) => ({ x, y })),
-        },
-      });
-      stroke.id = id;
-    } catch (err) {
-      console.error("save_surface_stroke failed", err);
-    }
+    commitChunkStrokePoints(pts);
   }
 
   function onChunkPointerCancel(e: PointerEvent) {
-    if (e.pointerType === "touch") {
+    const isActivePointer = chunkView && e.pointerId === chunkActivePointerId;
+    if (!isActivePointer && e.pointerType === "touch") {
       chunkTouchPointers = chunkTouchPointers.filter((p) => p.id !== e.pointerId);
       if (chunkTouchPointers.length === 1) {
         chunkLastPinchMid = { x: chunkTouchPointers[0].x, y: chunkTouchPointers[0].y };
@@ -7312,6 +8406,7 @@
       chunkSelectOrigin = null;
       chunkSelectRect = null;
       chunkGraphDrag = null;
+      chunkStrokeDrag = null;
       drawChunkWet();
       return;
     }
@@ -7320,9 +8415,11 @@
       drawChunkWet();
       return;
     }
+    const pts = chunkCurrentStroke;
     chunkIsDrawing = false;
     chunkCurrentStroke = [];
     drawChunkWet();
+    commitChunkStrokePoints(pts);
   }
 
   function onChunkWheel(e: WheelEvent) {
@@ -7339,11 +8436,25 @@
     }
     chunkCamera.x -= e.deltaX;
     chunkCamera.y -= e.deltaY;
+    clampChunkCamera();
     redrawChunkCanvases();
   }
 
   async function undoChunkStroke() {
     if (!chunkView) return;
+    if (chunkStrokeTransformUndo) {
+      const entry = chunkStrokeTransformUndo;
+      chunkStrokeTransformUndo = null;
+      applyStrokeTransformHistory(entry, "before");
+      chunkStrokeTransformRedo = entry;
+      chunkSelectedGraphId = null;
+      chunkSelectedStrokes = new Set(entry.strokes.map((item) => item.stroke));
+      chunkSelection = unionBBox(chunkSelectedStrokes);
+      clearChunkInkContextCache();
+      redrawChunkCanvases();
+      await persistChunkStrokeUpdates(entry.strokes.map((item) => item.stroke));
+      return;
+    }
     if (chunkGraphUndoStack.length > 0) {
       const entry = chunkGraphUndoStack[chunkGraphUndoStack.length - 1];
       chunkGraphUndoStack = chunkGraphUndoStack.slice(0, -1);
@@ -7360,6 +8471,7 @@
     const removed = getTrailingStrokeGroup(chunkView.strokes);
     if (removed.length === 0) return;
     chunkView.strokes = chunkView.strokes.slice(0, chunkView.strokes.length - removed.length);
+    clearChunkStrokeTransformHistory();
     clearChunkInkContextCache();
     const removedSet = new Set(removed);
     const nextSelected = new Set([...chunkSelectedStrokes].filter((stroke) => !removedSet.has(stroke)));
@@ -7384,6 +8496,19 @@
 
   async function redoChunkGraphAction() {
     if (!chunkView) return;
+    if (chunkStrokeTransformRedo) {
+      const entry = chunkStrokeTransformRedo;
+      chunkStrokeTransformRedo = null;
+      applyStrokeTransformHistory(entry, "after");
+      chunkStrokeTransformUndo = entry;
+      chunkSelectedGraphId = null;
+      chunkSelectedStrokes = new Set(entry.strokes.map((item) => item.stroke));
+      chunkSelection = unionBBox(chunkSelectedStrokes);
+      clearChunkInkContextCache();
+      redrawChunkCanvases();
+      await persistChunkStrokeUpdates(entry.strokes.map((item) => item.stroke));
+      return;
+    }
     if (chunkGraphRedoStack.length === 0) return;
     const entry = chunkGraphRedoStack[chunkGraphRedoStack.length - 1];
     chunkGraphRedoStack = chunkGraphRedoStack.slice(0, -1);
@@ -7403,10 +8528,7 @@
     const keep: Stroke[] = [];
     const remove: Stroke[] = [];
     for (const s of chunkView.strokes) {
-      const minX = s.bbox.minX * chunkSurfaceSize.w;
-      const minY = s.bbox.minY * chunkSurfaceSize.h;
-      const maxX = s.bbox.maxX * chunkSurfaceSize.w;
-      const maxY = s.bbox.maxY * chunkSurfaceSize.h;
+      const { minX, minY, maxX, maxY } = chunkStrokeWorldBounds(s);
       if (
         worldX < minX - radius || worldX > maxX + radius ||
         worldY < minY - radius || worldY > maxY + radius
@@ -7424,6 +8546,7 @@
     }
     if (remove.length === 0) return;
     chunkView.strokes = keep;
+    clearChunkStrokeTransformHistory();
     clearChunkInkContextCache();
     if (chunkSelectedStrokes.size > 0) {
       const keepSet = new Set(keep);
@@ -7452,6 +8575,7 @@
     }
     if (!chunkView || chunkSelectedStrokes.size === 0) return;
     const remove = [...chunkSelectedStrokes];
+    clearChunkStrokeTransformHistory();
     chunkView.strokes = chunkView.strokes.filter((stroke) => !chunkSelectedStrokes.has(stroke));
     clearChunkInkContextCache();
     clearChunkSelectionState();
@@ -7459,6 +8583,72 @@
     for (const stroke of remove) {
       if (stroke.id !== null) invoke("delete_surface_stroke", { strokeId: stroke.id }).catch(() => {});
     }
+  }
+
+  async function copySelectedChunkInk(): Promise<boolean> {
+    if (!chunkView) return false;
+    const nextClipboard = buildInkClipboardState("chunk", chunkView.strokes, chunkSelectedStrokes);
+    if (!nextClipboard) return false;
+    inkClipboard = nextClipboard;
+    try {
+      await copyTextToClipboard(serialiseInkClipboard(nextClipboard));
+      inkClipboard = { ...nextClipboard, systemSynced: true };
+    } catch {
+      // Keep an in-memory copy so paste still works inside Gloss when clipboard APIs are unavailable.
+    }
+    return true;
+  }
+
+  async function openChunkPasteMenuAt(anchor: InkAnchorPoint): Promise<boolean> {
+    const clipboard = await getInkClipboardForScope("chunk");
+    if (!clipboard) return false;
+    chunkPasteMenuAnchor = anchor;
+    return true;
+  }
+
+  async function pasteChunkInk(anchorPoint: InkAnchorPoint | null = null): Promise<boolean> {
+    if (chunkMode !== "select" || !chunkView) return false;
+    const clipboard = await getInkClipboardForScope("chunk");
+    if (!clipboard || !chunkView) return false;
+    const prepared = preparePastedStrokes(
+      clipboard,
+      getChunkPageWorldSize(),
+      chunkView.chunk.id,
+      { minX: 0, maxX: 1, minY: 0, maxY: getChunkDocumentPageCount() },
+      anchorPoint,
+    );
+    if (!prepared || !chunkView) return false;
+
+    const view = chunkView;
+    const pastedSelection = new Set(prepared.strokes);
+    view.strokes = [...view.strokes, ...prepared.strokes];
+    clearChunkInkContextCache();
+    clearChunkStrokeTransformHistory();
+    chunkSelectOrigin = null;
+    chunkSelectRect = null;
+    chunkSelectedGraphId = null;
+    chunkGraphDrag = null;
+    chunkSelectedStrokes = pastedSelection;
+    chunkSelection = unionBBox(pastedSelection);
+    chunkPasteHold = null;
+    chunkPasteMenuAnchor = null;
+    redrawChunkCanvases();
+
+    for (const stroke of prepared.strokes) {
+      void persistChunkStrokeCreate(
+        view.surfaceId,
+        stroke,
+        () => !!chunkView?.strokes.includes(stroke),
+      );
+    }
+
+    inkClipboard = { ...clipboard, pasteCount: prepared.nextPasteCount };
+    return true;
+  }
+
+  async function pasteChunkInkFromMenu() {
+    if (!chunkPasteMenuAnchor) return;
+    await pasteChunkInk(chunkPasteMenuAnchor);
   }
 
   // â”€â”€ Chunking progress events â”€â”€
@@ -7625,6 +8815,25 @@
       if (e.key === "Escape") {
         e.preventDefault();
         closeChunkView();
+      } else if (
+        (e.ctrlKey || e.metaKey)
+        && !e.altKey
+        && !e.shiftKey
+        && e.key.toLowerCase() === "c"
+        && chunkMode === "select"
+        && chunkSelectedStrokes.size > 0
+        && !hasDocumentTextSelection()
+      ) {
+        e.preventDefault();
+        await copySelectedChunkInk();
+      } else if (
+        (e.ctrlKey || e.metaKey)
+        && !e.altKey
+        && !e.shiftKey
+        && e.key.toLowerCase() === "v"
+        && chunkMode === "select"
+      ) {
+        if (await pasteChunkInk()) e.preventDefault();
       } else if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "z" && !e.shiftKey) {
         e.preventDefault();
         await undoChunkStroke();
@@ -7657,7 +8866,26 @@
       return;
     }
 
-    if ((e.ctrlKey || e.metaKey) && e.key === "z") {
+    if (
+      (e.ctrlKey || e.metaKey)
+      && !e.altKey
+      && !e.shiftKey
+      && e.key.toLowerCase() === "c"
+      && mode === "select"
+      && selectedStrokes.size > 0
+      && !hasDocumentTextSelection()
+    ) {
+      e.preventDefault();
+      await copySelectedPageInk();
+    } else if (
+      (e.ctrlKey || e.metaKey)
+      && !e.altKey
+      && !e.shiftKey
+      && e.key.toLowerCase() === "v"
+      && mode === "select"
+    ) {
+      if (await pastePageInk()) e.preventDefault();
+    } else if ((e.ctrlKey || e.metaKey) && e.key === "z") {
       e.preventDefault();
       await undoStroke();
     } else if ((e.ctrlKey || e.metaKey) && (e.key === "y" || (e.shiftKey && e.key === "z"))) {
@@ -7926,8 +9154,12 @@
                       class:assistant-bubble={message.role === "assistant"}
                       class:is-error={message.role === "assistant" && message.state === "error"}
                     >
-                      {#if message.imageDataUrl}
-                        <img class="chunk-chat-image" src={message.imageDataUrl} alt="Attached selection" />
+                      {#if message.imageDataUrls?.length}
+                        <div class="chunk-chat-image-strip">
+                          {#each message.imageDataUrls as imageDataUrl, imageIndex (`${message.id}-viewer-${imageIndex}`)}
+                            <img class="chunk-chat-image" src={imageDataUrl} alt="Attached context" />
+                          {/each}
+                        </div>
                       {/if}
                       {message.content || (message.role === "assistant" && message.state === "streaming" ? "Thinking..." : "")}
                     </div>
@@ -7945,7 +9177,7 @@
               <span class="chunk-ai-status">Transcribing attached image...</span>
             {/if}
             {#if chunkInkContextTranscribing}
-              <span class="chunk-ai-status">Reading chunk ink context...</span>
+              <span class="chunk-ai-status">Reading chunk visuals...</span>
             {/if}
             {#if chunkChatLoadingContext}
               <span class="chunk-ai-status">Preparing context...</span>
@@ -8323,6 +9555,7 @@
                   class:mode-erase={chunkMode === 'erase'}
                   class:mode-shape={chunkMode === 'shape'}
                   class:mode-select={chunkMode === 'select'}
+                  style={chunkGridStyle}
                   use:setupChunkCanvases
                   onwheel={onChunkWheel}
                 >
@@ -8340,8 +9573,8 @@
                       class="ink-btn"
                       type="button"
                       onclick={undoChunkStroke}
-                      disabled={chunkView.strokes.length === 0 && chunkGraphUndoStack.length === 0}
-                      aria-label="Undo chunk stroke"
+                      disabled={!chunkStrokeTransformUndo && chunkView.strokes.length === 0 && chunkGraphUndoStack.length === 0}
+                      aria-label="Undo chunk action"
                     >
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M9 14 4 9l5-5"/>
@@ -8352,8 +9585,8 @@
                       class="ink-btn"
                       type="button"
                       onclick={redoChunkGraphAction}
-                      disabled={chunkGraphRedoStack.length === 0}
-                      aria-label="Redo chunk graph action"
+                      disabled={!chunkStrokeTransformRedo && chunkGraphRedoStack.length === 0}
+                      aria-label="Redo chunk action"
                     >
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M15 14l5-5-5-5"/>
@@ -8501,6 +9734,33 @@
                       </svg>
                     </button>
                     <button
+                      class="ink-btn"
+                      type="button"
+                      onclick={() => void copySelectedChunkInk()}
+                      disabled={chunkMode !== 'select' || chunkSelectedStrokes.size === 0}
+                      aria-label="Copy selected ink"
+                      title="Copy selected ink (Ctrl/Cmd+C)"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="9" y="9" width="11" height="11" rx="2"/>
+                        <path d="M15 5h-9a2 2 0 0 0-2 2v9"/>
+                      </svg>
+                    </button>
+                    <button
+                      class="ink-btn"
+                      type="button"
+                      onclick={() => void pasteChunkInk()}
+                      disabled={chunkMode !== 'select' || !hasChunkInkClipboard}
+                      aria-label="Paste copied ink"
+                      title="Paste copied ink (Ctrl/Cmd+V)"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="6" y="4" width="12" height="16" rx="2"/>
+                        <path d="M9 4.5V3h6v1.5"/>
+                        <path d="M9 9h6"/>
+                      </svg>
+                    </button>
+                    <button
                       class="tool-btn ai-btn"
                       class:active={!!chunkSelection}
                       type="button"
@@ -8639,13 +9899,13 @@
 	                      <div class="chunk-ai-marking-controls">
 	                        <button
 	                          class="chunk-ai-context-toggle"
-	                          class:active={includeQuestionMarkVisuals}
+	                          class:active={includeChunkAiVisuals}
 	                          type="button"
-	                          aria-pressed={includeQuestionMarkVisuals}
-	                          onclick={() => includeQuestionMarkVisuals = !includeQuestionMarkVisuals}
+	                          aria-pressed={includeChunkAiVisuals}
+	                          onclick={() => includeChunkAiVisuals = !includeChunkAiVisuals}
 	                          disabled={questionMarkingLoading || questionMarkingApplying}
 	                        >
-	                          {includeQuestionMarkVisuals ? "Include visuals: On" : "Include visuals: Off"}
+	                          {includeChunkAiVisuals ? "Include visuals: On" : "Include visuals: Off"}
 	                        </button>
 	                        <button
 	                          class="chunk-ai-action chunk-ai-send"
@@ -8722,23 +9982,25 @@
 	                  {/if}
 
 	                  <div class="chunk-ai-rewrite chunk-ai-rewrite-compact">
-                    <div class="chunk-ai-context-row">
-                      <button
-                        class="chunk-ai-context-toggle"
-                        class:active={includeChunkInkContext}
-                        type="button"
-                        aria-pressed={includeChunkInkContext}
-                        onclick={() => includeChunkInkContext = !includeChunkInkContext}
-                        disabled={chunkInkContextTranscribing}
-                      >
-                        {includeChunkInkContext ? "Ink context: On" : "Ink context: Off"}
-                      </button>
-                      <span>
-                        {chunkHasInkContext
-                          ? "Let AI read chunk ink for extra context."
-                          : "No chunk ink yet. Add ink notes to use this context."}
-                      </span>
-                    </div>
+                    {#if !chunkIsQuestion}
+                      <div class="chunk-ai-context-row">
+                        <button
+                          class="chunk-ai-context-toggle"
+                          class:active={includeChunkAiVisuals}
+                          type="button"
+                          aria-pressed={includeChunkAiVisuals}
+                          onclick={() => includeChunkAiVisuals = !includeChunkAiVisuals}
+                          disabled={chunkInkContextTranscribing}
+                        >
+                          {includeChunkAiVisuals ? "Include visuals: On" : "Include visuals: Off"}
+                        </button>
+                        <span>
+                          {chunkHasInkContext
+                            ? "Use chunk visuals for rewrite and chat context."
+                            : "No chunk ink yet. Add ink notes to use visual context."}
+                        </span>
+                      </div>
+                    {/if}
                     <div class="chunk-ai-rewrite-header">
 	                      <strong>Rewrite</strong>
 	                      <span>
@@ -8913,8 +10175,12 @@
                               class:assistant-bubble={message.role === "assistant"}
                               class:is-error={message.role === "assistant" && message.state === "error"}
                             >
-                              {#if message.imageDataUrl}
-                                <img class="chunk-chat-image" src={message.imageDataUrl} alt="Attached selection" />
+                              {#if message.imageDataUrls?.length}
+                                <div class="chunk-chat-image-strip">
+                                  {#each message.imageDataUrls as imageDataUrl, imageIndex (`${message.id}-chunk-${imageIndex}`)}
+                                    <img class="chunk-chat-image" src={imageDataUrl} alt="Attached context" />
+                                  {/each}
+                                </div>
                               {/if}
                               {message.content || (message.role === "assistant" && message.state === "streaming" ? "Thinking..." : "")}
                             </div>
@@ -8929,7 +10195,7 @@
                       <span class="chunk-ai-status">Transcribing attached image...</span>
                     {/if}
                     {#if chunkInkContextTranscribing}
-                      <span class="chunk-ai-status">Reading chunk ink context...</span>
+                      <span class="chunk-ai-status">Reading chunk visuals...</span>
                     {/if}
                     {#if chunkChatLoadingContext}
                       <span class="chunk-ai-status">Preparing context...</span>
@@ -9065,7 +10331,7 @@
         <div class="divider"></div>
 
         <!-- Undo -->
-        <button class="ink-btn" onclick={undoStroke} disabled={strokes.length === 0 && pageGraphUndoStack.length === 0} aria-label="Undo stroke">
+        <button class="ink-btn" onclick={undoStroke} disabled={!pageStrokeTransformUndo && strokes.length === 0 && pageGraphUndoStack.length === 0} aria-label="Undo stroke">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M9 14 4 9l5-5"/>
             <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>
@@ -9073,7 +10339,7 @@
         </button>
 
         <!-- Redo -->
-        <button class="ink-btn" onclick={redoStroke} disabled={redoStack.length === 0 && pageGraphRedoStack.length === 0} aria-label="Redo stroke">
+        <button class="ink-btn" onclick={redoStroke} disabled={!pageStrokeTransformRedo && redoStack.length === 0 && pageGraphRedoStack.length === 0} aria-label="Redo stroke">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M15 14l5-5-5-5"/>
             <path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/>
@@ -9208,6 +10474,33 @@
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M5 3l14 9-7 1-4 7-3-17z"/>
+          </svg>
+        </button>
+
+        <button
+          class="ink-btn"
+          onclick={() => void copySelectedPageInk()}
+          disabled={mode !== 'select' || selectedStrokes.size === 0}
+          aria-label="Copy selected ink"
+          title="Copy selected ink (Ctrl/Cmd+C)"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="9" width="11" height="11" rx="2"/>
+            <path d="M15 5h-9a2 2 0 0 0-2 2v9"/>
+          </svg>
+        </button>
+
+        <button
+          class="ink-btn"
+          onclick={() => void pastePageInk()}
+          disabled={mode !== 'select' || !hasPageInkClipboard}
+          aria-label="Paste copied ink"
+          title="Paste copied ink (Ctrl/Cmd+V)"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="6" y="4" width="12" height="16" rx="2"/>
+            <path d="M9 4.5V3h6v1.5"/>
+            <path d="M9 9h6"/>
           </svg>
         </button>
 
@@ -11665,8 +12958,8 @@
     background-image:
       radial-gradient(circle at center, rgba(15, 23, 42, 0.18) 1.3px, transparent 1.4px),
       linear-gradient(180deg, #fbfcfe 0%, #f2f5fa 100%);
-    background-size: 40px 40px, 100% 100%;
-    background-position: 20px 20px, 0 0;
+    background-size: var(--chunk-grid-size, 40px) var(--chunk-grid-size, 40px), 100% 100%;
+    background-position: var(--chunk-grid-offset-x, 20px) var(--chunk-grid-offset-y, 20px), 0 0;
     touch-action: none;
   }
 
@@ -12450,6 +13743,17 @@
     border: 1px solid rgba(148, 163, 184, 0.55);
     background: #fff;
     margin-bottom: 8px;
+  }
+
+  .chunk-chat-image-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+
+  .chunk-chat-image-strip .chunk-chat-image {
+    margin-bottom: 0;
   }
 
   .chunk-chat-bubble.user-bubble {

@@ -326,13 +326,23 @@ impl GeminiClient {
             chunk.subject.is_some()
         );
 
+        let mut parts = vec![json!({ "text": prompt })];
+        for image_base64 in chunk.image_base64_list.iter()
+            .map(|b64| b64.trim())
+            .filter(|b64| !b64.is_empty())
+        {
+            parts.push(json!({
+                "inline_data": {
+                    "mime_type": "image/png",
+                    "data": image_base64
+                }
+            }));
+        }
         let value = self
             .send_request(json!({
                 "contents": [{
                     "role": "user",
-                    "parts": [{
-                        "text": prompt
-                    }]
+                    "parts": parts
                 }],
                 "generationConfig": {
                     "temperature": 0.1,
@@ -419,12 +429,7 @@ fn build_chat_request(prompt: &str, history: &[ChunkChatMessage]) -> Value {
             }));
         }
         if role == "user" {
-            if let Some(image_base64) = message
-                .image_base64
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
+            for image_base64 in message.image_items() {
                 parts.push(json!({
                     "inline_data": {
                         "mime_type": "image/png",
