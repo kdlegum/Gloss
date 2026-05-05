@@ -442,7 +442,7 @@ impl OpenAiClient {
             output_text.len()
         );
 
-        parse_chunk_rewrite(&output_text, LOG_TARGET)
+        parse_chunk_rewrite(&output_text, LOG_TARGET, chunk.body_format)
     }
 
     async fn send_request(&self, request: Value) -> Result<Value, LlmError> {

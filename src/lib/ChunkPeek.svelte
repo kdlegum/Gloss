@@ -3,6 +3,8 @@
   import { onMount } from "svelte";
   import { renderChunkBodyHtml } from "$lib/chunkBody";
 
+  type GlossaryFormat = "markdown" | "typst";
+
   interface ChunkPreview {
     id: number;
     chunk_type: string;
@@ -11,6 +13,7 @@
     status: string;
     body_preview: string | null;
     glossary_preview: string | null;
+    glossary_format: GlossaryFormat;
     has_formatted_body: boolean;
     has_self_explanation: boolean;
   }
@@ -51,9 +54,19 @@
   const bodyHtml = $derived(
     preview?.body_preview ? renderChunkBodyHtml(preview.body_preview) : "",
   );
+  const glossaryFormat = $derived<GlossaryFormat>(preview?.glossary_format ?? "markdown");
+  const glossaryIsTypst = $derived(glossaryFormat === "typst");
   const glossaryHtml = $derived(
-    preview?.glossary_preview ? renderChunkBodyHtml(preview.glossary_preview) : "",
+    preview?.glossary_preview && !glossaryIsTypst
+      ? renderChunkBodyHtml(preview.glossary_preview)
+      : "",
   );
+  const glossaryTypstPreview = $derived.by(() => {
+    if (!preview?.glossary_preview || !glossaryIsTypst) return "";
+    const trimmed = preview.glossary_preview.trim();
+    if (!trimmed) return "";
+    return trimmed.length > 320 ? `${trimmed.slice(0, 320).trimEnd()}...` : trimmed;
+  });
   const hasGlossary = $derived(Boolean(preview?.glossary_preview?.trim()));
   const displayTitle = $derived(preview?.title ?? preview?.subject ?? null);
 
@@ -179,7 +192,12 @@
     {/if}
 
     {#if activeTab === "glossary"}
-      {#if glossaryHtml}
+      {#if glossaryIsTypst && glossaryTypstPreview}
+        <div class="peek-body">
+          <div class="peek-note-format">Typst</div>
+          <pre class="peek-typst-preview">{glossaryTypstPreview}</pre>
+        </div>
+      {:else if glossaryHtml}
         <div class="peek-body">{@html glossaryHtml}</div>
       {:else}
         <div class="peek-body muted">No glossary entry yet.</div>
@@ -340,6 +358,34 @@
 
   .peek-body.muted {
     color: #777;
+  }
+
+  .peek-note-format {
+    display: inline-flex;
+    align-items: center;
+    margin-bottom: 0.55rem;
+    padding: 0.18rem 0.5rem;
+    border-radius: 999px;
+    background: rgba(15, 23, 42, 0.06);
+    color: #475569;
+    font-family: "Inter", system-ui, sans-serif;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .peek-typst-preview {
+    margin: 0;
+    padding: 0.55rem 0.65rem;
+    border-radius: 8px;
+    background: rgba(15, 23, 42, 0.05);
+    color: #1e293b;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.77rem;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 
   .peek-actions {

@@ -6,17 +6,21 @@ mod ollama;
 mod openai;
 mod references;
 mod settings;
+mod typst_render;
 mod zai;
 
 use crate::deepseek::DeepSeekClient;
 use crate::gemini::GeminiClient;
 use crate::llm::{
     sanitize_chunk_body_markdown, ChunkBodyPrompt, ChunkBodyResult, ChunkChatMessage,
-    ChunkChatPrompt, ChunkRewritePrompt, ChunkRewriteResult, LlmError, LlmProvider,
+    ChunkChatPrompt, ChunkNoteFormat, ChunkRewritePrompt, ChunkRewriteResult, LlmError,
+    LlmProvider,
 };
 use crate::ollama::OllamaClient;
 use crate::openai::OpenAiClient;
+use crate::typst_render::TypstRenderer;
 use crate::zai::ZaiClient;
+use base64::Engine as _;
 use log::info;
 use pdfium_render::prelude::*;
 use percent_encoding::percent_decode_str;
@@ -159,6 +163,7 @@ impl PdfCache {
 struct AppState {
     pdf_cache: Mutex<PdfCache>,
     pdfium: PdfiumWorker,
+    typst_renderer: Arc<TypstRenderer>,
     chunking_jobs: Arc<Mutex<HashSet<(i64, i64)>>>,
     chat_streams: Arc<Mutex<HashMap<String, ChatStreamHandle>>>,
     zai_transcription_semaphore: Arc<Semaphore>,
@@ -174,6 +179,12 @@ struct ChatStreamHandle {
 enum ChatStreamContext {
     Chunk(i64),
     Page(i64),
+}
+
+fn chunk_note_format_from_db(value: Option<&str>) -> ChunkNoteFormat {
+    value
+        .and_then(ChunkNoteFormat::parse)
+        .unwrap_or(ChunkNoteFormat::Markdown)
 }
 
 fn spawn_chunking_job(
@@ -762,6 +773,7 @@ struct ChunkInfo {
     ocr_text: Option<String>,
     formatted_body_md: Option<String>,
     glossary_md: Option<String>,
+    glossary_format: String,
     question_label: Option<String>,
     available_marks: Option<i64>,
     achieved_marks: Option<f64>,
@@ -784,6 +796,7 @@ struct ChunkForTranscription {
     ocr_text: Option<String>,
     formatted_body_md: Option<String>,
     glossary_md: Option<String>,
+    glossary_format: String,
     question_label: Option<String>,
     available_marks: Option<i64>,
     achieved_marks: Option<f64>,
@@ -797,13 +810,15 @@ async fn get_chunks_for_page(
     let rows = sqlx::query(
         "SELECT c.id, c.chunk_type, c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.status, \
                 c.title, c.subject, c.proves_chunk_id, c.ocr_text, c.formatted_body_md, c.glossary_md, \
+                c.glossary_format, \
                 c.question_label, c.available_marks, c.achieved_marks \
          FROM chunks c \
          WHERE c.page_id = ? \
            AND (c.chunk_type != 'question' OR NOT EXISTS (SELECT 1 FROM question_page_slices qps WHERE qps.chunk_id = c.id)) \
          UNION ALL \
-         SELECT c.id, c.chunk_type, qps.bbox_x, qps.bbox_y, qps.bbox_w, qps.bbox_h, c.status, \
+        SELECT c.id, c.chunk_type, qps.bbox_x, qps.bbox_y, qps.bbox_w, qps.bbox_h, c.status, \
                 c.title, c.subject, c.proves_chunk_id, c.ocr_text, c.formatted_body_md, c.glossary_md, \
+                c.glossary_format, \
                 c.question_label, c.available_marks, c.achieved_marks \
          FROM question_page_slices qps \
          JOIN chunks c ON c.id = qps.chunk_id \
@@ -832,6 +847,7 @@ async fn get_chunks_for_page(
             ocr_text: r.get("ocr_text"),
             formatted_body_md: r.get("formatted_body_md"),
             glossary_md: r.get("glossary_md"),
+            glossary_format: r.get("glossary_format"),
             question_label: r.get("question_label"),
             available_marks: r.get("available_marks"),
             achieved_marks: r.get("achieved_marks"),
@@ -843,6 +859,7 @@ async fn get_chunks_for_page(
 async fn save_chunk_glossary(
     chunk_id: i64,
     glossary_md: Option<String>,
+    glossary_format: String,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<(), String> {
     let trimmed = glossary_md
@@ -850,13 +867,68 @@ async fn save_chunk_glossary(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string());
-    sqlx::query("UPDATE chunks SET glossary_md = ? WHERE id = ?")
+    let glossary_format = ChunkNoteFormat::parse(&glossary_format)
+        .ok_or_else(|| format!("invalid glossary_format {:?}", glossary_format))?;
+    sqlx::query("UPDATE chunks SET glossary_md = ?, glossary_format = ? WHERE id = ?")
         .bind(trimmed.as_deref())
+        .bind(glossary_format.as_str())
         .bind(chunk_id)
         .execute(pool.inner())
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+async fn render_typst_note_preview(
+    source: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    state.typst_renderer.render_svg(source.trim())
+}
+
+#[tauri::command]
+async fn export_typst_note_pdf(
+    app: tauri::AppHandle,
+    suggested_file_name: String,
+    pdf_base64: String,
+) -> Result<String, String> {
+    let suggested_file_name = suggested_file_name.trim();
+    let suggested_file_name = if suggested_file_name.is_empty() {
+        "gloss-note.pdf"
+    } else {
+        suggested_file_name
+    };
+
+    let destination = app
+        .dialog()
+        .file()
+        .add_filter("PDF", &["pdf"])
+        .set_file_name(suggested_file_name)
+        .blocking_save_file();
+    let destination = match destination {
+        Some(path) => path,
+        None => return Err("cancelled".into()),
+    };
+    let destination_label = file_path_label(&destination);
+
+    let pdf_bytes = base64::engine::general_purpose::STANDARD
+        .decode(pdf_base64.trim())
+        .map_err(|e| format!("failed to decode exported pdf bytes: {e}"))?;
+    if pdf_bytes.is_empty() {
+        return Err("exported pdf was empty".into());
+    }
+
+    let mut output = open_file_for_overwrite(&app, destination)?;
+    output.write_all(&pdf_bytes).map_err(|e| e.to_string())?;
+    output.flush().map_err(|e| e.to_string())?;
+
+    info!(
+        target: "gloss_lib::typst",
+        "exported typst note pdf to {}",
+        destination_label
+    );
+    Ok(destination_label)
 }
 
 #[tauri::command]
@@ -917,7 +989,7 @@ async fn get_chunk_for_transcription(
         "SELECT c.id, c.source_document_id, p.page_number, c.chunk_type, \
                 c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.status, \
                 c.title, c.subject, c.proves_chunk_id, c.ocr_text, c.formatted_body_md, \
-                c.glossary_md, c.question_label, c.available_marks, c.achieved_marks \
+                c.glossary_md, c.glossary_format, c.question_label, c.available_marks, c.achieved_marks \
          FROM chunks c \
          JOIN pages p ON p.id = c.page_id \
          WHERE c.id = ?",
@@ -944,6 +1016,7 @@ async fn get_chunk_for_transcription(
         ocr_text: r.get("ocr_text"),
         formatted_body_md: r.get("formatted_body_md"),
         glossary_md: r.get("glossary_md"),
+        glossary_format: r.get("glossary_format"),
         question_label: r.get("question_label"),
         available_marks: r.get("available_marks"),
         achieved_marks: r.get("achieved_marks"),
@@ -1194,6 +1267,7 @@ struct RelatedChunkContext {
     subject: Option<String>,
     body_preview: Option<String>,
     glossary_preview: Option<String>,
+    glossary_format: ChunkNoteFormat,
     aliases: Vec<String>,
 }
 
@@ -1207,6 +1281,7 @@ struct ChunkChatContext {
     achieved_marks: Option<f64>,
     body_markdown: String,
     glossary_markdown: Option<String>,
+    glossary_format: ChunkNoteFormat,
     aliases: Vec<ChunkAliasContext>,
     related_chunks: Vec<RelatedChunkContext>,
 }
@@ -1243,10 +1318,21 @@ fn compose_chunk_chat_body(context: &ChunkChatContext) -> String {
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        extras.push_str("Chunk glossary entry:\n");
-        extras.push_str("---\n");
-        extras.push_str(glossary);
-        extras.push_str("\n---\n");
+        extras.push_str("Chunk note format: ");
+        extras.push_str(context.glossary_format.as_str());
+        extras.push_str("\nChunk glossary entry:\n");
+        match context.glossary_format {
+            ChunkNoteFormat::Markdown => {
+                extras.push_str("---\n");
+                extras.push_str(glossary);
+                extras.push_str("\n---\n");
+            }
+            ChunkNoteFormat::Typst => {
+                extras.push_str("```typst\n");
+                extras.push_str(glossary);
+                extras.push_str("\n```\n");
+            }
+        }
     }
 
     if !context.aliases.is_empty() {
@@ -1307,7 +1393,10 @@ fn compose_chunk_chat_body(context: &ChunkChatContext) -> String {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
-                extras.push_str("  glossary preview:\n");
+                extras.push_str(&format!(
+                    "  glossary preview ({}):\n",
+                    related.glossary_format.as_str()
+                ));
                 for line in glossary.lines() {
                     extras.push_str("    ");
                     extras.push_str(line);
@@ -1375,6 +1464,7 @@ async fn append_related_chunk(
     subject: Option<String>,
     body_markdown: Option<String>,
     glossary_markdown: Option<String>,
+    glossary_format: ChunkNoteFormat,
     max_related: usize,
 ) -> Result<(), String> {
     if related_chunks.len() >= max_related {
@@ -1403,6 +1493,7 @@ async fn append_related_chunk(
         subject,
         body_preview,
         glossary_preview,
+        glossary_format,
         aliases,
     });
     Ok(())
@@ -1451,7 +1542,8 @@ async fn load_chunk_chat_context(
         "SELECT sd.title AS book_title, c.source_document_id, c.chunk_type, c.title, c.subject, c.proves_chunk_id, \
                 c.question_label, c.available_marks, c.achieved_marks, \
                 COALESCE(NULLIF(TRIM(c.formatted_body_md), ''), NULLIF(TRIM(c.ocr_text), '')) AS body_markdown, \
-                NULLIF(TRIM(c.glossary_md), '') AS glossary_markdown \
+                NULLIF(TRIM(c.glossary_md), '') AS glossary_markdown, \
+                COALESCE(NULLIF(TRIM(c.glossary_format), ''), 'markdown') AS glossary_format \
          FROM chunks c \
          JOIN source_documents sd ON sd.id = c.source_document_id \
          WHERE c.id = ?",
@@ -1470,6 +1562,9 @@ async fn load_chunk_chat_context(
         .get::<Option<String>, _>("glossary_markdown")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let glossary_format = chunk_note_format_from_db(
+        row.get::<Option<String>, _>("glossary_format").as_deref(),
+    );
     let body_markdown = body_markdown
         .or_else(|| {
             glossary_markdown
@@ -1492,7 +1587,8 @@ async fn load_chunk_chat_context(
             if let Some(linked) = sqlx::query(
                 "SELECT id, chunk_type, title, subject, \
                         COALESCE(NULLIF(TRIM(formatted_body_md), ''), NULLIF(TRIM(ocr_text), '')) AS body_markdown, \
-                        NULLIF(TRIM(glossary_md), '') AS glossary_markdown \
+                        NULLIF(TRIM(glossary_md), '') AS glossary_markdown, \
+                        COALESCE(NULLIF(TRIM(glossary_format), ''), 'markdown') AS glossary_format \
                  FROM chunks \
                  WHERE id = ? AND source_document_id = ?",
             )
@@ -1513,6 +1609,9 @@ async fn load_chunk_chat_context(
                     linked.get("subject"),
                     linked.get("body_markdown"),
                     linked.get("glossary_markdown"),
+                    chunk_note_format_from_db(
+                        linked.get::<Option<String>, _>("glossary_format").as_deref(),
+                    ),
                     MAX_RELATED,
                 )
                 .await?;
@@ -1521,7 +1620,8 @@ async fn load_chunk_chat_context(
     } else if let Some(linked_proof) = sqlx::query(
         "SELECT id, chunk_type, title, subject, \
                 COALESCE(NULLIF(TRIM(formatted_body_md), ''), NULLIF(TRIM(ocr_text), '')) AS body_markdown, \
-                NULLIF(TRIM(glossary_md), '') AS glossary_markdown \
+                NULLIF(TRIM(glossary_md), '') AS glossary_markdown, \
+                COALESCE(NULLIF(TRIM(glossary_format), ''), 'markdown') AS glossary_format \
          FROM chunks \
          WHERE source_document_id = ? AND chunk_type = 'proof' AND proves_chunk_id = ? \
          ORDER BY id LIMIT 1",
@@ -1543,6 +1643,9 @@ async fn load_chunk_chat_context(
             linked_proof.get("subject"),
             linked_proof.get("body_markdown"),
             linked_proof.get("glossary_markdown"),
+            chunk_note_format_from_db(
+                linked_proof.get::<Option<String>, _>("glossary_format").as_deref(),
+            ),
             MAX_RELATED,
         )
         .await?;
@@ -1551,7 +1654,8 @@ async fn load_chunk_chat_context(
     let reference_rows = sqlx::query(
         "SELECT c.id, c.chunk_type, c.title, c.subject, \
                 COALESCE(NULLIF(TRIM(c.formatted_body_md), ''), NULLIF(TRIM(c.ocr_text), '')) AS body_markdown, \
-                NULLIF(TRIM(c.glossary_md), '') AS glossary_markdown \
+                NULLIF(TRIM(c.glossary_md), '') AS glossary_markdown, \
+                COALESCE(NULLIF(TRIM(c.glossary_format), ''), 'markdown') AS glossary_format \
          FROM chunk_references r \
          JOIN chunks src ON src.id = r.source_chunk_id \
          JOIN chunk_aliases a ON a.alias = r.matched_text \
@@ -1578,6 +1682,9 @@ async fn load_chunk_chat_context(
             row.get("subject"),
             row.get("body_markdown"),
             row.get("glossary_markdown"),
+            chunk_note_format_from_db(
+                row.get::<Option<String>, _>("glossary_format").as_deref(),
+            ),
             MAX_RELATED,
         )
         .await?;
@@ -1596,6 +1703,7 @@ async fn load_chunk_chat_context(
         achieved_marks: row.get("achieved_marks"),
         body_markdown,
         glossary_markdown,
+        glossary_format,
         aliases,
         related_chunks,
     })
@@ -1737,6 +1845,7 @@ async fn run_page_ai_stream(
             title: Some(page_title.as_str()),
             subject: None,
             body_markdown: &context.body_markdown,
+            note_format: None,
         };
         let configured_api_key = settings::api_key_for_provider(&pool, provider)
             .await
@@ -1839,6 +1948,7 @@ async fn run_chunk_ai_stream(
             title: context.title.as_deref(),
             subject: context.subject.as_deref(),
             body_markdown: &prompt_body,
+            note_format: Some(context.glossary_format),
         };
         let configured_api_key = settings::api_key_for_provider(&pool, provider)
             .await
@@ -1977,6 +2087,7 @@ async fn rewrite_chunk_text_with_prompt(
         title: context.title.as_deref(),
         subject: context.subject.as_deref(),
         body_markdown: &context.body_markdown,
+        body_format: ChunkNoteFormat::Markdown,
         user_prompt: &prompt,
         image_base64_list: vec![],
     };
@@ -2013,7 +2124,8 @@ async fn rewrite_chunk_glossary_with_prompt(
     let row = sqlx::query(
         "SELECT sd.title AS book_title, c.chunk_type, c.title, c.subject, \
                 COALESCE(NULLIF(TRIM(c.formatted_body_md), ''), NULLIF(TRIM(c.ocr_text), '')) AS body_markdown, \
-                NULLIF(TRIM(c.glossary_md), '') AS glossary_markdown \
+                NULLIF(TRIM(c.glossary_md), '') AS glossary_markdown, \
+                COALESCE(NULLIF(TRIM(c.glossary_format), ''), 'markdown') AS glossary_format \
          FROM chunks c \
          JOIN source_documents sd ON sd.id = c.source_document_id \
          WHERE c.id = ?",
@@ -2034,6 +2146,9 @@ async fn rewrite_chunk_glossary_with_prompt(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_default();
+    let glossary_format = chunk_note_format_from_db(
+        row.get::<Option<String>, _>("glossary_format").as_deref(),
+    );
     let book_title = row.get::<String, _>("book_title");
     let chunk_type = row.get::<String, _>("chunk_type");
     let title = row
@@ -2045,19 +2160,34 @@ async fn rewrite_chunk_glossary_with_prompt(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    let wrapped_prompt = format!(
-        "Edit ONLY the glossary entry markdown for this chunk.\n\
-         Output requirements:\n\
-         - Return title as null.\n\
-         - Put the rewritten glossary entry in body_markdown.\n\
-         - Keep glossary prose plain (no headings or bold).\n\
-         - Preserve mathematical correctness and use LaTeX where helpful.\n\
-         - If the glossary should stay exactly unchanged, return body_markdown as null.\n\n\
-         Current glossary markdown:\n---\n{}\n---\n\n\
-         Chunk body reference (for context only):\n---\n{}\n---\n\n\
-         User glossary edit instruction:\n{}",
-        glossary_markdown, chunk_body_markdown, prompt
-    );
+    let wrapped_prompt = match glossary_format {
+        ChunkNoteFormat::Markdown => format!(
+            "Edit ONLY the glossary entry markdown for this chunk.\n\
+             Output requirements:\n\
+             - Return title as null.\n\
+             - Put the rewritten glossary entry in body_markdown.\n\
+             - Keep glossary prose plain (no headings or bold).\n\
+             - Preserve mathematical correctness and use LaTeX where helpful.\n\
+             - If the glossary should stay exactly unchanged, return body_markdown as null.\n\n\
+             Current glossary markdown:\n---\n{}\n---\n\n\
+             Chunk body reference (for context only):\n---\n{}\n---\n\n\
+             User glossary edit instruction:\n{}",
+            glossary_markdown, chunk_body_markdown, prompt
+        ),
+        ChunkNoteFormat::Typst => format!(
+            "Edit ONLY the glossary/answer Typst source for this chunk.\n\
+             Output requirements:\n\
+             - Return title as null.\n\
+             - Put the rewritten Typst source in body_markdown.\n\
+             - Return valid Typst source only, with no code fences.\n\
+             - Preserve mathematical correctness and keep the result suitable for the chunk note tab.\n\
+             - If the glossary should stay exactly unchanged, return body_markdown as null.\n\n\
+             Current glossary Typst source:\n```typst\n{}\n```\n\n\
+             Chunk body reference (markdown, for context only):\n---\n{}\n---\n\n\
+             User glossary edit instruction:\n{}",
+            glossary_markdown, chunk_body_markdown, prompt
+        ),
+    };
 
     let rewrite_prompt = ChunkRewritePrompt {
         book_title: book_title.trim(),
@@ -2065,6 +2195,7 @@ async fn rewrite_chunk_glossary_with_prompt(
         title: title.as_deref(),
         subject: subject.as_deref(),
         body_markdown: &glossary_markdown,
+        body_format: glossary_format,
         user_prompt: &wrapped_prompt,
         image_base64_list: vec![],
     };
@@ -2074,7 +2205,7 @@ async fn rewrite_chunk_glossary_with_prompt(
         .body_markdown
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "AI response did not include glossary markdown edits.".to_string())?;
+        .ok_or_else(|| "AI response did not include glossary edits.".to_string())?;
 
     Ok(ChunkGlossaryRewriteResult { glossary_markdown })
 }
@@ -2262,6 +2393,7 @@ struct ChunkPreview {
     status: String,
     body_preview: Option<String>,
     glossary_preview: Option<String>,
+    glossary_format: String,
     has_formatted_body: bool,
     has_self_explanation: bool,
     question_label: Option<String>,
@@ -2305,7 +2437,7 @@ async fn get_chunk_preview(
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<ChunkPreview, String> {
     let row = sqlx::query(
-        "SELECT id, chunk_type, title, subject, status, formatted_body_md, ocr_text, glossary_md, \
+        "SELECT id, chunk_type, title, subject, status, formatted_body_md, ocr_text, glossary_md, glossary_format, \
                 question_label, available_marks, achieved_marks \
          FROM chunks WHERE id = ?",
     )
@@ -2333,6 +2465,9 @@ async fn get_chunk_preview(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let glossary_preview = glossary_source.map(truncate_markdown_preview);
+    let glossary_format = chunk_note_format_from_db(
+        row.get::<Option<String>, _>("glossary_format").as_deref(),
+    );
 
     Ok(ChunkPreview {
         id: row.get("id"),
@@ -2342,6 +2477,7 @@ async fn get_chunk_preview(
         status: row.get("status"),
         body_preview,
         glossary_preview,
+        glossary_format: glossary_format.as_str().to_string(),
         has_formatted_body,
         has_self_explanation: glossary_source.is_some(),
         question_label: row.get("question_label"),
@@ -2551,7 +2687,8 @@ async fn mark_question_answer_with_ai(
     let row = sqlx::query(
         "SELECT sd.title AS book_title, c.chunk_type, c.question_label, c.available_marks, \
                 COALESCE(NULLIF(TRIM(c.formatted_body_md), ''), NULLIF(TRIM(c.ocr_text), '')) AS question_body, \
-                NULLIF(TRIM(c.glossary_md), '') AS answer_body \
+                NULLIF(TRIM(c.glossary_md), '') AS answer_body, \
+                COALESCE(NULLIF(TRIM(c.glossary_format), ''), 'markdown') AS answer_format \
          FROM chunks c \
          JOIN source_documents sd ON sd.id = c.source_document_id \
          WHERE c.id = ?",
@@ -2577,10 +2714,22 @@ async fn mark_question_answer_with_ai(
         .get::<Option<String>, _>("answer_body")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let answer_format =
+        chunk_note_format_from_db(row.get::<Option<String>, _>("answer_format").as_deref());
     if answer_body.is_none() && visual_context_images.is_empty() {
         return Err("No answer text found. Add answer content before marking.".to_string());
     }
     let answer_body = answer_body.unwrap_or_default();
+    let answer_section = match answer_format {
+        ChunkNoteFormat::Markdown => format!(
+            "Student answer format: markdown\n\nStudent answer (text):\n---\n{}\n---",
+            answer_body.trim()
+        ),
+        ChunkNoteFormat::Typst => format!(
+            "Student answer format: typst\n\nStudent answer (Typst source):\n```typst\n{}\n```",
+            answer_body.trim()
+        ),
+    };
 
     let user_prompt = format!(
         "Mark the student's answer to this exam question.\n\
@@ -2596,13 +2745,13 @@ async fn mark_question_answer_with_ai(
          Question label: {}\n\
          Available marks: {}\n\n\
          Question text:\n---\n{}\n---\n\n\
-         Student answer (text):\n---\n{}\n---",
+         {}",
         question_label.as_deref().unwrap_or("unknown"),
         available_marks
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
         question_body.trim(),
-        answer_body.trim(),
+        answer_section,
     );
 
     let rewrite_prompt = ChunkRewritePrompt {
@@ -2611,6 +2760,7 @@ async fn mark_question_answer_with_ai(
         title: question_label.as_deref(),
         subject: None,
         body_markdown: question_body.trim(),
+        body_format: ChunkNoteFormat::Markdown,
         user_prompt: &user_prompt,
         image_base64_list: if include_visuals { visual_context_images } else { vec![] },
     };
@@ -4619,10 +4769,13 @@ pub fn run() {
                 PdfiumWorker::spawn(exe_dir.join(lib_name)).expect("failed to start pdfium worker")
             };
             info!(target: "gloss_lib::startup", "pdfium worker initialised");
+            let typst_renderer = Arc::new(TypstRenderer::new());
+            info!(target: "gloss_lib::startup", "typst renderer initialised");
 
             app.manage(AppState {
                 pdf_cache: Mutex::new(PdfCache::new()),
                 pdfium,
+                typst_renderer,
                 chunking_jobs: Arc::new(Mutex::new(HashSet::new())),
                 chat_streams: Arc::new(Mutex::new(HashMap::new())),
                 // Z.AI rejects higher fan-out, so keep transcription globally throttled.
@@ -4660,6 +4813,8 @@ pub fn run() {
             get_chunks_for_page,
             get_chunk_for_transcription,
             save_chunk_glossary,
+            render_typst_note_preview,
+            export_typst_note_pdf,
             save_chunk_title,
             save_chunk_body_markdown,
             get_ai_settings_state,

@@ -4334,6 +4334,7 @@
     ocr_text: string | null;
     formatted_body_md: string | null;
     glossary_md: string | null;
+    glossary_format: GlossaryFormat;
     question_label: string | null;
     available_marks: number | null;
     achieved_marks: number | null;
@@ -4411,6 +4412,7 @@
 
   type GraphModalSource = "page" | "chunk" | "glossary";
   type GraphPlacementScope = "page" | "chunk";
+  type GlossaryFormat = "markdown" | "typst";
 
   interface PendingGraphPlacement {
     scope: GraphPlacementScope;
@@ -4617,14 +4619,478 @@
     }
   }
 
+  const TYPST_PREVIEW_DEBOUNCE_MS = 400;
+  const typstPreviewSvgCache = new Map<string, string>();
+  const typstPreviewPendingCache = new Map<string, Promise<string>>();
+
+  function normaliseGlossaryFormat(value: string | null | undefined): GlossaryFormat {
+    return value === "typst" ? "typst" : "markdown";
+  }
+
+  function glossaryFormatLabel(format: GlossaryFormat): string {
+    return format === "typst" ? "Typst" : "Markdown";
+  }
+
+  function glossaryPlaceholder(format: GlossaryFormat, isQuestion: boolean): string {
+    if (format === "typst") {
+      return isQuestion
+        ? "Write your answer in Typst. This mode treats the whole note as Typst source."
+        : "Write your own explanation in Typst. This mode treats the whole note as Typst source.";
+    }
+    return isQuestion
+      ? "Write your answer. Markdown works, and LaTeX via $...$ inline or $$...$$ block."
+      : "Write your own explanation. Markdown works, and LaTeX via $...$ inline or $$...$$ block.";
+  }
+
+  async function loadTypstPreviewSvg(source: string): Promise<string> {
+    const cached = typstPreviewSvgCache.get(source);
+    if (cached) return cached;
+
+    const pending = typstPreviewPendingCache.get(source);
+    if (pending) return await pending;
+
+    const request = invoke<string>("render_typst_note_preview", { source })
+      .then((svg) => {
+        typstPreviewSvgCache.set(source, svg);
+        return svg;
+      })
+      .finally(() => {
+        if (typstPreviewPendingCache.get(source) === request) {
+          typstPreviewPendingCache.delete(source);
+        }
+      });
+    typstPreviewPendingCache.set(source, request);
+    return await request;
+  }
+
+  interface TypstPdfImage {
+    pageWidthPt: number;
+    pageHeightPt: number;
+    pixelWidth: number;
+    pixelHeight: number;
+    jpegBytes: Uint8Array;
+  }
+
+  const PDF_HEADER_BYTES = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34, 0x0a, 0x25, 0xff, 0xff, 0xff, 0xff, 0x0a]);
+  const pdfTextEncoder = new TextEncoder();
+
+  function encodePdfText(value: string): Uint8Array {
+    return pdfTextEncoder.encode(value);
+  }
+
+  function concatUint8Arrays(parts: Uint8Array[]): Uint8Array {
+    const totalLength = parts.reduce((sum, part) => sum + part.length, 0);
+    const merged = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const part of parts) {
+      merged.set(part, offset);
+      offset += part.length;
+    }
+    return merged;
+  }
+
+  function formatPdfNumber(value: number): string {
+    return Number(value.toFixed(3)).toString();
+  }
+
+  function parseSvgLength(value: string | null): number | null {
+    if (!value) return null;
+    const match = value.trim().match(/^([0-9]*\.?[0-9]+)([a-z%]*)$/i);
+    if (!match) return null;
+
+    const numeric = Number(match[1]);
+    if (!Number.isFinite(numeric) || numeric <= 0) return null;
+
+    const unit = match[2].toLowerCase();
+    switch (unit) {
+      case "":
+      case "pt":
+      case "px":
+        return numeric;
+      case "in":
+        return numeric * 72;
+      case "cm":
+        return numeric * 72 / 2.54;
+      case "mm":
+        return numeric * 72 / 25.4;
+      default:
+        return numeric;
+    }
+  }
+
+  function readTypstSvgPageSize(svgSource: string): { width: number; height: number } {
+    const document = new DOMParser().parseFromString(svgSource, "image/svg+xml");
+    if (document.querySelector("parsererror")) {
+      throw new Error("Couldn't parse the rendered Typst preview.");
+    }
+
+    const svg = document.documentElement;
+    if (!svg || svg.tagName.toLowerCase() !== "svg") {
+      throw new Error("The rendered Typst preview was not valid SVG.");
+    }
+
+    const viewBox = svg.getAttribute("viewBox");
+    if (viewBox) {
+      const parts = viewBox
+        .trim()
+        .split(/[\s,]+/)
+        .map((part) => Number(part));
+      if (
+        parts.length === 4
+        && Number.isFinite(parts[2])
+        && Number.isFinite(parts[3])
+        && parts[2] > 0
+        && parts[3] > 0
+      ) {
+        return { width: parts[2], height: parts[3] };
+      }
+    }
+
+    const width = parseSvgLength(svg.getAttribute("width"));
+    const height = parseSvgLength(svg.getAttribute("height"));
+    if (width && height) {
+      return { width, height };
+    }
+
+    throw new Error("Couldn't determine the size of the rendered Typst preview.");
+  }
+
+  async function loadImageElement(url: string): Promise<HTMLImageElement> {
+    return await new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error("Couldn't prepare the Typst preview for PDF export."));
+      image.src = url;
+    });
+  }
+
+  async function canvasToJpegBlob(canvas: HTMLCanvasElement): Promise<Blob> {
+    return await new Promise((resolve, reject) => {
+      canvas.toBlob(
+        (blob) => {
+          if (blob) {
+            resolve(blob);
+          } else {
+            reject(new Error("Couldn't encode the Typst preview as an image."));
+          }
+        },
+        "image/jpeg",
+        0.98,
+      );
+    });
+  }
+
+  async function blobToBase64(blob: Blob): Promise<string> {
+    return await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error("Couldn't prepare the PDF export."));
+      reader.onload = () => {
+        if (typeof reader.result !== "string") {
+          reject(new Error("Couldn't prepare the PDF export."));
+          return;
+        }
+        const parts = reader.result.split(",", 2);
+        if (parts.length !== 2 || !parts[1]) {
+          reject(new Error("Couldn't prepare the PDF export."));
+          return;
+        }
+        resolve(parts[1]);
+      };
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  async function rasterizeTypstPreviewForPdf(svgSource: string): Promise<TypstPdfImage> {
+    const { width: pageWidthPt, height: pageHeightPt } = readTypstSvgPageSize(svgSource);
+    const maxDimensionPx = 4000;
+    const scale = Math.min(2.25, maxDimensionPx / Math.max(pageWidthPt, pageHeightPt));
+    const pixelWidth = Math.max(1, Math.round(pageWidthPt * scale));
+    const pixelHeight = Math.max(1, Math.round(pageHeightPt * scale));
+
+    const svgBlob = new Blob([svgSource], { type: "image/svg+xml;charset=utf-8" });
+    const svgUrl = URL.createObjectURL(svgBlob);
+    try {
+      const image = await loadImageElement(svgUrl);
+      const canvas = document.createElement("canvas");
+      canvas.width = pixelWidth;
+      canvas.height = pixelHeight;
+
+      const ctx = canvas.getContext("2d", { alpha: false });
+      if (!ctx) {
+        throw new Error("Couldn't create an image canvas for the PDF export.");
+      }
+
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, pixelWidth, pixelHeight);
+      ctx.drawImage(image, 0, 0, pixelWidth, pixelHeight);
+
+      const jpegBlob = await canvasToJpegBlob(canvas);
+      const jpegBytes = new Uint8Array(await jpegBlob.arrayBuffer());
+      return { pageWidthPt, pageHeightPt, pixelWidth, pixelHeight, jpegBytes };
+    } finally {
+      URL.revokeObjectURL(svgUrl);
+    }
+  }
+
+  function buildSinglePagePdfFromJpeg(image: TypstPdfImage): Uint8Array {
+    const parts: Uint8Array[] = [PDF_HEADER_BYTES];
+    const objectOffsets: number[] = [0];
+    let totalLength = PDF_HEADER_BYTES.length;
+
+    function push(part: string | Uint8Array) {
+      const bytes = typeof part === "string" ? encodePdfText(part) : part;
+      parts.push(bytes);
+      totalLength += bytes.length;
+    }
+
+    function startObject(objectNumber: number) {
+      objectOffsets[objectNumber] = totalLength;
+      push(`${objectNumber} 0 obj\n`);
+    }
+
+    const contentStream = `q\n${formatPdfNumber(image.pageWidthPt)} 0 0 ${formatPdfNumber(image.pageHeightPt)} 0 0 cm\n/Im0 Do\nQ\n`;
+
+    startObject(1);
+    push("<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    startObject(2);
+    push("<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n");
+
+    startObject(3);
+    push(
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${formatPdfNumber(image.pageWidthPt)} ${formatPdfNumber(image.pageHeightPt)}] `
+      + `/Resources << /ProcSet [/PDF /ImageC] /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>\nendobj\n`,
+    );
+
+    startObject(4);
+    push(`<< /Length ${contentStream.length} >>\nstream\n${contentStream}endstream\nendobj\n`);
+
+    startObject(5);
+    push(
+      `<< /Type /XObject /Subtype /Image /Width ${image.pixelWidth} /Height ${image.pixelHeight} `
+      + `/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${image.jpegBytes.length} >>\nstream\n`,
+    );
+    push(image.jpegBytes);
+    push("\nendstream\nendobj\n");
+
+    const xrefOffset = totalLength;
+    push(`xref\n0 6\n0000000000 65535 f \n${[1, 2, 3, 4, 5]
+      .map((objectNumber) => `${objectOffsets[objectNumber].toString().padStart(10, "0")} 00000 n \n`)
+      .join("")}`);
+    push(`trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`);
+
+    return concatUint8Arrays(parts);
+  }
+
+  function sanitizeFileNameSegment(value: string | null | undefined): string {
+    return (value ?? "")
+      .normalize("NFKC")
+      .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function buildTypstPdfFileName(chunk: ChunkInfo): string {
+    const parts: string[] = [];
+    const bookTitle = sanitizeFileNameSegment(selectedBook?.title);
+    if (bookTitle) parts.push(bookTitle);
+
+    if (chunk.chunk_type === "question") {
+      const questionLabel = sanitizeFileNameSegment(chunk.question_label ? `Q${chunk.question_label}` : "");
+      if (questionLabel) parts.push(questionLabel);
+      parts.push("Answer");
+    } else {
+      const chunkTitle = sanitizeFileNameSegment(
+        chunkViewTitleDisplay?.heading
+        ?? chunk.title
+        ?? chunk.subject
+        ?? CHUNK_COLOURS[chunk.chunk_type]?.label
+        ?? "Glossary",
+      );
+      if (chunkTitle) parts.push(chunkTitle);
+      parts.push("Glossary");
+    }
+
+    const baseName = parts.join(" - ").slice(0, 120).trim();
+    return `${baseName || "Gloss note"}.pdf`;
+  }
+
+  function isChunkSheetMobileLayout(): boolean {
+    return typeof window !== "undefined" && window.matchMedia("(max-width: 720px)").matches;
+  }
+
   let glossaryDraft = $state("");
+  let glossaryFormat = $state<GlossaryFormat>("markdown");
   let glossaryMode = $state<'edit' | 'preview'>('edit');
   let glossarySaving = $state(false);
   let glossarySaveError = $state<string | null>(null);
+  let glossaryFormatNotice = $state<string | null>(null);
+  let glossaryPdfExporting = $state(false);
+  let glossaryPdfExportError = $state<string | null>(null);
+  let glossaryPdfExportFeedback = $state<string | null>(null);
   let glossarySaveTimer: ReturnType<typeof setTimeout> | null = null;
   let glossaryPendingChunkId: number | null = null;
   let glossaryTextareaEl = $state<HTMLTextAreaElement | null>(null);
-  let glossaryHtml = $derived(renderChunkBodyHtml(glossaryDraft));
+  let glossaryMarkdownHtml = $derived(renderChunkBodyHtml(glossaryDraft));
+  let glossaryTypstPreviewSvg = $state<string | null>(null);
+  let glossaryTypstPreviewError = $state<string | null>(null);
+  let glossaryTypstPreviewLoading = $state(false);
+  let glossaryTypstPreviewTimer: ReturnType<typeof setTimeout> | null = null;
+  let glossaryTypstPreviewRequestId = 0;
+  let glossaryTypstPreviewActiveRequestId = 0;
+  let glossaryRewriteTypstPreviewSvg = $state<string | null>(null);
+  let glossaryRewriteTypstPreviewError = $state<string | null>(null);
+  let glossaryRewriteTypstPreviewLoading = $state(false);
+  let glossaryRewriteTypstPreviewRequestId = 0;
+  let glossaryRewriteTypstPreviewActiveRequestId = 0;
+
+  function clearGlossaryTypstPreviewTimer() {
+    if (!glossaryTypstPreviewTimer) return;
+    clearTimeout(glossaryTypstPreviewTimer);
+    glossaryTypstPreviewTimer = null;
+  }
+
+  function resetGlossaryTypstPreviewState(clearSvg = true) {
+    clearGlossaryTypstPreviewTimer();
+    glossaryTypstPreviewActiveRequestId = ++glossaryTypstPreviewRequestId;
+    glossaryTypstPreviewLoading = false;
+    glossaryTypstPreviewError = null;
+    if (clearSvg) {
+      glossaryTypstPreviewSvg = null;
+    }
+  }
+
+  function resetGlossaryRewriteTypstPreviewState(clearSvg = true) {
+    glossaryRewriteTypstPreviewActiveRequestId = ++glossaryRewriteTypstPreviewRequestId;
+    glossaryRewriteTypstPreviewLoading = false;
+    glossaryRewriteTypstPreviewError = null;
+    if (clearSvg) {
+      glossaryRewriteTypstPreviewSvg = null;
+    }
+  }
+
+  function shouldRenderGlossaryTypstPreview() {
+    return !!chunkView
+      && chunkTab === "glossary"
+      && glossaryFormat === "typst"
+      && (!isChunkSheetMobileLayout() || glossaryMode === "preview");
+  }
+
+  async function refreshGlossaryTypstPreview() {
+    const view = chunkView;
+    if (!view || glossaryFormat !== "typst" || chunkTab !== "glossary") return;
+
+    const source = glossaryDraft.trim();
+    if (!source) {
+      glossaryTypstPreviewLoading = false;
+      glossaryTypstPreviewError = null;
+      glossaryTypstPreviewSvg = null;
+      return;
+    }
+
+    const requestId = ++glossaryTypstPreviewRequestId;
+    glossaryTypstPreviewActiveRequestId = requestId;
+    glossaryTypstPreviewLoading = true;
+    try {
+      const svg = await loadTypstPreviewSvg(source);
+      if (
+        glossaryTypstPreviewActiveRequestId !== requestId
+        || chunkView?.chunk.id !== view.chunk.id
+        || glossaryFormat !== "typst"
+        || chunkTab !== "glossary"
+      ) {
+        return;
+      }
+      glossaryTypstPreviewSvg = svg;
+      glossaryTypstPreviewError = null;
+    } catch (err) {
+      if (glossaryTypstPreviewActiveRequestId !== requestId || chunkView?.chunk.id !== view.chunk.id) return;
+      glossaryTypstPreviewError = formatLogError(err);
+      await appLogWarn(`[typst] preview failed chunkId=${view.chunk.id}: ${glossaryTypstPreviewError}`);
+    } finally {
+      if (glossaryTypstPreviewActiveRequestId === requestId) {
+        glossaryTypstPreviewLoading = false;
+      }
+    }
+  }
+
+  function scheduleGlossaryTypstPreview(delay = TYPST_PREVIEW_DEBOUNCE_MS) {
+    clearGlossaryTypstPreviewTimer();
+    if (!shouldRenderGlossaryTypstPreview()) return;
+    if (!glossaryDraft.trim()) {
+      glossaryTypstPreviewLoading = false;
+      glossaryTypstPreviewError = null;
+      glossaryTypstPreviewSvg = null;
+      return;
+    }
+    glossaryTypstPreviewTimer = setTimeout(() => {
+      glossaryTypstPreviewTimer = null;
+      void refreshGlossaryTypstPreview();
+    }, delay);
+  }
+
+  async function refreshGlossaryRewriteTypstPreview(source: string) {
+    const noteSource = source.trim();
+    if (!noteSource) {
+      glossaryRewriteTypstPreviewLoading = false;
+      glossaryRewriteTypstPreviewError = null;
+      glossaryRewriteTypstPreviewSvg = null;
+      return;
+    }
+
+    const requestId = ++glossaryRewriteTypstPreviewRequestId;
+    glossaryRewriteTypstPreviewActiveRequestId = requestId;
+    glossaryRewriteTypstPreviewLoading = true;
+    try {
+      const svg = await loadTypstPreviewSvg(noteSource);
+      if (glossaryRewriteTypstPreviewActiveRequestId !== requestId) return;
+      glossaryRewriteTypstPreviewSvg = svg;
+      glossaryRewriteTypstPreviewError = null;
+    } catch (err) {
+      if (glossaryRewriteTypstPreviewActiveRequestId !== requestId) return;
+      glossaryRewriteTypstPreviewError = formatLogError(err);
+    } finally {
+      if (glossaryRewriteTypstPreviewActiveRequestId === requestId) {
+        glossaryRewriteTypstPreviewLoading = false;
+      }
+    }
+  }
+
+  function setGlossaryMode(mode: 'edit' | 'preview') {
+    if (mode === "preview") {
+      void flushGlossarySave();
+      if (glossaryFormat === "typst") {
+        scheduleGlossaryTypstPreview(0);
+      }
+    }
+    glossaryMode = mode;
+  }
+
+  function clearGlossaryPdfExportNotices() {
+    glossaryPdfExportError = null;
+    glossaryPdfExportFeedback = null;
+  }
+
+  function setGlossaryFormat(nextFormat: GlossaryFormat) {
+    if (nextFormat === glossaryFormat) return;
+    const previous = glossaryFormat;
+    glossaryFormat = nextFormat;
+    glossaryFormatNotice = glossaryDraft.trim()
+      ? `Switched from ${glossaryFormatLabel(previous)} to ${glossaryFormatLabel(nextFormat)}. Existing content was kept as-is and not converted.`
+      : null;
+    glossarySaveError = null;
+    clearGlossaryPdfExportNotices();
+    if (graphModalOpen && graphModalSource === "glossary" && nextFormat === "typst") {
+      graphModalOpen = false;
+    }
+    scheduleGlossarySave();
+    if (nextFormat === "typst") {
+      scheduleGlossaryTypstPreview(0);
+    } else {
+      resetGlossaryTypstPreviewState();
+      resetGlossaryRewriteTypstPreviewState();
+    }
+  }
 
   async function flushGlossarySave() {
     if (glossarySaveTimer) {
@@ -4634,19 +5100,20 @@
     if (glossaryPendingChunkId == null) return;
     const chunkId = glossaryPendingChunkId;
     const value = glossaryDraft;
+    const format = glossaryFormat;
     glossaryPendingChunkId = null;
     glossarySaving = true;
     try {
-      await invoke("save_chunk_glossary", { chunkId, glossaryMd: value });
+      await invoke("save_chunk_glossary", { chunkId, glossaryMd: value, glossaryFormat: format });
       glossarySaveError = null;
       const stored: string | null = value.trim() ? value : null;
       currentChunks = currentChunks.map((c) =>
-        c.id === chunkId ? { ...c, glossary_md: stored } : c,
+        c.id === chunkId ? { ...c, glossary_md: stored, glossary_format: format } : c,
       );
       if (chunkView?.chunk.id === chunkId) {
         chunkView = {
           ...chunkView,
-          chunk: { ...chunkView.chunk, glossary_md: stored },
+          chunk: { ...chunkView.chunk, glossary_md: stored, glossary_format: format },
         };
       }
     } catch (err) {
@@ -4670,10 +5137,55 @@
   function onGlossaryInput(event: Event) {
     const target = event.target as HTMLTextAreaElement;
     glossaryDraft = target.value;
+    glossaryFormatNotice = null;
+    clearGlossaryPdfExportNotices();
     scheduleGlossarySave();
+    if (glossaryFormat === "typst") {
+      scheduleGlossaryTypstPreview();
+    }
+  }
+
+  async function exportGlossaryTypstPdf() {
+    const view = chunkView;
+    const source = glossaryDraft.trim();
+    if (!view || glossaryFormat !== "typst" || !source || glossaryPdfExporting) return;
+
+    glossaryPdfExporting = true;
+    glossaryPdfExportError = null;
+    glossaryPdfExportFeedback = null;
+
+    try {
+      await flushGlossarySave();
+      if (chunkView?.chunk.id !== view.chunk.id) return;
+
+      const svg = await loadTypstPreviewSvg(source);
+      if (chunkView?.chunk.id !== view.chunk.id) return;
+
+      const pdfImage = await rasterizeTypstPreviewForPdf(svg);
+      const pdfBytes = buildSinglePagePdfFromJpeg(pdfImage);
+      const pdfBase64 = await blobToBase64(new Blob([pdfBytes], { type: "application/pdf" }));
+      if (chunkView?.chunk.id !== view.chunk.id) return;
+
+      const destination = await invoke<string>("export_typst_note_pdf", {
+        suggestedFileName: buildTypstPdfFileName(view.chunk),
+        pdfBase64,
+      });
+      if (chunkView?.chunk.id !== view.chunk.id) return;
+
+      glossaryPdfExportFeedback = `PDF saved to ${destination}.`;
+      await appLogInfo(`[typst] exported pdf chunkId=${view.chunk.id} to ${destination}`);
+    } catch (err) {
+      if (err !== "cancelled" && chunkView?.chunk.id === view.chunk.id) {
+        glossaryPdfExportError = formatLogError(err);
+        await appLogWarn(`[typst] pdf export failed chunkId=${view.chunk.id}: ${glossaryPdfExportError}`);
+      }
+    } finally {
+      glossaryPdfExporting = false;
+    }
   }
 
   function insertGraphFenceIntoGlossary(spec: GraphSpec) {
+    if (glossaryFormat === "typst") return;
     const fence = graphSpecToFence(spec);
     const textarea = glossaryTextareaEl;
     if (
@@ -4702,6 +5214,7 @@
   }
 
   function openGlossaryGraphComposer() {
+    if (glossaryFormat === "typst") return;
     openGraphComposer("glossary");
   }
 
@@ -5009,7 +5522,7 @@
   let glossaryRewriteError = $state<string | null>(null);
   let glossaryRewriteApplying = $state(false);
   let glossaryRewriteSuggestion = $state<ChunkGlossaryRewriteSuggestionOutput | null>(null);
-  let glossaryRewritePreviewHtml = $derived(
+  let glossaryRewriteMarkdownPreviewHtml = $derived(
     glossaryRewriteSuggestion?.glossary_markdown
       ? renderChunkBodyHtml(glossaryRewriteSuggestion.glossary_markdown, undefined, {
         copyCodeBlocks: false,
@@ -5106,6 +5619,7 @@
     status: string;
     body_preview: string | null;
     glossary_preview?: string | null;
+    glossary_format: GlossaryFormat;
     has_formatted_body: boolean;
     has_self_explanation: boolean;
     question_label?: string | null;
@@ -6150,6 +6664,8 @@
 
     let prepared: PreparedChatUserMessage;
     try {
+      await flushChunkTextSaves();
+      await flushGlossarySave();
       prepared = await prepareChunkChatUserMessage(draftContent, { chunkId, pageNumber });
       if (chunkId != null) {
         await ensureChunkChatContext(chunkId);
@@ -6330,6 +6846,7 @@
     glossaryRewriteLoading = true;
     glossaryRewriteError = null;
     glossaryRewriteSuggestion = null;
+    resetGlossaryRewriteTypstPreviewState();
     try {
       await flushChunkTextSaves();
       await flushGlossarySave();
@@ -6348,6 +6865,9 @@
       if (chunkView?.chunk.id !== view.chunk.id) return;
 
       glossaryRewriteSuggestion = suggestion;
+      if (glossaryFormat === "typst") {
+        void refreshGlossaryRewriteTypstPreview(suggestion.glossary_markdown);
+      }
       await appLogInfo(
         `[chunk-ai] glossary rewrite ready chunkId=${view.chunk.id} provider=${chatProvider} model=${chatModel || "auto"} chars=${suggestion.glossary_markdown.length}`,
       );
@@ -6364,6 +6884,7 @@
   function discardGlossaryRewriteSuggestion() {
     glossaryRewriteSuggestion = null;
     glossaryRewriteError = null;
+    resetGlossaryRewriteTypstPreviewState();
   }
 
   async function applyGlossaryRewriteSuggestion() {
@@ -6373,11 +6894,16 @@
     try {
       glossaryDraft = glossaryRewriteSuggestion.glossary_markdown;
       glossarySaveError = null;
+      clearGlossaryPdfExportNotices();
       glossaryPendingChunkId = chunkId;
       await flushGlossarySave();
-      glossaryMode = 'preview';
+      setGlossaryMode('preview');
+      if (glossaryFormat === "typst") {
+        scheduleGlossaryTypstPreview(0);
+      }
       glossaryRewriteSuggestion = null;
       glossaryRewriteError = null;
+      resetGlossaryRewriteTypstPreviewState();
     } finally {
       glossaryRewriteApplying = false;
     }
@@ -7339,13 +7865,18 @@
       chunkBodySaveTimer = null;
     }
     glossaryDraft = chunk.glossary_md ?? "";
+    glossaryFormat = normaliseGlossaryFormat(chunk.glossary_format);
     glossaryMode = 'edit';
     glossarySaveError = null;
+    glossaryFormatNotice = null;
+    glossaryPdfExporting = false;
+    clearGlossaryPdfExportNotices();
     glossaryPendingChunkId = null;
     if (glossarySaveTimer) {
       clearTimeout(glossarySaveTimer);
       glossarySaveTimer = null;
     }
+    resetGlossaryTypstPreviewState();
     includeChunkAiVisuals = false;
     clearChunkInkContextCache();
     chunkAiRewriteTab = 'body';
@@ -7359,6 +7890,7 @@
     glossaryRewriteSuggestion = null;
     glossaryRewriteLoading = false;
     glossaryRewriteApplying = false;
+    resetGlossaryRewriteTypstPreviewState();
     questionAvailableMarksDraft = chunk.available_marks == null
       ? ""
       : `${chunk.available_marks}`;
@@ -7447,11 +7979,17 @@
     chunkRewriteSuggestion = null;
     chunkRewriteLoading = false;
     chunkRewriteApplying = false;
+    glossaryFormat = "markdown";
+    glossaryFormatNotice = null;
+    glossaryPdfExporting = false;
+    clearGlossaryPdfExportNotices();
+    resetGlossaryTypstPreviewState();
     glossaryRewritePrompt = "";
     glossaryRewriteError = null;
     glossaryRewriteSuggestion = null;
     glossaryRewriteLoading = false;
     glossaryRewriteApplying = false;
+    resetGlossaryRewriteTypstPreviewState();
     questionAvailableMarksDraft = "";
     questionAvailableMarksEditing = false;
     questionAvailableMarksSaving = false;
@@ -8966,6 +9504,9 @@
     void flushChunkTextSaves();
     void flushGlossarySave();
     stopChunkPanelResize();
+    clearGlossaryTypstPreviewTimer();
+    resetGlossaryTypstPreviewState();
+    resetGlossaryRewriteTypstPreviewState();
     window.removeEventListener("keydown", handleKeydown);
     window.removeEventListener("wheel", handleWheel);
     containerResizeObserver?.disconnect();
@@ -9425,6 +9966,9 @@
                     chunkTab = 'glossary';
                     showChunkPenOptions = false;
                     showChunkShapeOptions = false;
+                    if (glossaryFormat === "typst") {
+                      scheduleGlossaryTypstPreview(0);
+                    }
                   }}
                 >
 	                  <svg viewBox="0 0 16 16" fill="none" width="13" height="13">
@@ -9734,58 +10278,143 @@
               {:else if chunkTab === 'glossary'}
                 <div class="chunk-glossary-pane">
                   <div class="chunk-glossary-bar">
-                    <div class="chunk-glossary-mode">
-                      <button
-                        type="button"
-                        class="chunk-glossary-mode-btn"
-                        class:active={glossaryMode === 'edit'}
-                        onclick={() => glossaryMode = 'edit'}
-                      >Edit</button>
-                      <button
-                        type="button"
-                        class="chunk-glossary-mode-btn"
-                        class:active={glossaryMode === 'preview'}
-                        onclick={() => { void flushGlossarySave(); glossaryMode = 'preview'; }}
-                      >Preview</button>
+                    <div class="chunk-glossary-bar-main">
+                      <div class="chunk-glossary-mode">
+                        <button
+                          type="button"
+                          class="chunk-glossary-mode-btn"
+                          class:active={glossaryMode === 'edit'}
+                          onclick={() => setGlossaryMode('edit')}
+                        >Edit</button>
+                        <button
+                          type="button"
+                          class="chunk-glossary-mode-btn"
+                          class:active={glossaryMode === 'preview'}
+                          onclick={() => setGlossaryMode('preview')}
+                        >Preview</button>
+                      </div>
+                      <div class="chunk-glossary-format-picker" role="group" aria-label="Note format">
+                        <button
+                          type="button"
+                          class="chunk-glossary-format-btn"
+                          class:active={glossaryFormat === 'markdown'}
+                          onclick={() => setGlossaryFormat('markdown')}
+                        >Markdown</button>
+                        <button
+                          type="button"
+                          class="chunk-glossary-format-btn"
+                          class:active={glossaryFormat === 'typst'}
+                          onclick={() => setGlossaryFormat('typst')}
+                        >Typst</button>
+                      </div>
                       <button
                         type="button"
                         class="chunk-glossary-insert-graph"
                         onclick={openGlossaryGraphComposer}
+                        disabled={glossaryFormat === 'typst'}
+                        aria-disabled={glossaryFormat === 'typst'}
+                        title={glossaryFormat === 'typst' ? "Insert graph is only available in markdown mode." : "Insert graph"}
                       >Insert graph</button>
+                      {#if glossaryFormat === 'typst'}
+                        <button
+                          type="button"
+                          class="chunk-glossary-export-pdf"
+                          onclick={() => void exportGlossaryTypstPdf()}
+                          disabled={!glossaryDraft.trim() || glossaryPdfExporting}
+                          title={!glossaryDraft.trim() ? "Write some Typst before saving." : "Save this Typst note as a PDF."}
+                        >{glossaryPdfExporting ? "Saving PDF..." : "Save PDF"}</button>
+                      {/if}
                     </div>
-                    <span class="chunk-glossary-status">
-                      {#if glossarySaveError}
+                    <span class="chunk-glossary-status" title={glossaryPdfExportError ?? glossaryPdfExportFeedback ?? undefined}>
+                      {#if glossaryPdfExportError}
+                        <span class="chunk-glossary-status-error">PDF save failed</span>
+                      {:else if glossaryPdfExporting}
+                        Saving PDF…
+                      {:else if glossaryPdfExportFeedback}
+                        PDF saved
+                      {:else if glossarySaveError}
                         <span class="chunk-glossary-status-error">Save failed</span>
                       {:else if glossarySaving}
-                        Savingâ€¦
+                        Saving…
                       {:else if glossaryDraft.trim()}
                         Saved
                       {/if}
                     </span>
                   </div>
-                  {#if glossaryMode === 'edit'}
-	                    <textarea
-	                      class="chunk-glossary-editor"
-                        bind:this={glossaryTextareaEl}
-	                      placeholder={chunkIsQuestion
-	                        ? "Write your answer. Markdown works, and LaTeX via $â€¦$ inline or $$â€¦$$ block."
-	                        : "Write your own explanation. Markdown works, and LaTeX via $â€¦$ inline or $$â€¦$$ block."}
-	                      value={glossaryDraft}
-	                      oninput={onGlossaryInput}
-	                      onblur={() => void flushGlossarySave()}
-	                      spellcheck="true"
-	                    ></textarea>
+                  {#if glossaryFormatNotice}
+                    <p class="chunk-glossary-format-notice">{glossaryFormatNotice}</p>
+                  {/if}
+                  {#if glossaryFormat === 'typst'}
+                    <div
+                      class="chunk-glossary-typst-workspace"
+                      class:mode-edit={glossaryMode === 'edit'}
+                      class:mode-preview={glossaryMode === 'preview'}
+                    >
+                      <section class="chunk-glossary-typst-editor-pane">
+                        <div class="chunk-glossary-pane-header">
+                          <strong>Source</strong>
+                          <span>{chunkIsQuestion ? "Full Typst answer source" : "Full Typst glossary source"}</span>
+                        </div>
+                        <textarea
+                          class="chunk-glossary-editor chunk-glossary-editor-typst"
+                          bind:this={glossaryTextareaEl}
+                          placeholder={glossaryPlaceholder(glossaryFormat, chunkIsQuestion)}
+                          value={glossaryDraft}
+                          oninput={onGlossaryInput}
+                          onblur={() => void flushGlossarySave()}
+                          spellcheck="false"
+                        ></textarea>
+                      </section>
+                      <section class="chunk-glossary-typst-preview-pane">
+                        <div class="chunk-glossary-pane-header">
+                          <strong>Preview</strong>
+                          <span>
+                            {#if glossaryTypstPreviewError}
+                              Error
+                            {:else if glossaryTypstPreviewLoading}
+                              Rendering…
+                            {:else if glossaryTypstPreviewSvg}
+                              Up to date
+                            {:else}
+                              Waiting for content
+                            {/if}
+                          </span>
+                        </div>
+                        <div class="chunk-glossary-preview chunk-glossary-preview-typst">
+                          {#if glossaryTypstPreviewError}
+                            <p class="chunk-typst-preview-error">{glossaryTypstPreviewError}</p>
+                          {/if}
+                          {#if glossaryTypstPreviewSvg}
+                            <div class="chunk-typst-preview-svg rendered">{@html glossaryTypstPreviewSvg}</div>
+                          {:else if !glossaryDraft.trim()}
+                            <p class="chunk-glossary-preview-empty">Nothing yet.</p>
+                          {:else if glossaryTypstPreviewLoading}
+                            <p class="chunk-glossary-preview-empty">Rendering preview…</p>
+                          {/if}
+                        </div>
+                      </section>
+                    </div>
+                  {:else if glossaryMode === 'edit'}
+                    <textarea
+                      class="chunk-glossary-editor"
+                      bind:this={glossaryTextareaEl}
+                      placeholder={glossaryPlaceholder(glossaryFormat, chunkIsQuestion)}
+                      value={glossaryDraft}
+                      oninput={onGlossaryInput}
+                      onblur={() => void flushGlossarySave()}
+                      spellcheck="true"
+                    ></textarea>
                   {:else}
                     <div class="chunk-glossary-preview">
                       {#if glossaryDraft.trim()}
-                        {@html glossaryHtml}
+                        {@html glossaryMarkdownHtml}
                       {:else}
                         <p class="chunk-glossary-preview-empty">Nothing yet.</p>
                       {/if}
                     </div>
                   {/if}
                 </div>
-	              {:else if chunkTab === 'ai'}
+              {:else if chunkTab === 'ai'}
 	                <div class="chunk-ai-pane">
 	                  {#if chunkIsQuestion}
 	                    <section class="chunk-ai-marking">
@@ -10011,12 +10640,25 @@
                       {#if glossaryRewriteSuggestion}
                         <div class="chunk-ai-rewrite-preview">
                           <p class="chunk-ai-rewrite-field">
-                            <span>Glossary:</span>
-                            Updated
+                            <span>{chunkIsQuestion ? "Answer" : "Glossary"}:</span>
+                            {glossaryFormat === "typst" ? "Updated Typst source" : "Updated"}
                           </p>
-                          <div class="chunk-ai-rewrite-body-preview rendered">
-                            {@html glossaryRewritePreviewHtml}
-                          </div>
+                          {#if glossaryFormat === "typst"}
+                            <div class="chunk-ai-rewrite-body-preview">
+                              {#if glossaryRewriteTypstPreviewError}
+                                <p class="chunk-typst-preview-error">{glossaryRewriteTypstPreviewError}</p>
+                              {/if}
+                              {#if glossaryRewriteTypstPreviewSvg}
+                                <div class="chunk-typst-preview-svg rendered">{@html glossaryRewriteTypstPreviewSvg}</div>
+                              {:else if glossaryRewriteTypstPreviewLoading}
+                                <p class="chunk-glossary-preview-empty">Rendering preview…</p>
+                              {/if}
+                            </div>
+                          {:else}
+                            <div class="chunk-ai-rewrite-body-preview rendered">
+                              {@html glossaryRewriteMarkdownPreviewHtml}
+                            </div>
+                          {/if}
                           <div class="chunk-ai-rewrite-actions">
                             <button
                               class="chunk-ai-action chunk-ai-send"
@@ -11550,10 +12192,20 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
     padding: 6px 10px;
     border-bottom: 1px solid rgba(0, 0, 0, 0.06);
     background: #fafafa;
     flex-shrink: 0;
+  }
+
+  .chunk-glossary-bar-main {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    min-width: 0;
   }
 
   .chunk-glossary-mode {
@@ -11584,6 +12236,33 @@
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
   }
 
+  .chunk-glossary-format-picker {
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    background: #f2f4f7;
+    border-radius: 6px;
+  }
+
+  .chunk-glossary-format-btn {
+    height: 22px;
+    padding: 0 10px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #52606d;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+  }
+
+  .chunk-glossary-format-btn.active {
+    background: #ffffff;
+    color: #0f172a;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+  }
+
   .chunk-glossary-insert-graph {
     height: 22px;
     padding: 0 10px;
@@ -11600,11 +12279,111 @@
     background: #eff6ff;
   }
 
+  .chunk-glossary-insert-graph:disabled {
+    cursor: not-allowed;
+    color: #94a3b8;
+    border-color: #cbd5e1;
+    background: #f8fafc;
+  }
+
+  .chunk-glossary-export-pdf {
+    height: 22px;
+    padding: 0 10px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #0f172a;
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
+  }
+
+  .chunk-glossary-export-pdf:hover:not(:disabled) {
+    background: #f8fafc;
+    border-color: #94a3b8;
+  }
+
+  .chunk-glossary-export-pdf:disabled {
+    cursor: not-allowed;
+    color: #94a3b8;
+    border-color: #cbd5e1;
+    background: #f8fafc;
+  }
+
   .chunk-glossary-status {
+    margin-left: auto;
     font-size: 11px;
     color: #9ca3af;
   }
   .chunk-glossary-status-error { color: #b91c1c; }
+
+  .chunk-glossary-format-notice {
+    margin: 0;
+    padding: 8px 10px;
+    border-bottom: 1px solid rgba(191, 219, 254, 0.85);
+    background: #eff6ff;
+    color: #1d4ed8;
+    font-size: 12px;
+    line-height: 1.45;
+    font-family: Inter, system-ui, sans-serif;
+  }
+
+  .chunk-glossary-typst-workspace {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    overflow: hidden;
+  }
+
+  .chunk-glossary-typst-workspace.mode-preview {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .chunk-glossary-typst-workspace.mode-preview .chunk-glossary-typst-editor-pane {
+    display: none;
+  }
+
+  .chunk-glossary-typst-workspace.mode-preview .chunk-glossary-typst-preview-pane .chunk-glossary-pane-header {
+    display: none;
+  }
+
+  .chunk-glossary-typst-editor-pane,
+  .chunk-glossary-typst-preview-pane {
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .chunk-glossary-typst-editor-pane {
+    border-right: 1px solid rgba(203, 213, 225, 0.72);
+  }
+
+  .chunk-glossary-pane-header {
+    min-height: 34px;
+    padding: 8px 12px;
+    border-bottom: 1px solid rgba(203, 213, 225, 0.72);
+    background: #f8fafc;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    font-family: Inter, system-ui, sans-serif;
+  }
+
+  .chunk-glossary-pane-header strong {
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #334155;
+  }
+
+  .chunk-glossary-pane-header span {
+    font-size: 11px;
+    color: #64748b;
+  }
 
   .chunk-glossary-editor {
     flex: 1;
@@ -11622,6 +12401,14 @@
     box-sizing: border-box;
   }
 
+  .chunk-glossary-editor-typst {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.6;
+    tab-size: 2;
+    border-radius: 0;
+  }
+
   .chunk-glossary-editor::placeholder {
     color: #9ca3af;
     font-style: italic;
@@ -11636,6 +12423,17 @@
     font-size: 14px;
     line-height: 1.55;
     color: #1f2937;
+  }
+
+  .chunk-glossary-preview-typst {
+    padding: 18px 20px 22px;
+    background:
+      radial-gradient(circle at top left, rgba(191, 219, 254, 0.16), transparent 40%),
+      linear-gradient(180deg, #fbfdff 0%, #f8fafc 100%);
+  }
+
+  .chunk-glossary-typst-workspace.mode-preview .chunk-glossary-preview-typst {
+    padding: 26px clamp(20px, 3vw, 40px) 32px;
   }
 
   .chunk-glossary-preview :global(p) { margin: 0 0 0.7em; }
@@ -11684,6 +12482,35 @@
     color: #9ca3af;
     font-style: italic;
     margin: 0;
+  }
+
+  .chunk-typst-preview-error {
+    margin: 0 0 10px;
+    padding: 9px 10px;
+    border-radius: 8px;
+    border: 1px solid #fecaca;
+    background: #fef2f2;
+    color: #991b1b;
+    font-family: Inter, system-ui, sans-serif;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+  }
+
+  .chunk-typst-preview-svg {
+    width: min(100%, 940px);
+    margin: 0 auto;
+    border-radius: 16px;
+    border: 1px solid rgba(203, 213, 225, 0.9);
+    background: #ffffff;
+    box-shadow: 0 18px 38px rgba(15, 23, 42, 0.08);
+    overflow: hidden;
+  }
+
+  .chunk-typst-preview-svg :global(svg) {
+    display: block;
+    width: 100%;
+    height: auto;
   }
 
   :global(.chunk-graph-block) {
@@ -12524,6 +13351,34 @@
       margin-bottom: 8px;
       font-size: 12px;
       line-height: 1.45;
+    }
+    .chunk-glossary-bar {
+      align-items: flex-start;
+    }
+    .chunk-glossary-bar-main {
+      width: 100%;
+      flex-wrap: wrap;
+    }
+    .chunk-glossary-status {
+      width: 100%;
+      margin-left: 0;
+    }
+    .chunk-glossary-typst-workspace {
+      display: block;
+    }
+    .chunk-glossary-typst-workspace .chunk-glossary-typst-editor-pane,
+    .chunk-glossary-typst-workspace .chunk-glossary-typst-preview-pane {
+      display: none;
+    }
+    .chunk-glossary-typst-workspace.mode-edit .chunk-glossary-typst-editor-pane,
+    .chunk-glossary-typst-workspace.mode-preview .chunk-glossary-typst-preview-pane {
+      display: flex;
+    }
+    .chunk-glossary-typst-editor-pane {
+      border-right: none;
+    }
+    .chunk-glossary-preview-typst {
+      padding: 10px;
     }
     .chunk-ai-rewrite-body-preview {
       max-height: 120px;

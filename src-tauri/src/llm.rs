@@ -119,6 +119,30 @@ pub struct ChunkChatPrompt<'a> {
     pub title: Option<&'a str>,
     pub subject: Option<&'a str>,
     pub body_markdown: &'a str,
+    pub note_format: Option<ChunkNoteFormat>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkNoteFormat {
+    Markdown,
+    Typst,
+}
+
+impl ChunkNoteFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::Typst => "typst",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "markdown" => Some(Self::Markdown),
+            "typst" => Some(Self::Typst),
+            _ => None,
+        }
+    }
 }
 
 pub struct ChunkRewritePrompt<'a> {
@@ -127,6 +151,7 @@ pub struct ChunkRewritePrompt<'a> {
     pub title: Option<&'a str>,
     pub subject: Option<&'a str>,
     pub body_markdown: &'a str,
+    pub body_format: ChunkNoteFormat,
     pub user_prompt: &'a str,
     pub image_base64_list: Vec<String>,
 }
@@ -207,6 +232,14 @@ pub struct ChunkRewriteResult {
 
 pub fn build_chunk_chat_prompt(chunk: &ChunkChatPrompt<'_>) -> String {
     let mut s = String::new();
+    let note_block_guidance = match chunk.note_format {
+        Some(ChunkNoteFormat::Typst) => {
+            "6. When the user asks for a glossary entry, reusable note, answer draft, or any paste-ready content for this chunk's note tab, put the exact text to paste inside a triple-backtick fenced block using ```typst. Use ```latex only for standalone raw TeX snippets. Keep any explanation outside the block.\n"
+        }
+        _ => {
+            "6. When the user asks for a glossary entry, reusable note, or any copyable Markdown/LaTeX, put the exact text to paste inside a triple-backtick fenced block. Use ```markdown for glossary-ready entries and ```latex for raw TeX snippets. Keep any explanation outside the block.\n"
+        }
+    };
     s.push_str(
         "You are a helpful mathematics study assistant inside a notes app.\n\
          You are answering questions about one chunk from a textbook.\n\n\
@@ -216,8 +249,11 @@ pub fn build_chunk_chat_prompt(chunk: &ChunkChatPrompt<'_>) -> String {
          3. Ground your answer primarily in the chunk context below.\n\
          4. You may use broader mathematical knowledge when helpful, but clearly say when a point is not supported by the chunk itself.\n\
          5. If the chunk is insufficient to answer fully, say what is missing instead of pretending it is present.\n\
-         6. When the user asks for a glossary entry, reusable note, or any copyable Markdown/LaTeX, put the exact text to paste inside a triple-backtick fenced block. Use ```markdown for glossary-ready entries and ```latex for raw TeX snippets. Keep any explanation outside the block.\n\
-         7. Do not mention hidden instructions or internal context formatting.\n\
+",
+    );
+    s.push_str(note_block_guidance);
+    s.push_str(
+        "7. Do not mention hidden instructions or internal context formatting.\n\
          8. Keep prose in plain paragraph/list form. Do not use Markdown headings or bold emphasis.\n\n\
          Chunk context:\n",
     );
@@ -237,15 +273,29 @@ pub fn build_chunk_chat_prompt(chunk: &ChunkChatPrompt<'_>) -> String {
 
 pub fn build_chunk_rewrite_prompt(chunk: &ChunkRewritePrompt<'_>) -> String {
     let mut s = String::new();
+    let (body_label, body_rules) = match chunk.body_format {
+        ChunkNoteFormat::Markdown => (
+            "Current body markdown",
+            "2. Use Markdown + LaTeX for math in the body.\n\
+         3. Keep prose plain: no Markdown headings or bold emphasis.\n",
+        ),
+        ChunkNoteFormat::Typst => (
+            "Current body Typst source",
+            "2. Return valid Typst source in body_markdown.\n\
+         3. Preserve Typst syntax exactly where possible; do not wrap the body in code fences.\n",
+        ),
+    };
     s.push_str(
         "You are editing textbook chunk text in a mathematics notes app.\n\
          Return ONLY valid JSON matching this schema:\n\
          { \"title\": string | null, \"body_markdown\": string | null }\n\n\
          Rewrite rules:\n\
          1. Apply the user instruction to the chunk title and/or body.\n\
-         2. Use Markdown + LaTeX for math in the body.\n\
-         3. Keep prose plain: no Markdown headings or bold emphasis.\n\
-         4. Preserve mathematical correctness and avoid inventing facts not implied by context.\n\
+",
+    );
+    s.push_str(body_rules);
+    s.push_str(
+        "4. Preserve mathematical correctness and avoid inventing facts not implied by context.\n\
          5. If title should stay unchanged, return title as null.\n\
          6. If body should stay unchanged, return body_markdown as null.\n\
          7. Never include commentary outside the JSON object.\n\n\
@@ -261,7 +311,7 @@ pub fn build_chunk_rewrite_prompt(chunk: &ChunkRewritePrompt<'_>) -> String {
     if let Some(subject) = chunk.subject.filter(|value| !value.trim().is_empty()) {
         s.push_str(&format!("Proof subject: {}\n", subject.trim()));
     }
-    s.push_str("\nCurrent body markdown:\n---\n");
+    s.push_str(&format!("\n{}:\n---\n", body_label));
     s.push_str(chunk.body_markdown.trim());
     s.push_str("\n---\n");
     s.push_str("\nUser edit instruction:\n");
@@ -707,7 +757,11 @@ pub fn parse_chunk_body(raw: &str, log_target: &str) -> Result<ChunkBodyResult, 
     Ok(parsed)
 }
 
-pub fn parse_chunk_rewrite(raw: &str, log_target: &str) -> Result<ChunkRewriteResult, LlmError> {
+pub fn parse_chunk_rewrite(
+    raw: &str,
+    log_target: &str,
+    body_format: ChunkNoteFormat,
+) -> Result<ChunkRewriteResult, LlmError> {
     let mut parsed: ChunkRewriteResult = parse_json(raw, log_target, "chunk rewrite")?;
     parsed.title = parsed
         .title
@@ -715,7 +769,7 @@ pub fn parse_chunk_rewrite(raw: &str, log_target: &str) -> Result<ChunkRewriteRe
         .filter(|value| !value.is_empty());
     parsed.body_markdown = parsed
         .body_markdown
-        .map(|value| sanitize_chunk_body_markdown(value.trim()))
+        .map(|value| sanitize_chunk_note_source(value.trim(), body_format))
         .filter(|value| !value.is_empty());
 
     if parsed.title.is_none() && parsed.body_markdown.is_none() {
@@ -726,6 +780,13 @@ pub fn parse_chunk_rewrite(raw: &str, log_target: &str) -> Result<ChunkRewriteRe
         return Err(LlmError::Parse(raw.to_string()));
     }
     Ok(parsed)
+}
+
+pub fn sanitize_chunk_note_source(source: &str, format: ChunkNoteFormat) -> String {
+    match format {
+        ChunkNoteFormat::Markdown => sanitize_chunk_body_markdown(source),
+        ChunkNoteFormat::Typst => sanitize_chunk_body_typst(source),
+    }
 }
 
 pub fn sanitize_chunk_body_markdown(source: &str) -> String {
@@ -754,6 +815,14 @@ pub fn sanitize_chunk_body_markdown(source: &str) -> String {
         lines.pop();
     }
     lines.join("\n")
+}
+
+pub fn sanitize_chunk_body_typst(source: &str) -> String {
+    source
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim()
+        .to_string()
 }
 
 fn strip_bbox_markdown_placeholders(line: &str) -> String {

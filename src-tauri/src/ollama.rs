@@ -296,7 +296,7 @@ impl OllamaClient {
             output.len()
         );
 
-        parse_chunk_rewrite(&output, LOG_TARGET)
+        parse_chunk_rewrite(&output, LOG_TARGET, chunk.body_format)
     }
 
     async fn resolve_text_model(&self) -> Result<String, LlmError> {

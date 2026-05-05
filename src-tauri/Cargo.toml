@@ -35,3 +35,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 base64 = "0.22"
 futures = "0.3"
+typst = "0.14.2"
+typst-kit = { version = "0.14.2", default-features = false, features = ["fonts", "embed-fonts"] }
+typst-svg = "0.14.2"
