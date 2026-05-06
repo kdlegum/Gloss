@@ -392,7 +392,9 @@ impl OpenAiClient {
             chunk.subject.is_some()
         );
 
-        let images = chunk.image_base64_list.iter()
+        let images = chunk
+            .image_base64_list
+            .iter()
             .map(|b64| b64.trim())
             .filter(|b64| !b64.is_empty())
             .collect::<Vec<_>>();

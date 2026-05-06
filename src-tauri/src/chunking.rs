@@ -109,6 +109,8 @@ struct DocumentBlock {
 struct PastPaperChunkCandidate {
     label: String,
     available_marks: Option<i64>,
+    start_block_id: i64,
+    end_block_id: i64,
     block_ids: Vec<i64>,
     question_text: String,
 }
@@ -528,11 +530,7 @@ async fn run_past_paper_document(
         let is_instruction = instruction_range
             .as_ref()
             .is_some_and(|r| r.contains(block.page_number));
-        let pp_block = PastPaperBlockForPrompt {
-            id: block.id,
-            page_number: block.page_number,
-            bbox_y: block.bbox_y,
-        };
+        let pp_block = past_paper_block_for_prompt(block);
         if is_instruction {
             instruction_blocks.push(pp_block);
             if instruction_pages_seen.insert(block.page_number) {
@@ -564,21 +562,17 @@ async fn run_past_paper_document(
     let instruction_markdown = if instruction_blocks.is_empty() {
         String::new()
     } else {
-        match run_with_transient_llm_retry(
-            doc_id,
-            provider,
-            "instruction extraction",
-            || {
-                try_chunk_ai_extract_instruction(
-                    pool,
-                    provider,
-                    &instruction_images,
-                    &instruction_blocks,
-                    model_override,
-                )
-            },
-        )
-        .await {
+        match run_with_transient_llm_retry(doc_id, provider, "instruction extraction", || {
+            try_chunk_ai_extract_instruction(
+                pool,
+                provider,
+                &instruction_images,
+                &instruction_blocks,
+                model_override,
+            )
+        })
+        .await
+        {
             Ok(result) => {
                 let preview = result
                     .markdown
@@ -618,21 +612,16 @@ async fn run_past_paper_document(
     }
 
     // Call #2: identify and transcribe all questions in a single document call.
-    let result = run_with_transient_llm_retry(
-        doc_id,
-        provider,
-        "question chunking",
-        || {
-            try_chunk_ai_chunk_document(
-                pool,
-                provider,
-                &question_images,
-                &question_blocks,
-                &instruction_markdown,
-                model_override,
-            )
-        },
-    )
+    let result = run_with_transient_llm_retry(doc_id, provider, "question chunking", || {
+        try_chunk_ai_chunk_document(
+            pool,
+            provider,
+            &question_images,
+            &question_blocks,
+            &instruction_markdown,
+            model_override,
+        )
+    })
     .await?;
 
     info!(
@@ -649,6 +638,8 @@ async fn run_past_paper_document(
         .map(|q| PastPaperChunkCandidate {
             label: q.question_label,
             available_marks: q.available_marks,
+            start_block_id: q.start_block_id,
+            end_block_id: q.end_block_id,
             block_ids: q.block_ids,
             question_text: q.question_text,
         })
@@ -662,9 +653,7 @@ async fn run_past_paper_document(
         &result.noise_block_ids,
     );
     if assignments.question_candidates.is_empty() {
-        return Err(
-            "LLM did not return any usable question chunks for the past paper".to_string(),
-        );
+        return Err("LLM did not return any usable question chunks for the past paper".to_string());
     }
 
     persist_past_paper_chunks(
@@ -976,6 +965,8 @@ fn normalize_past_paper_candidates(
     for candidate in candidates {
         let mut unique_local: HashSet<i64> = HashSet::new();
         let mut kept_block_ids = Vec::new();
+        let mut start_present = false;
+        let mut end_present = false;
         for block_id in candidate.block_ids {
             if !valid_ids.contains(&block_id) {
                 warn!(
@@ -996,6 +987,12 @@ fn normalize_past_paper_candidates(
             if !assigned.insert(block_id) {
                 continue;
             }
+            if block_id == candidate.start_block_id {
+                start_present = true;
+            }
+            if block_id == candidate.end_block_id {
+                end_present = true;
+            }
             kept_block_ids.push(block_id);
         }
 
@@ -1010,10 +1007,59 @@ fn normalize_past_paper_candidates(
             );
             continue;
         }
+        if !start_present || !end_present {
+            warn!(
+                target: "gloss_lib::chunking",
+                "doc_id={} dropping question_label={} because start/end block ids were not preserved after filtering",
+                doc_id,
+                candidate.label
+            );
+            for block_id in &kept_block_ids {
+                assigned.remove(block_id);
+            }
+            continue;
+        }
+        let first_block_id = kept_block_ids[0];
+        let last_block_id = *kept_block_ids.last().unwrap_or(&first_block_id);
+        if first_block_id != candidate.start_block_id || last_block_id != candidate.end_block_id {
+            warn!(
+                target: "gloss_lib::chunking",
+                "doc_id={} dropping question_label={} because ordered block boundary mismatch start={} expected_start={} end={} expected_end={}",
+                doc_id,
+                candidate.label,
+                first_block_id,
+                candidate.start_block_id,
+                last_block_id,
+                candidate.end_block_id
+            );
+            for block_id in &kept_block_ids {
+                assigned.remove(block_id);
+            }
+            continue;
+        }
+        let monotonic = kept_block_ids.windows(2).all(|pair| {
+            let left = block_order.get(&pair[0]).copied().unwrap_or(usize::MAX);
+            let right = block_order.get(&pair[1]).copied().unwrap_or(usize::MAX);
+            left <= right
+        });
+        if !monotonic {
+            warn!(
+                target: "gloss_lib::chunking",
+                "doc_id={} dropping question_label={} because ordered block ids are not monotonic",
+                doc_id,
+                candidate.label
+            );
+            for block_id in &kept_block_ids {
+                assigned.remove(block_id);
+            }
+            continue;
+        }
 
         normalized.push(PastPaperChunkCandidate {
             label: candidate.label,
             available_marks: candidate.available_marks,
+            start_block_id: candidate.start_block_id,
+            end_block_id: candidate.end_block_id,
             block_ids: kept_block_ids,
             question_text: candidate.question_text,
         });
@@ -1293,7 +1339,11 @@ fn log_past_paper_mark_coverage(
         instruction_preview
     );
 
-    for candidate in candidates.iter().filter(|c| c.available_marks.is_none()).take(6) {
+    for candidate in candidates
+        .iter()
+        .filter(|c| c.available_marks.is_none())
+        .take(6)
+    {
         let snippet = candidate
             .question_text
             .chars()
@@ -1324,6 +1374,50 @@ fn preferred_block_text(block: &DocumentBlock) -> Option<&str> {
                 Some(extracted)
             }
         })
+}
+
+fn past_paper_block_for_prompt(block: &DocumentBlock) -> PastPaperBlockForPrompt {
+    let preview_text = preferred_block_text(block)
+        .map(normalize_preview_whitespace)
+        .unwrap_or_default();
+    let (text_start_preview, text_end_preview, text_char_len) =
+        build_text_boundary_previews(&preview_text);
+
+    PastPaperBlockForPrompt {
+        id: block.id,
+        page_number: block.page_number,
+        order_idx: block.order_idx,
+        bbox_x: block.bbox_x,
+        bbox_y: block.bbox_y,
+        bbox_w: block.bbox_w,
+        bbox_h: block.bbox_h,
+        text_start_preview,
+        text_end_preview,
+        text_char_len,
+    }
+}
+
+fn normalize_preview_whitespace(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn build_text_boundary_previews(text: &str) -> (String, String, usize) {
+    const PREVIEW_CHARS: usize = 100;
+    const FULL_PREVIEW_THRESHOLD: usize = PREVIEW_CHARS * 2;
+
+    let chars: Vec<char> = text.chars().collect();
+    let text_char_len = chars.len();
+
+    if text_char_len <= FULL_PREVIEW_THRESHOLD {
+        let full = chars.into_iter().collect::<String>();
+        return (full.clone(), full, text_char_len);
+    }
+
+    let text_start_preview = chars[..PREVIEW_CHARS].iter().collect::<String>();
+    let text_end_preview = chars[text_char_len - PREVIEW_CHARS..]
+        .iter()
+        .collect::<String>();
+    (text_start_preview, text_end_preview, text_char_len)
 }
 
 pub async fn rechunk_page(
@@ -2653,6 +2747,21 @@ fn group_lines_into_blocks(lines: Vec<Line>) -> Vec<Line> {
 mod tests {
     use super::*;
 
+    fn prompt_block(id: i64, order_idx: i32) -> PastPaperBlockForPrompt {
+        PastPaperBlockForPrompt {
+            id,
+            page_number: 1,
+            order_idx,
+            bbox_x: 0.1,
+            bbox_y: 0.1 + order_idx as f32 * 0.01,
+            bbox_w: 0.2,
+            bbox_h: 0.02,
+            text_start_preview: format!("start-{id}"),
+            text_end_preview: format!("end-{id}"),
+            text_char_len: 20,
+        }
+    }
+
     #[test]
     fn resolves_instruction_page_ranges() {
         assert_eq!(
@@ -2666,5 +2775,92 @@ mod tests {
         assert!(resolve_instruction_page_range(Some(0), Some(1)).is_err());
         assert!(resolve_instruction_page_range(Some(4), Some(2)).is_err());
         assert!(resolve_instruction_page_range(Some(1), None).is_err());
+    }
+
+    #[test]
+    fn boundary_previews_bias_toward_start_and_end() {
+        let text = format!("{}{}", "A".repeat(120), "B".repeat(120));
+        let (start, end, len) = build_text_boundary_previews(&text);
+
+        assert_eq!(len, 240);
+        assert_eq!(start, "A".repeat(100));
+        assert_eq!(end, "B".repeat(100));
+    }
+
+    #[test]
+    fn prompt_block_builder_uses_trimmed_transcribed_boundaries() {
+        let block = DocumentBlock {
+            id: 42,
+            page_id: 7,
+            page_number: 3,
+            order_idx: 5,
+            bbox_x: 0.2,
+            bbox_y: 0.3,
+            bbox_w: 0.4,
+            bbox_h: 0.05,
+            text: "ignored fallback".to_string(),
+            transcribed_text: Some("  Start line\n\nmiddle words\tEnd line  ".to_string()),
+        };
+
+        let prompt = past_paper_block_for_prompt(&block);
+
+        assert_eq!(prompt.id, 42);
+        assert_eq!(prompt.page_number, 3);
+        assert_eq!(prompt.order_idx, 5);
+        assert_eq!(
+            prompt.text_start_preview,
+            "Start line middle words End line"
+        );
+        assert_eq!(prompt.text_end_preview, "Start line middle words End line");
+        assert_eq!(
+            prompt.text_char_len,
+            "Start line middle words End line".chars().count()
+        );
+    }
+
+    #[test]
+    fn normalize_past_paper_candidates_keeps_valid_boundaries() {
+        let question_blocks = vec![
+            prompt_block(10, 0),
+            prompt_block(11, 1),
+            prompt_block(12, 2),
+        ];
+        let candidates = vec![PastPaperChunkCandidate {
+            label: "1".to_string(),
+            available_marks: Some(4),
+            start_block_id: 10,
+            end_block_id: 12,
+            block_ids: vec![12, 10, 11],
+            question_text: "Question".to_string(),
+        }];
+
+        let normalized = normalize_past_paper_candidates(1, candidates, &question_blocks, &[]);
+
+        assert_eq!(normalized.question_candidates.len(), 1);
+        assert_eq!(
+            normalized.question_candidates[0].block_ids,
+            vec![10, 11, 12]
+        );
+    }
+
+    #[test]
+    fn normalize_past_paper_candidates_drops_boundary_mismatch() {
+        let question_blocks = vec![
+            prompt_block(10, 0),
+            prompt_block(11, 1),
+            prompt_block(12, 2),
+        ];
+        let candidates = vec![PastPaperChunkCandidate {
+            label: "1".to_string(),
+            available_marks: Some(4),
+            start_block_id: 11,
+            end_block_id: 12,
+            block_ids: vec![10, 11, 12],
+            question_text: "Question".to_string(),
+        }];
+
+        let normalized = normalize_past_paper_candidates(1, candidates, &question_blocks, &[]);
+
+        assert!(normalized.question_candidates.is_empty());
     }
 }

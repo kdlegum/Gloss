@@ -327,7 +327,9 @@ impl GeminiClient {
         );
 
         let mut parts = vec![json!({ "text": prompt })];
-        for image_base64 in chunk.image_base64_list.iter()
+        for image_base64 in chunk
+            .image_base64_list
+            .iter()
             .map(|b64| b64.trim())
             .filter(|b64| !b64.is_empty())
         {

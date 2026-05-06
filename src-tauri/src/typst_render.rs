@@ -1,15 +1,22 @@
 use log::warn;
 use typst::diag::{FileError, FileResult, SourceDiagnostic, Warned};
 use typst::foundations::{Bytes, Datetime};
-use typst::layout::{Abs, PagedDocument};
+use typst::layout::PagedDocument;
 use typst::syntax::{FileId, Source, VirtualPath};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{compile, Library, LibraryExt, World};
 use typst_kit::fonts::{FontSearcher, FontSlot, Fonts};
 
-const PREVIEW_PREAMBLE: &str = "#set page(width: 640pt, height: auto, margin: (x: 18pt, y: 16pt), fill: none)\n#set par(justify: false)\n";
-const PREVIEW_IMPORT_ERROR: &str = "Imports and external file loads are not supported in Typst note previews.";
+const PREVIEW_PREAMBLE: &str =
+    "#set page(width: 640pt, height: 900pt, margin: (x: 18pt, y: 16pt))\n#set par(justify: false)\n";
+const PREVIEW_IMPORT_ERROR: &str =
+    "Imports and external file loads are not supported in Typst note previews.";
+
+#[derive(serde::Serialize, Clone)]
+pub struct TypstPreviewDocument {
+    pub pages: Vec<String>,
+}
 
 pub struct TypstRenderer {
     library: LazyHash<Library>,
@@ -27,7 +34,7 @@ impl TypstRenderer {
         }
     }
 
-    pub fn render_svg(&self, source: &str) -> Result<String, String> {
+    pub fn render_document(&self, source: &str) -> Result<TypstPreviewDocument, String> {
         let main = FileId::new_fake(VirtualPath::new("/gloss-preview.typ"));
         let world = PreviewWorld {
             renderer: self,
@@ -44,7 +51,9 @@ impl TypstRenderer {
         }
 
         let document = output.map_err(format_diagnostics)?;
-        Ok(typst_svg::svg_merged(&document, Abs::pt(0.0)))
+        Ok(TypstPreviewDocument {
+            pages: document.pages.iter().map(typst_svg::svg).collect(),
+        })
     }
 }
 

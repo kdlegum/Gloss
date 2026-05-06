@@ -59,12 +59,112 @@ export function renderChunkBodyHtml(
   options: RenderChunkBodyOptions = {},
 ): string {
   const prepared = injectReferenceLinks(source, references);
-  const normalized = prepared.replace(/\r\n?/g, "\n").trim();
-  if (!normalized) return "";
-  const preSuppressed = suppressLeadingDuplicateSource(normalized, options.suppressLeadingText ?? []);
+  const normalized = normalizeChunkBodySource(prepared).trim();
+  return renderNormalisedChunkBodyHtml(normalized, options);
+}
+
+export function renderChunkBodyPreviewHtml(
+  source: string,
+  options: RenderChunkBodyOptions = {},
+): string {
+  const normalized = trimIncompletePreviewSource(normalizeChunkBodySource(source)).trim();
+  return renderNormalisedChunkBodyHtml(normalized, options);
+}
+
+function renderNormalisedChunkBodyHtml(
+  source: string,
+  options: RenderChunkBodyOptions = {},
+): string {
+  if (!source) return "";
+  const preSuppressed = suppressLeadingDuplicateSource(source, options.suppressLeadingText ?? []);
   const blocks = parseBlocks(preSuppressed, options);
   const visibleBlocks = suppressLeadingDuplicateBlocks(blocks, options);
   return visibleBlocks.map((block) => renderBlock(block, options)).join("");
+}
+
+function normalizeChunkBodySource(source: string): string {
+  const normalized = source.replace(/\r\n?/g, "\n").replace(/\u00a0/g, " ");
+  return normalized
+    .split("\n")
+    .flatMap((line) => normaliseChunkBodyLine(line))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n");
+}
+
+function normaliseChunkBodyLine(line: string): string[] {
+  const segments = line.replace(/<br\s*\/?>/giu, "\n").split("\n");
+  return segments.map((segment) => {
+    const trimmed = segment.trim();
+    if (!trimmed) return "";
+    if (isHtmlWrapperLine(trimmed)) return "";
+    return segment
+      .replace(/^\s*<\s*(?:div|center)\b[^>]*>\s*/iu, "")
+      .replace(/\s*<\s*\/\s*(?:div|center)\s*>\s*$/iu, "")
+      .trimEnd();
+  });
+}
+
+function isHtmlWrapperLine(source: string): boolean {
+  return /^<\s*\/?\s*(?:div|center)\b[^>]*>\s*$/iu.test(source);
+}
+
+function trimIncompletePreviewSource(source: string): string {
+  if (!source) return "";
+
+  const lines = source.split("\n");
+  let safeEnd = 0;
+  let cursor = 0;
+  let openCodeFence = false;
+  let openDisplayCloser: "$$" | "\\]" | null = null;
+  let openDisplayEnvironment: string | null = null;
+
+  for (const line of lines) {
+    const lineStart = cursor;
+    cursor += line.length + 1;
+    const trimmed = line.trim();
+
+    if (openCodeFence) {
+      if (codeFencePattern.test(line)) openCodeFence = false;
+    } else if (openDisplayCloser) {
+      if (line.includes(openDisplayCloser)) openDisplayCloser = null;
+    } else if (openDisplayEnvironment) {
+      if (line.includes(`\\end{${openDisplayEnvironment}}`)) {
+        openDisplayEnvironment = null;
+      }
+    } else if (codeFencePattern.test(line)) {
+      openCodeFence = true;
+    } else if (startsUnclosedDisplayBlock(trimmed, "$$", "$$")) {
+      openDisplayCloser = "$$";
+    } else if (startsUnclosedDisplayBlock(trimmed, "\\[", "\\]")) {
+      openDisplayCloser = "\\]";
+    } else {
+      const environmentMatch = trimmed.match(displayEnvironmentPattern);
+      const environment = environmentMatch?.[1];
+      if (
+        environment
+        && DISPLAY_ENVIRONMENTS.has(environment)
+        && !line.includes(`\\end{${environment}}`)
+      ) {
+        openDisplayEnvironment = environment;
+      }
+    }
+
+    if (!openCodeFence && !openDisplayCloser && !openDisplayEnvironment) {
+      safeEnd = cursor;
+    } else if (safeEnd === 0 && lineStart > 0) {
+      safeEnd = lineStart;
+    }
+  }
+
+  if (!openCodeFence && !openDisplayCloser && !openDisplayEnvironment) {
+    return source;
+  }
+  return source.slice(0, safeEnd).trimEnd();
+}
+
+function startsUnclosedDisplayBlock(source: string, opener: string, closer: string): boolean {
+  if (!source.startsWith(opener)) return false;
+  return source.slice(opener.length).indexOf(closer) === -1;
 }
 
 function suppressLeadingDuplicateSource(source: string, suppressLeadingText: string[]): string {

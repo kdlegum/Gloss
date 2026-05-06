@@ -30,7 +30,7 @@
   } from "$lib/graph";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { attachConsole } from "@tauri-apps/plugin-log";
-  import { renderChunkBodyHtml, type ResolvedReference } from "$lib/chunkBody";
+  import { renderChunkBodyHtml, renderChunkBodyPreviewHtml, type ResolvedReference } from "$lib/chunkBody";
   import ChunkPeek from "$lib/ChunkPeek.svelte";
   import ViewerHeader from "$lib/viewer/ViewerHeader.svelte";
   import BatchChunkProgressCard from "$lib/viewer/BatchChunkProgressCard.svelte";
@@ -4619,9 +4619,13 @@
     }
   }
 
+  interface TypstPreviewDocument {
+    pages: string[];
+  }
+
   const TYPST_PREVIEW_DEBOUNCE_MS = 400;
-  const typstPreviewSvgCache = new Map<string, string>();
-  const typstPreviewPendingCache = new Map<string, Promise<string>>();
+  const typstPreviewDocumentCache = new Map<string, TypstPreviewDocument>();
+  const typstPreviewPendingCache = new Map<string, Promise<TypstPreviewDocument>>();
 
   function normaliseGlossaryFormat(value: string | null | undefined): GlossaryFormat {
     return value === "typst" ? "typst" : "markdown";
@@ -4642,17 +4646,17 @@
       : "Write your own explanation. Markdown works, and LaTeX via $...$ inline or $$...$$ block.";
   }
 
-  async function loadTypstPreviewSvg(source: string): Promise<string> {
-    const cached = typstPreviewSvgCache.get(source);
+  async function loadTypstPreviewDocument(source: string): Promise<TypstPreviewDocument> {
+    const cached = typstPreviewDocumentCache.get(source);
     if (cached) return cached;
 
     const pending = typstPreviewPendingCache.get(source);
     if (pending) return await pending;
 
-    const request = invoke<string>("render_typst_note_preview", { source })
-      .then((svg) => {
-        typstPreviewSvgCache.set(source, svg);
-        return svg;
+    const request = invoke<TypstPreviewDocument>("render_typst_note_preview", { source })
+      .then((document) => {
+        typstPreviewDocumentCache.set(source, document);
+        return document;
       })
       .finally(() => {
         if (typstPreviewPendingCache.get(source) === request) {
@@ -4718,8 +4722,8 @@
     }
   }
 
-  function readTypstSvgPageSize(svgSource: string): { width: number; height: number } {
-    const document = new DOMParser().parseFromString(svgSource, "image/svg+xml");
+  function readTypstPreviewPageSize(pageSvg: string): { width: number; height: number } {
+    const document = new DOMParser().parseFromString(pageSvg, "image/svg+xml");
     if (document.querySelector("parsererror")) {
       throw new Error("Couldn't parse the rendered Typst preview.");
     }
@@ -4800,14 +4804,14 @@
     });
   }
 
-  async function rasterizeTypstPreviewForPdf(svgSource: string): Promise<TypstPdfImage> {
-    const { width: pageWidthPt, height: pageHeightPt } = readTypstSvgPageSize(svgSource);
+  async function rasterizeTypstPreviewPageForPdf(pageSvg: string): Promise<TypstPdfImage> {
+    const { width: pageWidthPt, height: pageHeightPt } = readTypstPreviewPageSize(pageSvg);
     const maxDimensionPx = 4000;
     const scale = Math.min(2.25, maxDimensionPx / Math.max(pageWidthPt, pageHeightPt));
     const pixelWidth = Math.max(1, Math.round(pageWidthPt * scale));
     const pixelHeight = Math.max(1, Math.round(pageHeightPt * scale));
 
-    const svgBlob = new Blob([svgSource], { type: "image/svg+xml;charset=utf-8" });
+    const svgBlob = new Blob([pageSvg], { type: "image/svg+xml;charset=utf-8" });
     const svgUrl = URL.createObjectURL(svgBlob);
     try {
       const image = await loadImageElement(svgUrl);
@@ -4832,10 +4836,16 @@
     }
   }
 
-  function buildSinglePagePdfFromJpeg(image: TypstPdfImage): Uint8Array {
+  function buildPdfFromJpegs(images: TypstPdfImage[]): Uint8Array {
+    if (images.length === 0) {
+      throw new Error("Couldn't build a PDF because the Typst preview had no pages.");
+    }
+
     const parts: Uint8Array[] = [PDF_HEADER_BYTES];
     const objectOffsets: number[] = [0];
     let totalLength = PDF_HEADER_BYTES.length;
+    const firstPageObject = 3;
+    const totalObjects = 2 + images.length * 3;
 
     function push(part: string | Uint8Array) {
       const bytes = typeof part === "string" ? encodePdfText(part) : part;
@@ -4848,36 +4858,49 @@
       push(`${objectNumber} 0 obj\n`);
     }
 
-    const contentStream = `q\n${formatPdfNumber(image.pageWidthPt)} 0 0 ${formatPdfNumber(image.pageHeightPt)} 0 0 cm\n/Im0 Do\nQ\n`;
-
     startObject(1);
     push("<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
 
     startObject(2);
-    push("<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n");
-
-    startObject(3);
     push(
-      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${formatPdfNumber(image.pageWidthPt)} ${formatPdfNumber(image.pageHeightPt)}] `
-      + `/Resources << /ProcSet [/PDF /ImageC] /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>\nendobj\n`,
+      `<< /Type /Pages /Count ${images.length} /Kids [${images
+        .map((_, index) => `${firstPageObject + index * 3} 0 R`)
+        .join(" ")}] >>\nendobj\n`,
     );
 
-    startObject(4);
-    push(`<< /Length ${contentStream.length} >>\nstream\n${contentStream}endstream\nendobj\n`);
+    for (const [index, image] of images.entries()) {
+      const pageObject = firstPageObject + index * 3;
+      const contentObject = pageObject + 1;
+      const imageObject = pageObject + 2;
+      const contentStream =
+        `q\n${formatPdfNumber(image.pageWidthPt)} 0 0 ${formatPdfNumber(image.pageHeightPt)} 0 0 cm\n/Im0 Do\nQ\n`;
+      const contentBytes = encodePdfText(contentStream);
 
-    startObject(5);
-    push(
-      `<< /Type /XObject /Subtype /Image /Width ${image.pixelWidth} /Height ${image.pixelHeight} `
-      + `/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${image.jpegBytes.length} >>\nstream\n`,
-    );
-    push(image.jpegBytes);
-    push("\nendstream\nendobj\n");
+      startObject(pageObject);
+      push(
+        `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${formatPdfNumber(image.pageWidthPt)} ${formatPdfNumber(image.pageHeightPt)}] `
+        + `/Resources << /ProcSet [/PDF /ImageC] /XObject << /Im0 ${imageObject} 0 R >> >> /Contents ${contentObject} 0 R >>\nendobj\n`,
+      );
+
+      startObject(contentObject);
+      push(`<< /Length ${contentBytes.length} >>\nstream\n`);
+      push(contentBytes);
+      push("endstream\nendobj\n");
+
+      startObject(imageObject);
+      push(
+        `<< /Type /XObject /Subtype /Image /Width ${image.pixelWidth} /Height ${image.pixelHeight} `
+        + `/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${image.jpegBytes.length} >>\nstream\n`,
+      );
+      push(image.jpegBytes);
+      push("\nendstream\nendobj\n");
+    }
 
     const xrefOffset = totalLength;
-    push(`xref\n0 6\n0000000000 65535 f \n${[1, 2, 3, 4, 5]
+    push(`xref\n0 ${totalObjects + 1}\n0000000000 65535 f \n${Array.from({ length: totalObjects }, (_, index) => index + 1)
       .map((objectNumber) => `${objectOffsets[objectNumber].toString().padStart(10, "0")} 00000 n \n`)
       .join("")}`);
-    push(`trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`);
+    push(`trailer\n<< /Size ${totalObjects + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`);
 
     return concatUint8Arrays(parts);
   }
@@ -4932,13 +4955,13 @@
   let glossaryPendingChunkId: number | null = null;
   let glossaryTextareaEl = $state<HTMLTextAreaElement | null>(null);
   let glossaryMarkdownHtml = $derived(renderChunkBodyHtml(glossaryDraft));
-  let glossaryTypstPreviewSvg = $state<string | null>(null);
+  let glossaryTypstPreviewDocument = $state<TypstPreviewDocument | null>(null);
   let glossaryTypstPreviewError = $state<string | null>(null);
   let glossaryTypstPreviewLoading = $state(false);
   let glossaryTypstPreviewTimer: ReturnType<typeof setTimeout> | null = null;
   let glossaryTypstPreviewRequestId = 0;
   let glossaryTypstPreviewActiveRequestId = 0;
-  let glossaryRewriteTypstPreviewSvg = $state<string | null>(null);
+  let glossaryRewriteTypstPreviewDocument = $state<TypstPreviewDocument | null>(null);
   let glossaryRewriteTypstPreviewError = $state<string | null>(null);
   let glossaryRewriteTypstPreviewLoading = $state(false);
   let glossaryRewriteTypstPreviewRequestId = 0;
@@ -4950,22 +4973,22 @@
     glossaryTypstPreviewTimer = null;
   }
 
-  function resetGlossaryTypstPreviewState(clearSvg = true) {
+  function resetGlossaryTypstPreviewState(clearPreview = true) {
     clearGlossaryTypstPreviewTimer();
     glossaryTypstPreviewActiveRequestId = ++glossaryTypstPreviewRequestId;
     glossaryTypstPreviewLoading = false;
     glossaryTypstPreviewError = null;
-    if (clearSvg) {
-      glossaryTypstPreviewSvg = null;
+    if (clearPreview) {
+      glossaryTypstPreviewDocument = null;
     }
   }
 
-  function resetGlossaryRewriteTypstPreviewState(clearSvg = true) {
+  function resetGlossaryRewriteTypstPreviewState(clearPreview = true) {
     glossaryRewriteTypstPreviewActiveRequestId = ++glossaryRewriteTypstPreviewRequestId;
     glossaryRewriteTypstPreviewLoading = false;
     glossaryRewriteTypstPreviewError = null;
-    if (clearSvg) {
-      glossaryRewriteTypstPreviewSvg = null;
+    if (clearPreview) {
+      glossaryRewriteTypstPreviewDocument = null;
     }
   }
 
@@ -4984,7 +5007,7 @@
     if (!source) {
       glossaryTypstPreviewLoading = false;
       glossaryTypstPreviewError = null;
-      glossaryTypstPreviewSvg = null;
+      glossaryTypstPreviewDocument = null;
       return;
     }
 
@@ -4992,7 +5015,7 @@
     glossaryTypstPreviewActiveRequestId = requestId;
     glossaryTypstPreviewLoading = true;
     try {
-      const svg = await loadTypstPreviewSvg(source);
+      const document = await loadTypstPreviewDocument(source);
       if (
         glossaryTypstPreviewActiveRequestId !== requestId
         || chunkView?.chunk.id !== view.chunk.id
@@ -5001,7 +5024,7 @@
       ) {
         return;
       }
-      glossaryTypstPreviewSvg = svg;
+      glossaryTypstPreviewDocument = document;
       glossaryTypstPreviewError = null;
     } catch (err) {
       if (glossaryTypstPreviewActiveRequestId !== requestId || chunkView?.chunk.id !== view.chunk.id) return;
@@ -5020,7 +5043,7 @@
     if (!glossaryDraft.trim()) {
       glossaryTypstPreviewLoading = false;
       glossaryTypstPreviewError = null;
-      glossaryTypstPreviewSvg = null;
+      glossaryTypstPreviewDocument = null;
       return;
     }
     glossaryTypstPreviewTimer = setTimeout(() => {
@@ -5034,7 +5057,7 @@
     if (!noteSource) {
       glossaryRewriteTypstPreviewLoading = false;
       glossaryRewriteTypstPreviewError = null;
-      glossaryRewriteTypstPreviewSvg = null;
+      glossaryRewriteTypstPreviewDocument = null;
       return;
     }
 
@@ -5042,9 +5065,9 @@
     glossaryRewriteTypstPreviewActiveRequestId = requestId;
     glossaryRewriteTypstPreviewLoading = true;
     try {
-      const svg = await loadTypstPreviewSvg(noteSource);
+      const document = await loadTypstPreviewDocument(noteSource);
       if (glossaryRewriteTypstPreviewActiveRequestId !== requestId) return;
-      glossaryRewriteTypstPreviewSvg = svg;
+      glossaryRewriteTypstPreviewDocument = document;
       glossaryRewriteTypstPreviewError = null;
     } catch (err) {
       if (glossaryRewriteTypstPreviewActiveRequestId !== requestId) return;
@@ -5158,11 +5181,14 @@
       await flushGlossarySave();
       if (chunkView?.chunk.id !== view.chunk.id) return;
 
-      const svg = await loadTypstPreviewSvg(source);
+      const document = await loadTypstPreviewDocument(source);
       if (chunkView?.chunk.id !== view.chunk.id) return;
 
-      const pdfImage = await rasterizeTypstPreviewForPdf(svg);
-      const pdfBytes = buildSinglePagePdfFromJpeg(pdfImage);
+      const pdfImages: TypstPdfImage[] = [];
+      for (const pageSvg of document.pages) {
+        pdfImages.push(await rasterizeTypstPreviewPageForPdf(pageSvg));
+      }
+      const pdfBytes = buildPdfFromJpegs(pdfImages);
       const pdfBase64 = await blobToBase64(new Blob([pdfBytes], { type: "application/pdf" }));
       if (chunkView?.chunk.id !== view.chunk.id) return;
 
@@ -5296,7 +5322,7 @@
   let linkedChunkPreviewError = $state<string | null>(null);
   let linkedChunkPreviewBodyHtml = $derived(
     linkedChunkPreview?.body_preview
-      ? renderChunkBodyHtml(linkedChunkPreview.body_preview, undefined, {
+      ? renderChunkBodyPreviewHtml(linkedChunkPreview.body_preview, {
         allowHeadings: false,
         allowStrong: false,
       })
@@ -5846,36 +5872,13 @@
     }
   }
 
-  async function onPeekOpen(chunkId: number) {
-    chunkPeek = null;
-    const cached = currentChunks.find((c) => c.id === chunkId);
-    if (cached) {
-      void openChunkView(cached);
-      return;
-    }
-    try {
-      const chunk = await invoke<ChunkInfo>("get_chunk_preview", { chunkId });
-      // `get_chunk_preview` returns a preview shape; pull full chunk if needed.
-      // For now, navigate only when the chunk is on the current page.
-      void appLogInfo(`[chunk] peek open requested for chunkId=${chunkId} (not on current page)`);
-      // Fallback: close peek without navigation. Cross-page navigation can be added later.
-      void chunk;
-    } catch (err) {
-      await appLogWarn(`[chunk] peek open failed chunkId=${chunkId}: ${formatLogError(err)}`);
-    }
-  }
-
-  function onPeekClose() {
-    chunkPeek = null;
-  }
-
-  async function openLinkedChunk(chunkId: number) {
+  async function openChunkById(chunkId: number) {
     const book = selectedBook;
     if (!book) return;
 
-    const localTarget = currentChunks.find((entry) => entry.id === chunkId);
-    if (localTarget) {
-      await openChunkView(localTarget, {
+    const cached = currentChunks.find((c) => c.id === chunkId);
+    if (cached) {
+      await openChunkView(cached, {
         pageNumber: currentPage,
         pageChunks: currentChunks,
       });
@@ -5884,9 +5887,14 @@
 
     try {
       const fetched = await invoke<ChunkForTranscription>("get_chunk_for_transcription", { chunkId });
-      if (fetched.source_document_id !== book.id) return;
-      const targetPage = fetched.page_number;
+      if (fetched.source_document_id !== book.id) {
+        void appLogWarn(
+          `[chunk] open request ignored chunkId=${chunkId} doc=${fetched.source_document_id} activeDoc=${book.id}`,
+        );
+        return;
+      }
 
+      const targetPage = fetched.page_number;
       if (targetPage !== currentPage) {
         await goToPage(targetPage, { keepChunkView: true });
         if (currentPage !== targetPage) return;
@@ -5903,8 +5911,21 @@
         pageChunks,
       });
     } catch (err) {
-      await appLogWarn(`[chunk] open linked chunk failed chunkId=${chunkId}: ${formatLogError(err)}`);
+      await appLogWarn(`[chunk] open chunk failed chunkId=${chunkId}: ${formatLogError(err)}`);
     }
+  }
+
+  function onPeekOpen(chunkId: number) {
+    chunkPeek = null;
+    void openChunkById(chunkId);
+  }
+
+  function onPeekClose() {
+    chunkPeek = null;
+  }
+
+  async function openLinkedChunk(chunkId: number) {
+    await openChunkById(chunkId);
   }
 
   function openLinkedChunkFromPanel() {
@@ -10373,7 +10394,7 @@
                               Error
                             {:else if glossaryTypstPreviewLoading}
                               Rendering…
-                            {:else if glossaryTypstPreviewSvg}
+                            {:else if glossaryTypstPreviewDocument}
                               Up to date
                             {:else}
                               Waiting for content
@@ -10384,8 +10405,14 @@
                           {#if glossaryTypstPreviewError}
                             <p class="chunk-typst-preview-error">{glossaryTypstPreviewError}</p>
                           {/if}
-                          {#if glossaryTypstPreviewSvg}
-                            <div class="chunk-typst-preview-svg rendered">{@html glossaryTypstPreviewSvg}</div>
+                          {#if glossaryTypstPreviewDocument}
+                            <div class="chunk-typst-preview-document">
+                              {#each glossaryTypstPreviewDocument.pages as pageSvg, pageIndex (pageIndex)}
+                                <div class="chunk-typst-preview-svg rendered" aria-label={`Typst preview page ${pageIndex + 1}`}>
+                                  {@html pageSvg}
+                                </div>
+                              {/each}
+                            </div>
                           {:else if !glossaryDraft.trim()}
                             <p class="chunk-glossary-preview-empty">Nothing yet.</p>
                           {:else if glossaryTypstPreviewLoading}
@@ -10415,7 +10442,23 @@
                   {/if}
                 </div>
               {:else if chunkTab === 'ai'}
+                  {@const chatModelLabel = aiTaskSettings.chat.model || "Auto (server default)"}
+                  {@const visionModelLabel = aiTaskSettings.vision.model || "Auto (server default)"}
 	                <div class="chunk-ai-pane">
+                    <div class="chunk-ai-toolbar">
+                      <div class="chunk-ai-toolbar-copy">
+                        <strong>AI defaults</strong>
+                        <span>Chat: {getProviderLabel(aiTaskSettings.chat.provider)} · {chatModelLabel}</span>
+                        <span>Vision OCR: {getProviderLabel(aiTaskSettings.vision.provider)} · {visionModelLabel}</span>
+                      </div>
+                      <button
+                        class="chunk-ai-settings-btn"
+                        type="button"
+                        onclick={openAiSettings}
+                      >
+                        AI settings
+                      </button>
+                    </div>
 	                  {#if chunkIsQuestion}
 	                    <section class="chunk-ai-marking">
 	                      <div class="chunk-ai-marking-header">
@@ -10648,8 +10691,14 @@
                               {#if glossaryRewriteTypstPreviewError}
                                 <p class="chunk-typst-preview-error">{glossaryRewriteTypstPreviewError}</p>
                               {/if}
-                              {#if glossaryRewriteTypstPreviewSvg}
-                                <div class="chunk-typst-preview-svg rendered">{@html glossaryRewriteTypstPreviewSvg}</div>
+                              {#if glossaryRewriteTypstPreviewDocument}
+                                <div class="chunk-typst-preview-document">
+                                  {#each glossaryRewriteTypstPreviewDocument.pages as pageSvg, pageIndex (pageIndex)}
+                                    <div class="chunk-typst-preview-svg rendered" aria-label={`Typst preview page ${pageIndex + 1}`}>
+                                      {@html pageSvg}
+                                    </div>
+                                  {/each}
+                                </div>
                               {:else if glossaryRewriteTypstPreviewLoading}
                                 <p class="chunk-glossary-preview-empty">Rendering preview…</p>
                               {/if}
@@ -12426,14 +12475,12 @@
   }
 
   .chunk-glossary-preview-typst {
-    padding: 18px 20px 22px;
-    background:
-      radial-gradient(circle at top left, rgba(191, 219, 254, 0.16), transparent 40%),
-      linear-gradient(180deg, #fbfdff 0%, #f8fafc 100%);
+    padding: 12px;
+    background: linear-gradient(180deg, #eef2f8 0%, #e7edf5 100%);
   }
 
   .chunk-glossary-typst-workspace.mode-preview .chunk-glossary-preview-typst {
-    padding: 26px clamp(20px, 3vw, 40px) 32px;
+    padding: 16px;
   }
 
   .chunk-glossary-preview :global(p) { margin: 0 0 0.7em; }
@@ -12497,13 +12544,17 @@
     white-space: pre-wrap;
   }
 
+  .chunk-typst-preview-document {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-height: 100%;
+  }
+
   .chunk-typst-preview-svg {
-    width: min(100%, 940px);
-    margin: 0 auto;
-    border-radius: 16px;
+    width: 100%;
     border: 1px solid rgba(203, 213, 225, 0.9);
     background: #ffffff;
-    box-shadow: 0 18px 38px rgba(15, 23, 42, 0.08);
     overflow: hidden;
   }
 
@@ -12552,6 +12603,60 @@
     flex-direction: column;
     overflow: hidden;
     background: linear-gradient(180deg, #fbfcfe 0%, #f4f7fb 100%);
+  }
+
+  .chunk-ai-toolbar {
+    padding: 10px 14px;
+    border-bottom: 1px solid rgba(203, 213, 225, 0.72);
+    background: rgba(255, 255, 255, 0.92);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    flex-shrink: 0;
+    font-family: Inter, system-ui, sans-serif;
+  }
+
+  .chunk-ai-toolbar-copy {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .chunk-ai-toolbar-copy strong {
+    font-size: 12px;
+    color: #1f2937;
+  }
+
+  .chunk-ai-toolbar-copy span {
+    font-size: 11px;
+    color: #64748b;
+    line-height: 1.4;
+    word-break: break-word;
+  }
+
+  .chunk-ai-settings-btn {
+    min-width: 94px;
+    height: 32px;
+    padding: 0 12px;
+    border-radius: 10px;
+    border: 1px solid rgba(148, 163, 184, 0.55);
+    background: #fff;
+    color: #334155;
+    font-size: 12px;
+    font-weight: 700;
+    font-family: Inter, system-ui, sans-serif;
+    cursor: pointer;
+    transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease, transform 0.12s ease;
+  }
+
+  .chunk-ai-settings-btn:hover:not(:disabled) {
+    transform: translateY(-1px);
+    border-color: color-mix(in oklch, var(--chunk-accent) 36%, white);
+    background: color-mix(in oklch, var(--chunk-accent) 8%, white);
+    color: color-mix(in oklch, var(--chunk-accent) 72%, black);
   }
 
   .chunk-ai-marking {

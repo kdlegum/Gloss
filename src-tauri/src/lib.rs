@@ -18,7 +18,7 @@ use crate::llm::{
 };
 use crate::ollama::OllamaClient;
 use crate::openai::OpenAiClient;
-use crate::typst_render::TypstRenderer;
+use crate::typst_render::{TypstPreviewDocument, TypstRenderer};
 use crate::zai::ZaiClient;
 use base64::Engine as _;
 use log::info;
@@ -883,8 +883,8 @@ async fn save_chunk_glossary(
 async fn render_typst_note_preview(
     source: String,
     state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
-    state.typst_renderer.render_svg(source.trim())
+) -> Result<TypstPreviewDocument, String> {
+    state.typst_renderer.render_document(source.trim())
 }
 
 #[tauri::command]
@@ -1562,9 +1562,8 @@ async fn load_chunk_chat_context(
         .get::<Option<String>, _>("glossary_markdown")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let glossary_format = chunk_note_format_from_db(
-        row.get::<Option<String>, _>("glossary_format").as_deref(),
-    );
+    let glossary_format =
+        chunk_note_format_from_db(row.get::<Option<String>, _>("glossary_format").as_deref());
     let body_markdown = body_markdown
         .or_else(|| {
             glossary_markdown
@@ -1682,9 +1681,7 @@ async fn load_chunk_chat_context(
             row.get("subject"),
             row.get("body_markdown"),
             row.get("glossary_markdown"),
-            chunk_note_format_from_db(
-                row.get::<Option<String>, _>("glossary_format").as_deref(),
-            ),
+            chunk_note_format_from_db(row.get::<Option<String>, _>("glossary_format").as_deref()),
             MAX_RELATED,
         )
         .await?;
@@ -2146,9 +2143,8 @@ async fn rewrite_chunk_glossary_with_prompt(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_default();
-    let glossary_format = chunk_note_format_from_db(
-        row.get::<Option<String>, _>("glossary_format").as_deref(),
-    );
+    let glossary_format =
+        chunk_note_format_from_db(row.get::<Option<String>, _>("glossary_format").as_deref());
     let book_title = row.get::<String, _>("book_title");
     let chunk_type = row.get::<String, _>("chunk_type");
     let title = row
@@ -2465,9 +2461,8 @@ async fn get_chunk_preview(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let glossary_preview = glossary_source.map(truncate_markdown_preview);
-    let glossary_format = chunk_note_format_from_db(
-        row.get::<Option<String>, _>("glossary_format").as_deref(),
-    );
+    let glossary_format =
+        chunk_note_format_from_db(row.get::<Option<String>, _>("glossary_format").as_deref());
 
     Ok(ChunkPreview {
         id: row.get("id"),
@@ -2762,7 +2757,11 @@ async fn mark_question_answer_with_ai(
         body_markdown: question_body.trim(),
         body_format: ChunkNoteFormat::Markdown,
         user_prompt: &user_prompt,
-        image_base64_list: if include_visuals { visual_context_images } else { vec![] },
+        image_base64_list: if include_visuals {
+            visual_context_images
+        } else {
+            vec![]
+        },
     };
     let result = run_chunk_rewrite_request(pool.inner(), provider, model, &rewrite_prompt).await?;
 
@@ -3647,8 +3646,13 @@ async fn replace_main_database_from_staged_import(
         .is_some();
 
         if imported_has_sqlite_sequence {
-            if let Err(err) = sqlx::query("DELETE FROM sqlite_sequence").execute(pool).await {
-                restore_result = Err(format!("failed clearing sqlite_sequence during import: {err}"));
+            if let Err(err) = sqlx::query("DELETE FROM sqlite_sequence")
+                .execute(pool)
+                .await
+            {
+                restore_result = Err(format!(
+                    "failed clearing sqlite_sequence during import: {err}"
+                ));
             } else if let Err(err) = sqlx::query(
                 "INSERT INTO sqlite_sequence(name, seq) \
                  SELECT name, seq FROM imported.sqlite_sequence",
@@ -3656,7 +3660,9 @@ async fn replace_main_database_from_staged_import(
             .execute(pool)
             .await
             {
-                restore_result = Err(format!("failed copying sqlite_sequence during import: {err}"));
+                restore_result = Err(format!(
+                    "failed copying sqlite_sequence during import: {err}"
+                ));
             }
         }
     }
@@ -3968,11 +3974,13 @@ async fn delete_source_document(
         .await
         .map_err(|e| e.to_string())?;
 
-    sqlx::query("DELETE FROM strokes WHERE page_id IN (SELECT id FROM pages WHERE source_document_id = ?)")
-        .bind(source_document_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "DELETE FROM strokes WHERE page_id IN (SELECT id FROM pages WHERE source_document_id = ?)",
+    )
+    .bind(source_document_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
 
     sqlx::query("DELETE FROM chunks WHERE source_document_id = ?")
         .bind(source_document_id)

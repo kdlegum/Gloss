@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import { renderChunkBodyHtml } from "$lib/chunkBody";
+  import { renderChunkBodyPreviewHtml } from "$lib/chunkBody";
 
   type GlossaryFormat = "markdown" | "typst";
 
@@ -51,14 +51,29 @@
     (preview && colours[preview.chunk_type])
     ?? { accent: "oklch(0.52 0.03 240)", tint: "oklch(0.975 0.008 240)", label: "Chunk", short: "?" },
   );
+  const displayTitle = $derived(preview?.title ?? preview?.subject ?? null);
+  const previewSuppressionCandidates = $derived.by(() => {
+    const candidates: string[] = [];
+    const title = displayTitle?.trim();
+    const subject = preview?.subject?.trim();
+    if (title) candidates.push(title);
+    if (subject && subject !== title) candidates.push(subject);
+    return candidates;
+  });
   const bodyHtml = $derived(
-    preview?.body_preview ? renderChunkBodyHtml(preview.body_preview) : "",
+    preview?.body_preview
+      ? renderChunkBodyPreviewHtml(preview.body_preview, {
+        allowHeadings: false,
+        allowStrong: false,
+        suppressLeadingText: previewSuppressionCandidates,
+      })
+      : "",
   );
   const glossaryFormat = $derived<GlossaryFormat>(preview?.glossary_format ?? "markdown");
   const glossaryIsTypst = $derived(glossaryFormat === "typst");
   const glossaryHtml = $derived(
     preview?.glossary_preview && !glossaryIsTypst
-      ? renderChunkBodyHtml(preview.glossary_preview)
+      ? renderChunkBodyPreviewHtml(preview.glossary_preview)
       : "",
   );
   const glossaryTypstPreview = $derived.by(() => {
@@ -68,7 +83,6 @@
     return trimmed.length > 320 ? `${trimmed.slice(0, 320).trimEnd()}...` : trimmed;
   });
   const hasGlossary = $derived(Boolean(preview?.glossary_preview?.trim()));
-  const displayTitle = $derived(preview?.title ?? preview?.subject ?? null);
 
   $effect(() => {
     if (!preview) {

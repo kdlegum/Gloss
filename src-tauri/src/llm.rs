@@ -86,7 +86,14 @@ pub struct BlockForPrompt<'a> {
 pub struct PastPaperBlockForPrompt {
     pub id: i64,
     pub page_number: i64,
+    pub order_idx: i32,
+    pub bbox_x: f32,
     pub bbox_y: f32,
+    pub bbox_w: f32,
+    pub bbox_h: f32,
+    pub text_start_preview: String,
+    pub text_end_preview: String,
+    pub text_char_len: usize,
 }
 
 pub struct PastPaperInstructionMarkdown {
@@ -97,6 +104,8 @@ pub struct PastPaperInstructionMarkdown {
 pub struct PastPaperQuestionChunk {
     pub question_label: String,
     pub available_marks: Option<i64>,
+    pub start_block_id: i64,
+    pub end_block_id: i64,
     pub block_ids: Vec<i64>,
     pub question_text: String,
 }
@@ -217,7 +226,6 @@ pub struct ChunkAlias {
 struct ChunkResponseWrapper {
     chunks: Vec<GroupedChunk>,
 }
-
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ChunkBodyResult {
@@ -448,16 +456,26 @@ pub fn build_past_paper_document_chunk_prompt(
          1. Each question chunk must include ALL subparts (a, b, c, etc.) in one chunk.\n\
          2. question_label: numeric string (\"1\", \"12\").\n\
          3. available_marks: extract from the visible text if present (e.g. \"[4 marks]\"), else null.\n\
-         4. block_ids: list of pdfium block IDs that make up this question.\n\
+         4. start_block_id: the first block where this question genuinely begins.\n\
+         5. end_block_id: the last block where this question genuinely ends.\n\
+         6. block_ids: list of pdfium block IDs that make up this question.\n\
             Include ONLY blocks that genuinely belong to this question.\n\
-         5. noise_block_ids: list of block IDs that are NOT part of any question\n\
-         (e.g. section headers, blank-page labels, copyright/footer text, page numbers,\n\
-         formula booklets, or other admin material).\n\
-         6. Each block ID must appear exactly once, either in one question.block_ids OR\n\
-            in noise_block_ids (never both).\n\
+            start_block_id and end_block_id must both appear in block_ids.\n\
+            When block_ids are ordered by page and order, the first must be start_block_id\n\
+            and the last must be end_block_id.\n\
          7. question_text: full faithful transcription of the entire question (including all subparts)\n\
             as markdown. Use $...$ for inline math and $$...$$ for display math. Preserve all\n\
-            mathematical notation exactly.\n\n\
+            mathematical notation exactly.\n\
+            question_text must start with text from the start block and end with text from the end block.\n\
+         8. noise_block_ids: list of block IDs that are NOT part of any question\n\
+            (e.g. section headers, blank-page labels, copyright/footer text, page numbers,\n\
+            stray punctuation, formula booklets, or other admin material).\n\
+         9. Each block ID must appear exactly once, either in one question.block_ids OR\n\
+            in noise_block_ids (never both).\n\
+         10. The first meaningful block for Question N should visibly begin Question N.\n\
+             Do not shift a question down by assigning its first content block to Question N+1.\n\n\
+         Example noise: a page number by itself, a section heading such as \"Section A: Pure Mathematics\",\n\
+         or a lone trailing full stop should go into noise_block_ids, not into Question 1.\n\n\
          Instruction page context:\n",
     );
     let instruction_trimmed = instruction_markdown.trim();
@@ -467,14 +485,29 @@ pub fn build_past_paper_document_chunk_prompt(
         s.push_str(instruction_trimmed);
         s.push('\n');
     }
-    s.push_str("\nBlock positions (id :: page :: y0):\n");
+    s.push_str(
+        "\nQuestion-page blocks (id :: page :: order :: bbox[x,y,w,h] :: chars :: start :: end):\n",
+    );
     for b in blocks {
-        s.push_str(&format!("{} :: {} :: {:.2}\n", b.id, b.page_number, b.bbox_y));
+        s.push_str(&format!(
+            "{} :: {} :: {} :: [{:.3}, {:.3}, {:.3}, {:.3}] :: {} :: {:?} :: {:?}\n",
+            b.id,
+            b.page_number,
+            b.order_idx,
+            b.bbox_x,
+            b.bbox_y,
+            b.bbox_w,
+            b.bbox_h,
+            b.text_char_len,
+            b.text_start_preview,
+            b.text_end_preview
+        ));
     }
     s.push_str(
         "\nReturn ONLY valid JSON:\n\
          { \"questions\": [\n\
-           { \"question_label\": \"1\", \"available_marks\": 4, \"block_ids\": [42, 43, 44], \
+           { \"question_label\": \"1\", \"available_marks\": 4, \"start_block_id\": 42, \
+               \"end_block_id\": 44, \"block_ids\": [42, 43, 44], \
                \"question_text\": \"**1.** Let $f(x) = x^2$. Find $f'(x)$. [4 marks]\" }\n\
            ],\n\
            \"noise_block_ids\": [99, 100]\n\
@@ -604,10 +637,19 @@ pub fn past_paper_document_chunk_schema() -> Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["question_label", "available_marks", "block_ids", "question_text"],
+                    "required": [
+                        "question_label",
+                        "available_marks",
+                        "start_block_id",
+                        "end_block_id",
+                        "block_ids",
+                        "question_text"
+                    ],
                     "properties": {
                         "question_label": { "type": "string", "minLength": 1 },
                         "available_marks": { "type": ["integer", "null"] },
+                        "start_block_id": { "type": "integer" },
+                        "end_block_id": { "type": "integer" },
                         "block_ids": {
                             "type": "array",
                             "items": { "type": "integer" },
@@ -734,9 +776,19 @@ pub fn parse_past_paper_document_chunk_result(
             );
             continue;
         }
+        if !block_ids.contains(&q.start_block_id) || !block_ids.contains(&q.end_block_id) {
+            warn!(
+                target: log_target,
+                "skipping past-paper question chunk label={:?} because boundary block ids are missing from block_ids",
+                label
+            );
+            continue;
+        }
         questions.push(PastPaperQuestionChunk {
             question_label: label,
             available_marks: q.available_marks.map(|m| m.max(0)),
+            start_block_id: q.start_block_id,
+            end_block_id: q.end_block_id,
             block_ids,
             question_text: q.question_text.trim().to_string(),
         });
@@ -1011,5 +1063,40 @@ fn parse_sse_event_data(event_bytes: &[u8]) -> Option<String> {
         None
     } else {
         Some(joined)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_past_paper_question_boundaries() {
+        let raw = r#"{
+            "questions": [
+                {
+                    "question_label": "1",
+                    "available_marks": 4,
+                    "start_block_id": 42,
+                    "end_block_id": 44,
+                    "block_ids": [42, 43, 44, 43],
+                    "question_text": "**1.** Example question"
+                }
+            ],
+            "noise_block_ids": [99, 100, 99]
+        }"#;
+
+        let parsed = parse_past_paper_document_chunk_result(raw, "test")
+            .expect("should parse past-paper result");
+
+        assert_eq!(parsed.noise_block_ids, vec![99, 100]);
+        assert_eq!(parsed.questions.len(), 1);
+        let question = &parsed.questions[0];
+        assert_eq!(question.question_label, "1");
+        assert_eq!(question.available_marks, Some(4));
+        assert_eq!(question.start_block_id, 42);
+        assert_eq!(question.end_block_id, 44);
+        assert_eq!(question.block_ids, vec![42, 43, 44]);
+        assert_eq!(question.question_text, "**1.** Example question");
     }
 }
