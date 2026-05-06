@@ -4954,7 +4954,9 @@
   let glossarySaveTimer: ReturnType<typeof setTimeout> | null = null;
   let glossaryPendingChunkId: number | null = null;
   let glossaryTextareaEl = $state<HTMLTextAreaElement | null>(null);
-  let glossaryMarkdownHtml = $derived(renderChunkBodyHtml(glossaryDraft));
+  let glossaryMentionRefs = $state<ResolvedReference[]>([]);
+  let glossaryMentionResolveRequestId = 0;
+  let glossaryMarkdownHtml = $derived(renderChunkBodyHtml(glossaryDraft, glossaryMentionRefs));
   let glossaryTypstPreviewDocument = $state<TypstPreviewDocument | null>(null);
   let glossaryTypstPreviewError = $state<string | null>(null);
   let glossaryTypstPreviewLoading = $state(false);
@@ -5548,9 +5550,11 @@
   let glossaryRewriteError = $state<string | null>(null);
   let glossaryRewriteApplying = $state(false);
   let glossaryRewriteSuggestion = $state<ChunkGlossaryRewriteSuggestionOutput | null>(null);
+  let glossaryRewriteMentionRefs = $state<ResolvedReference[]>([]);
+  let glossaryRewriteMentionResolveRequestId = 0;
   let glossaryRewriteMarkdownPreviewHtml = $derived(
     glossaryRewriteSuggestion?.glossary_markdown
-      ? renderChunkBodyHtml(glossaryRewriteSuggestion.glossary_markdown, undefined, {
+      ? renderChunkBodyHtml(glossaryRewriteSuggestion.glossary_markdown, glossaryRewriteMentionRefs, {
         copyCodeBlocks: false,
         allowHeadings: false,
         allowStrong: false,
@@ -5637,6 +5641,19 @@
     target_type: string | null;
   }
 
+  interface BackendResolvedChunkMention {
+    matched_text: string;
+    alias: string;
+    span_start: number;
+    span_end: number;
+    target_id: number;
+    target_type: string;
+    target_title: string | null;
+    target_subject: string | null;
+    page_number: number | null;
+    body_preview: string | null;
+  }
+
   interface ChunkPreview {
     id: number;
     chunk_type: string;
@@ -5668,6 +5685,123 @@
     } catch (err) {
       await appLogWarn(`[chunk] load references failed chunkId=${chunkId}: ${formatLogError(err)}`);
     }
+  }
+
+  function mapResolvedMentionsToRefs(rows: BackendResolvedChunkMention[]): ResolvedReference[] {
+    return rows.map((row) => ({
+      matched_text: row.matched_text,
+      span_start: row.span_start,
+      span_end: row.span_end,
+      target_id: row.target_id,
+    }));
+  }
+
+  async function resolveMentionsForCurrentDocument(
+    source: string,
+    limit = 32,
+  ): Promise<BackendResolvedChunkMention[]> {
+    const book = selectedBook;
+    const trimmed = source.trim();
+    if (!book || !trimmed) return [];
+    return await invoke<BackendResolvedChunkMention[]>("resolve_chunk_mentions", {
+      sourceDocumentId: book.id,
+      source,
+      limit,
+    });
+  }
+
+  async function refreshGlossaryMarkdownMentions() {
+    const view = chunkView;
+    const requestId = ++glossaryMentionResolveRequestId;
+    const shouldResolve = !!view
+      && chunkTab === "glossary"
+      && glossaryFormat === "markdown"
+      && glossaryMode === "preview"
+      && !!glossaryDraft.trim();
+    if (!shouldResolve) {
+      glossaryMentionRefs = [];
+      return;
+    }
+
+    try {
+      const rows = await resolveMentionsForCurrentDocument(glossaryDraft);
+      if (
+        glossaryMentionResolveRequestId !== requestId
+        || chunkView?.chunk.id !== view.chunk.id
+        || chunkTab !== "glossary"
+        || glossaryFormat !== "markdown"
+        || glossaryMode !== "preview"
+      ) {
+        return;
+      }
+      glossaryMentionRefs = mapResolvedMentionsToRefs(rows);
+    } catch (err) {
+      if (glossaryMentionResolveRequestId === requestId) {
+        glossaryMentionRefs = [];
+      }
+      await appLogWarn(`[glossary] mention resolution failed: ${formatLogError(err)}`);
+    }
+  }
+
+  async function refreshGlossaryRewriteMarkdownMentions(source: string) {
+    const requestId = ++glossaryRewriteMentionResolveRequestId;
+    const trimmed = source.trim();
+    if (glossaryFormat !== "markdown" || !trimmed) {
+      glossaryRewriteMentionRefs = [];
+      return;
+    }
+
+    try {
+      const rows = await resolveMentionsForCurrentDocument(source);
+      if (
+        glossaryRewriteMentionResolveRequestId !== requestId
+        || glossaryFormat !== "markdown"
+        || glossaryRewriteSuggestion?.glossary_markdown !== source
+      ) {
+        return;
+      }
+      glossaryRewriteMentionRefs = mapResolvedMentionsToRefs(rows);
+    } catch (err) {
+      if (glossaryRewriteMentionResolveRequestId === requestId) {
+        glossaryRewriteMentionRefs = [];
+      }
+      await appLogWarn(`[glossary] rewrite mention resolution failed: ${formatLogError(err)}`);
+    }
+  }
+
+  function buildMentionContextBlock(rows: BackendResolvedChunkMention[]): string | null {
+    if (rows.length === 0) return null;
+
+    const unique = new Map<number, BackendResolvedChunkMention>();
+    for (const row of rows) {
+      if (!unique.has(row.target_id)) {
+        unique.set(row.target_id, row);
+      }
+    }
+    if (unique.size === 0) return null;
+
+    const parts = ["Referenced chunks:"];
+    for (const row of unique.values()) {
+      const headerParts = [`- ${row.matched_text} -> chunk ${row.target_id} (${row.target_type})`];
+      if (row.page_number != null) {
+        headerParts.push(`page ${row.page_number}`);
+      }
+      parts.push(headerParts.join(", "));
+      if (row.target_title?.trim()) {
+        parts.push(`  title: ${row.target_title.trim()}`);
+      }
+      if (row.target_subject?.trim()) {
+        parts.push(`  subject: ${row.target_subject.trim()}`);
+      }
+      if (row.body_preview?.trim()) {
+        parts.push("  body preview:");
+        for (const line of row.body_preview.trim().split("\n")) {
+          parts.push(`    ${line}`);
+        }
+      }
+    }
+
+    return parts.join("\n");
   }
 
   async function flushChunkTitleSave() {
@@ -6032,6 +6166,31 @@
     // Re-run when saved body changes (references may now hit different spans).
     const body = chunkView ? getChunkDisplayBody(chunkView.chunk) : "";
     if (chunkView && body) void loadChunkReferences(chunkView.chunk.id);
+  });
+
+  $effect(() => {
+    const chunkId = chunkView?.chunk.id ?? null;
+    const source = glossaryDraft;
+    const tab = chunkTab;
+    const format = glossaryFormat;
+    const mode = glossaryMode;
+    if (!chunkId || tab !== "glossary" || format !== "markdown" || mode !== "preview" || !source.trim()) {
+      glossaryMentionResolveRequestId += 1;
+      glossaryMentionRefs = [];
+      return;
+    }
+    void refreshGlossaryMarkdownMentions();
+  });
+
+  $effect(() => {
+    const source = glossaryRewriteSuggestion?.glossary_markdown ?? "";
+    const format = glossaryFormat;
+    if (format !== "markdown" || !source.trim()) {
+      glossaryRewriteMentionResolveRequestId += 1;
+      glossaryRewriteMentionRefs = [];
+      return;
+    }
+    void refreshGlossaryRewriteMarkdownMentions(source);
   });
 
   function makeChunkChatRequestId() {
@@ -6619,6 +6778,18 @@
       }
     }
 
+    if (draftContent) {
+      try {
+        const mentionRows = await resolveMentionsForCurrentDocument(draftContent, 12);
+        const mentionContext = buildMentionContextBlock(mentionRows);
+        if (mentionContext) {
+          historyParts.push(mentionContext);
+        }
+      } catch (err) {
+        await appLogWarn(`[chunk-ai] mention resolution failed: ${formatLogError(err)}`);
+      }
+    }
+
     const leadText = draftContent || (
       imageBase64List.length > 0 || attachment
         ? `Use the attached ${imageBase64List.length > 1 ? "images" : "image"} as additional context.`
@@ -6748,6 +6919,7 @@
           provider: chatProvider,
           model: chatModel.length > 0 ? chatModel : null,
           history,
+          searchQuery: draftContent || null,
         });
         await appLogInfo(
           `[chunk-ai] started requestId=${requestId} chunkId=${chunkId} provider=${chatProvider} model=${chatModel || "auto"} history=${history.length}`,
@@ -6759,6 +6931,7 @@
           provider: chatProvider,
           model: chatModel.length > 0 ? chatModel : null,
           history,
+          searchQuery: draftContent || null,
         });
         await appLogInfo(
           `[viewer-ai] started requestId=${requestId} pageId=${pageId} provider=${chatProvider} model=${chatModel || "auto"} history=${history.length}`,
@@ -10009,6 +10182,13 @@
                 >
                   AI
                 </button>
+                <button
+                  class="chunk-tab-settings"
+                  type="button"
+                  onclick={openAiSettings}
+                >
+                  AI settings
+                </button>
               </div>
 
               {#if chunkTab === 'ink'}
@@ -10442,23 +10622,7 @@
                   {/if}
                 </div>
               {:else if chunkTab === 'ai'}
-                  {@const chatModelLabel = aiTaskSettings.chat.model || "Auto (server default)"}
-                  {@const visionModelLabel = aiTaskSettings.vision.model || "Auto (server default)"}
 	                <div class="chunk-ai-pane">
-                    <div class="chunk-ai-toolbar">
-                      <div class="chunk-ai-toolbar-copy">
-                        <strong>AI defaults</strong>
-                        <span>Chat: {getProviderLabel(aiTaskSettings.chat.provider)} · {chatModelLabel}</span>
-                        <span>Vision OCR: {getProviderLabel(aiTaskSettings.vision.provider)} · {visionModelLabel}</span>
-                      </div>
-                      <button
-                        class="chunk-ai-settings-btn"
-                        type="button"
-                        onclick={openAiSettings}
-                      >
-                        AI settings
-                      </button>
-                    </div>
 	                  {#if chunkIsQuestion}
 	                    <section class="chunk-ai-marking">
 	                      <div class="chunk-ai-marking-header">
@@ -12060,6 +12224,8 @@
 
   .chunk-tab-bar {
     display: flex;
+    align-items: center;
+    gap: 2px;
     border-bottom: 1px solid rgba(0, 0, 0, 0.07);
     background: #fff;
     flex-shrink: 0;
@@ -12091,6 +12257,29 @@
     opacity: 0.4;
     cursor: default;
     pointer-events: none;
+  }
+
+  .chunk-tab-settings {
+    margin-left: auto;
+    margin-right: 10px;
+    height: 28px;
+    padding: 0 11px;
+    border-radius: 999px;
+    border: 1px solid rgba(148, 163, 184, 0.55);
+    background: #fff;
+    color: #475569;
+    font-size: 11px;
+    font-weight: 700;
+    font-family: Inter, system-ui, sans-serif;
+    cursor: pointer;
+    transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease, transform 0.12s ease;
+  }
+
+  .chunk-tab-settings:hover:not(:disabled) {
+    transform: translateY(-1px);
+    border-color: color-mix(in oklch, var(--chunk-accent) 36%, white);
+    background: color-mix(in oklch, var(--chunk-accent) 8%, white);
+    color: color-mix(in oklch, var(--chunk-accent) 72%, black);
   }
 
   .chunk-sheet-surface {
@@ -12603,60 +12792,6 @@
     flex-direction: column;
     overflow: hidden;
     background: linear-gradient(180deg, #fbfcfe 0%, #f4f7fb 100%);
-  }
-
-  .chunk-ai-toolbar {
-    padding: 10px 14px;
-    border-bottom: 1px solid rgba(203, 213, 225, 0.72);
-    background: rgba(255, 255, 255, 0.92);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    flex-wrap: wrap;
-    flex-shrink: 0;
-    font-family: Inter, system-ui, sans-serif;
-  }
-
-  .chunk-ai-toolbar-copy {
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-
-  .chunk-ai-toolbar-copy strong {
-    font-size: 12px;
-    color: #1f2937;
-  }
-
-  .chunk-ai-toolbar-copy span {
-    font-size: 11px;
-    color: #64748b;
-    line-height: 1.4;
-    word-break: break-word;
-  }
-
-  .chunk-ai-settings-btn {
-    min-width: 94px;
-    height: 32px;
-    padding: 0 12px;
-    border-radius: 10px;
-    border: 1px solid rgba(148, 163, 184, 0.55);
-    background: #fff;
-    color: #334155;
-    font-size: 12px;
-    font-weight: 700;
-    font-family: Inter, system-ui, sans-serif;
-    cursor: pointer;
-    transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease, transform 0.12s ease;
-  }
-
-  .chunk-ai-settings-btn:hover:not(:disabled) {
-    transform: translateY(-1px);
-    border-color: color-mix(in oklch, var(--chunk-accent) 36%, white);
-    background: color-mix(in oklch, var(--chunk-accent) 8%, white);
-    color: color-mix(in oklch, var(--chunk-accent) 72%, black);
   }
 
   .chunk-ai-marking {

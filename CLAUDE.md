@@ -11,6 +11,7 @@ This is different from GoodNotes (which lets you write *on* a PDF). In Gloss you
 Key features (many not yet built):
 - **Chunk system** - definitions, theorems, exercises, proofs are containers for your work. AI pre-suggests chunk boundaries, user confirms or adjusts them.
 - **In-app AI chat** - chunk-aware: knows which chunk you're in, your attached work, and can pull in related chunks from across all sources via RAG over AI-generated semantic tags. It should handle maths synonym and notation variation.
+  - Retrieval architecture note: `docs/ai-chunk-retrieval.md` explains the current chunk-first retrieval model and the future semantic-tag / embedding upgrade path.
 - **Cross-source linking** - an exercise in a textbook can link to a related worked example in lecture notes.
 - **Progress tracking** - complete/incomplete status across all exercises in a textbook.
 - **Personal glossary** - self-explanations in your own words, one type of work attachable to a chunk. Doubles as a learner model for the AI.

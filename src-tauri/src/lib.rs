@@ -1273,6 +1273,7 @@ struct RelatedChunkContext {
 
 struct ChunkChatContext {
     book_title: String,
+    source_document_id: i64,
     chunk_type: String,
     title: Option<String>,
     subject: Option<String>,
@@ -1499,6 +1500,457 @@ async fn append_related_chunk(
     Ok(())
 }
 
+#[derive(Clone)]
+struct ChunkSearchCandidate {
+    chunk_id: i64,
+    page_number: i64,
+    chunk_type: String,
+    title: Option<String>,
+    subject: Option<String>,
+    aliases: Vec<String>,
+    body_markdown: Option<String>,
+    glossary_markdown: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ChunkSearchResultView {
+    chunk_id: i64,
+    page_number: i64,
+    chunk_type: String,
+    title: Option<String>,
+    subject: Option<String>,
+    match_reason: String,
+    snippet: String,
+}
+
+fn normalize_search_text(source: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_separator = true;
+
+    for ch in source.chars() {
+        let normalized = match ch {
+            '−' | '–' | '—' | '‑' | '‒' => Some('-'),
+            ch if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') => {
+                Some(ch.to_ascii_lowercase())
+            }
+            _ => None,
+        };
+
+        match normalized {
+            Some(ch) => {
+                out.push(ch);
+                last_was_separator = false;
+            }
+            None if !last_was_separator && !out.is_empty() => {
+                out.push(' ');
+                last_was_separator = true;
+            }
+            None => {}
+        }
+    }
+
+    out.trim().to_string()
+}
+
+fn tokenize_search_text(source: &str) -> Vec<String> {
+    normalize_search_text(source)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_search_stop_word(token: &str) -> bool {
+    matches!(
+        token,
+        "a"
+            | "an"
+            | "about"
+            | "called"
+            | "chunk"
+            | "chunks"
+            | "find"
+            | "for"
+            | "in"
+            | "is"
+            | "me"
+            | "named"
+            | "of"
+            | "on"
+            | "please"
+            | "show"
+            | "tell"
+            | "that"
+            | "the"
+            | "this"
+            | "to"
+            | "what"
+            | "where"
+            | "which"
+    )
+}
+
+fn tokenize_search_query(source: &str) -> Vec<String> {
+    let tokens = tokenize_search_text(source);
+    let filtered: Vec<String> = tokens
+        .iter()
+        .filter(|token| !is_search_stop_word(token))
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        tokens
+    } else {
+        filtered
+    }
+}
+
+fn normalize_search_phrase(source: &str) -> String {
+    tokenize_search_query(source).join(" ")
+}
+
+fn strip_search_numeric_prefix(source: &str) -> Option<String> {
+    let trimmed = source.trim();
+    let label = references::extract_numeric_label_from_title(trimmed)?;
+    let start = trimmed.find(&label)?;
+    let remainder = trimmed[start + label.len()..].trim_start_matches(|ch: char| {
+        ch.is_whitespace() || matches!(ch, ':' | '.' | '-' | ')' | '−' | '–' | '—' | '‑' | '‒')
+    });
+    let remainder = remainder.trim();
+    if remainder.is_empty() {
+        None
+    } else {
+        Some(remainder.to_string())
+    }
+}
+
+fn build_search_variants(source: Option<&str>) -> Vec<String> {
+    let Some(source) = source.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Vec::new();
+    };
+
+    let mut variants = vec![source.to_string()];
+    if let Some(stripped) = strip_search_numeric_prefix(source) {
+        if !variants.iter().any(|existing| existing.eq_ignore_ascii_case(&stripped)) {
+            variants.push(stripped);
+        }
+    }
+    variants
+}
+
+fn token_overlap_count(query_tokens: &HashSet<String>, source: &str) -> usize {
+    if query_tokens.is_empty() {
+        return 0;
+    }
+    let source_tokens: HashSet<String> = tokenize_search_text(source).into_iter().collect();
+    query_tokens.intersection(&source_tokens).count()
+}
+
+fn truncate_search_snippet(source: &str, limit: usize) -> String {
+    let collapsed = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= limit {
+        return collapsed;
+    }
+
+    let mut out = String::new();
+    for ch in collapsed.chars().take(limit) {
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
+}
+
+fn contains_search_phrase(haystack: &str, needle: &str) -> bool {
+    if haystack.is_empty() || needle.is_empty() {
+        return false;
+    }
+    if haystack == needle {
+        return true;
+    }
+
+    let mut padded_haystack = String::with_capacity(haystack.len() + 2);
+    padded_haystack.push(' ');
+    padded_haystack.push_str(haystack);
+    padded_haystack.push(' ');
+
+    let mut padded_needle = String::with_capacity(needle.len() + 2);
+    padded_needle.push(' ');
+    padded_needle.push_str(needle);
+    padded_needle.push(' ');
+
+    padded_haystack.contains(&padded_needle)
+}
+
+fn phrase_match_specificity(query_phrase: &str, candidate_phrase: &str) -> usize {
+    if query_phrase.is_empty() || candidate_phrase.is_empty() {
+        return 0;
+    }
+    if contains_search_phrase(query_phrase, candidate_phrase) {
+        return candidate_phrase.split_whitespace().count();
+    }
+    if contains_search_phrase(candidate_phrase, query_phrase) {
+        return query_phrase.split_whitespace().count();
+    }
+    0
+}
+
+fn pick_search_snippet(candidate: &ChunkSearchCandidate, query_tokens: &HashSet<String>) -> String {
+    for source in [
+        candidate.body_markdown.as_deref(),
+        candidate.glossary_markdown.as_deref(),
+        candidate.title.as_deref(),
+        candidate.subject.as_deref(),
+    ] {
+        let Some(source) = source.map(str::trim).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        if query_tokens.is_empty() || token_overlap_count(query_tokens, source) > 0 {
+            return truncate_search_snippet(source, 220);
+        }
+    }
+
+    candidate
+        .body_markdown
+        .as_deref()
+        .or(candidate.glossary_markdown.as_deref())
+        .or(candidate.title.as_deref())
+        .or(candidate.subject.as_deref())
+        .map(|value| truncate_search_snippet(value.trim(), 220))
+        .unwrap_or_else(|| "No preview available.".to_string())
+}
+
+fn build_search_result_for_candidate(
+    candidate: &ChunkSearchCandidate,
+    query_normalized: &str,
+    query_phrase: &str,
+    query_tokens: &HashSet<String>,
+) -> Option<(i64, ChunkSearchResultView)> {
+    if query_normalized.is_empty() {
+        return None;
+    }
+
+    let title_variants = [
+        build_search_variants(candidate.title.as_deref()),
+        build_search_variants(candidate.subject.as_deref()),
+    ]
+    .concat();
+    let title_overlap = title_variants
+        .iter()
+        .map(|variant| token_overlap_count(query_tokens, variant))
+        .max()
+        .unwrap_or(0);
+    let title_phrase_match = title_variants
+        .iter()
+        .map(|variant| phrase_match_specificity(query_phrase, &normalize_search_phrase(variant)))
+        .max()
+        .unwrap_or(0);
+    let exact_title_or_subject = title_variants.iter().any(|variant| {
+        let normalized = normalize_search_text(variant);
+        normalized == query_normalized
+            || (!query_phrase.is_empty() && normalize_search_phrase(variant) == query_phrase)
+    });
+
+    let alias_overlap = candidate
+        .aliases
+        .iter()
+        .map(|alias| token_overlap_count(query_tokens, alias))
+        .max()
+        .unwrap_or(0);
+    let alias_phrase_match = candidate
+        .aliases
+        .iter()
+        .map(|alias| phrase_match_specificity(query_phrase, &normalize_search_phrase(alias)))
+        .max()
+        .unwrap_or(0);
+    let exact_alias = candidate
+        .aliases
+        .iter()
+        .any(|alias| normalize_search_text(alias) == query_normalized);
+
+    let body_glossary_source = format!(
+        "{}\n{}",
+        candidate.body_markdown.as_deref().unwrap_or(""),
+        candidate.glossary_markdown.as_deref().unwrap_or("")
+    );
+    let body_glossary_overlap = token_overlap_count(query_tokens, &body_glossary_source);
+
+    let (score, match_reason) = if exact_alias {
+        (10_000, "exact alias match")
+    } else if exact_title_or_subject {
+        (9_000, "exact title/subject match")
+    } else if title_phrase_match > 0 {
+        (
+            8_000 + title_phrase_match as i64 * 25 + title_overlap as i64 * 10,
+            "title/subject phrase match",
+        )
+    } else if alias_phrase_match > 0 {
+        (
+            7_000 + alias_phrase_match as i64 * 25 + alias_overlap as i64 * 10,
+            "alias phrase match",
+        )
+    } else if title_overlap > 0 {
+        (
+            6_000 + title_overlap as i64 * 20 + body_glossary_overlap as i64 * 5,
+            "title/subject token overlap",
+        )
+    } else if alias_overlap > 0 {
+        (4_000 + alias_overlap as i64 * 15, "alias token overlap")
+    } else if body_glossary_overlap > 0 {
+        (
+            1_000 + body_glossary_overlap as i64 * 10,
+            "body/glossary text overlap",
+        )
+    } else {
+        return None;
+    };
+
+    Some((
+        score,
+        ChunkSearchResultView {
+            chunk_id: candidate.chunk_id,
+            page_number: candidate.page_number,
+            chunk_type: candidate.chunk_type.clone(),
+            title: candidate.title.clone(),
+            subject: candidate.subject.clone(),
+            match_reason: match_reason.to_string(),
+            snippet: pick_search_snippet(candidate, query_tokens),
+        },
+    ))
+}
+
+async fn search_chunks_for_ai_internal(
+    pool: &SqlitePool,
+    source_document_id: i64,
+    query: &str,
+    limit: usize,
+    exclude_chunk_id: Option<i64>,
+) -> Result<Vec<ChunkSearchResultView>, String> {
+    references::ensure_document_aliases(pool, source_document_id).await?;
+
+    let trimmed_query = query.trim();
+    if trimmed_query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let query_normalized = normalize_search_text(trimmed_query);
+    if query_normalized.is_empty() {
+        return Ok(Vec::new());
+    }
+    let query_token_list = tokenize_search_query(trimmed_query);
+    let query_phrase = query_token_list.join(" ");
+    let query_tokens: HashSet<String> = query_token_list.into_iter().collect();
+
+    let chunk_rows = sqlx::query(
+        "SELECT c.id AS chunk_id, p.page_number, c.chunk_type, c.title, c.subject, \
+                COALESCE(NULLIF(TRIM(c.formatted_body_md), ''), NULLIF(TRIM(c.ocr_text), '')) AS body_markdown, \
+                NULLIF(TRIM(c.glossary_md), '') AS glossary_markdown \
+         FROM chunks c \
+         JOIN pages p ON p.id = c.page_id \
+         WHERE c.source_document_id = ? AND c.chunk_type != 'noise'",
+    )
+    .bind(source_document_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let alias_rows = sqlx::query(
+        "SELECT chunk_id, alias FROM chunk_aliases \
+         WHERE chunk_id IN (SELECT id FROM chunks WHERE source_document_id = ?)",
+    )
+    .bind(source_document_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut aliases_by_chunk: HashMap<i64, Vec<String>> = HashMap::new();
+    for row in alias_rows {
+        aliases_by_chunk
+            .entry(row.get("chunk_id"))
+            .or_default()
+            .push(row.get("alias"));
+    }
+
+    let max_results = if limit == 0 { 5 } else { limit };
+    let mut scored: Vec<(i64, ChunkSearchResultView)> = Vec::new();
+    for row in chunk_rows {
+        let chunk_id: i64 = row.get("chunk_id");
+        if exclude_chunk_id.is_some_and(|excluded| excluded == chunk_id) {
+            continue;
+        }
+
+        let candidate = ChunkSearchCandidate {
+            chunk_id,
+            page_number: row.get("page_number"),
+            chunk_type: row.get("chunk_type"),
+            title: row.get("title"),
+            subject: row.get("subject"),
+            aliases: aliases_by_chunk.remove(&chunk_id).unwrap_or_default(),
+            body_markdown: row.get("body_markdown"),
+            glossary_markdown: row.get("glossary_markdown"),
+        };
+
+        if let Some(result) =
+            build_search_result_for_candidate(
+                &candidate,
+                &query_normalized,
+                &query_phrase,
+                &query_tokens,
+            )
+        {
+            scored.push(result);
+        }
+    }
+
+    scored.sort_by(|(left_score, left_result), (right_score, right_result)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_result.page_number.cmp(&right_result.page_number))
+            .then_with(|| left_result.chunk_id.cmp(&right_result.chunk_id))
+    });
+
+    Ok(scored
+        .into_iter()
+        .take(max_results)
+        .map(|(_, result)| result)
+        .collect())
+}
+
+fn format_search_results_context(query: &str, results: &[ChunkSearchResultView]) -> String {
+    if results.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    out.push_str("Chunk search results for the latest user query:\n");
+    out.push_str(&format!("Query: {}\n", query.trim()));
+    for (index, result) in results.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. chunk {} on page {} ({})\n",
+            index + 1,
+            result.chunk_id,
+            result.page_number,
+            result.chunk_type
+        ));
+        if let Some(title) = result.title.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            out.push_str(&format!("   title: {}\n", title));
+        }
+        if let Some(subject) = result
+            .subject
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            out.push_str(&format!("   subject: {}\n", subject));
+        }
+        out.push_str(&format!("   match: {}\n", result.match_reason));
+        out.push_str("   snippet:\n");
+        for line in result.snippet.lines() {
+            out.push_str("     ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn sanitize_chunk_chat_history(
     history: Vec<ChunkChatMessage>,
 ) -> Result<Vec<ChunkChatMessage>, String> {
@@ -1690,8 +2142,42 @@ async fn load_chunk_chat_context(
         }
     }
 
+    if glossary_format == ChunkNoteFormat::Markdown {
+        if let Some(glossary_source) = glossary_markdown.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            let glossary_mentions = references::resolve_mentions_in_document(
+                pool,
+                source_document_id,
+                glossary_source,
+                MAX_RELATED,
+            )
+            .await?;
+
+            for mention in glossary_mentions {
+                append_related_chunk(
+                    pool,
+                    &mut related_chunks,
+                    &mut seen_ids,
+                    "glossary_mention",
+                    mention.target_id,
+                    mention.target_type,
+                    mention.target_title,
+                    mention.target_subject,
+                    mention.body_preview,
+                    None,
+                    ChunkNoteFormat::Markdown,
+                    MAX_RELATED,
+                )
+                .await?;
+                if related_chunks.len() >= MAX_RELATED {
+                    break;
+                }
+            }
+        }
+    }
+
     Ok(ChunkChatContext {
         book_title: row.get("book_title"),
+        source_document_id,
         chunk_type,
         title: row.get("title"),
         subject: row.get("subject"),
@@ -1708,6 +2194,7 @@ async fn load_chunk_chat_context(
 
 struct PageChatContext {
     book_title: String,
+    source_document_id: i64,
     page_number: i64,
     body_markdown: String,
 }
@@ -1717,7 +2204,7 @@ async fn load_page_chat_context(
     page_id: i64,
 ) -> Result<PageChatContext, String> {
     let page_row = sqlx::query(
-        "SELECT p.page_number, sd.title AS book_title \
+        "SELECT p.page_number, p.source_document_id, sd.title AS book_title \
          FROM pages p \
          JOIN source_documents sd ON sd.id = p.source_document_id \
          WHERE p.id = ?",
@@ -1729,6 +2216,7 @@ async fn load_page_chat_context(
     .ok_or_else(|| format!("page {} not found", page_id))?;
 
     let page_number: i64 = page_row.get("page_number");
+    let source_document_id: i64 = page_row.get("source_document_id");
     let book_title: String = page_row.get("book_title");
 
     let block_rows = sqlx::query(
@@ -1810,6 +2298,7 @@ async fn load_page_chat_context(
 
     Ok(PageChatContext {
         book_title,
+        source_document_id,
         page_number,
         body_markdown: page_context.trim().to_string(),
     })
@@ -1824,6 +2313,7 @@ async fn run_page_ai_stream(
     provider: LlmProvider,
     model_override: Option<String>,
     history: Vec<ChunkChatMessage>,
+    search_query: Option<String>,
     cancelled: Arc<AtomicBool>,
 ) {
     let stream_context = ChatStreamContext::Page(page_id);
@@ -1835,13 +2325,35 @@ async fn run_page_ai_stream(
         let context = load_page_chat_context(&pool, page_id)
             .await
             .map_err(LlmError::Config)?;
+        let search_results = if let Some(query) = search_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            search_chunks_for_ai_internal(&pool, context.source_document_id, query, 4, None)
+                .await
+                .map_err(LlmError::Config)?
+        } else {
+            Vec::new()
+        };
+        let search_context = search_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|query| format_search_results_context(query, &search_results))
+            .filter(|value| !value.trim().is_empty());
+        let prompt_body = if let Some(search_context) = search_context {
+            format!("{}\n\nSupplemental chunk search results:\n---\n{}\n---\n", context.body_markdown, search_context)
+        } else {
+            context.body_markdown.clone()
+        };
         let page_title = format!("Page {}", context.page_number);
         let prompt = ChunkChatPrompt {
             book_title: &context.book_title,
             chunk_type: "page",
             title: Some(page_title.as_str()),
             subject: None,
-            body_markdown: &context.body_markdown,
+            body_markdown: &prompt_body,
             note_format: None,
         };
         let configured_api_key = settings::api_key_for_provider(&pool, provider)
@@ -1927,6 +2439,7 @@ async fn run_chunk_ai_stream(
     provider: LlmProvider,
     model_override: Option<String>,
     history: Vec<ChunkChatMessage>,
+    search_query: Option<String>,
     cancelled: Arc<AtomicBool>,
 ) {
     let stream_context = ChatStreamContext::Chunk(chunk_id);
@@ -1938,7 +2451,30 @@ async fn run_chunk_ai_stream(
         let context = load_chunk_chat_context(&pool, chunk_id)
             .await
             .map_err(LlmError::Config)?;
-        let prompt_body = compose_chunk_chat_body(&context);
+        let mut prompt_body = compose_chunk_chat_body(&context);
+        let search_results = if let Some(query) = search_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            search_chunks_for_ai_internal(&pool, context.source_document_id, query, 4, Some(chunk_id))
+                .await
+                .map_err(LlmError::Config)?
+        } else {
+            Vec::new()
+        };
+        if let Some(query) = search_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let search_context = format_search_results_context(query, &search_results);
+            if !search_context.trim().is_empty() {
+                prompt_body.push_str("\n\nSupplemental chunk search results:\n---\n");
+                prompt_body.push_str(search_context.trim_end());
+                prompt_body.push_str("\n---\n");
+            }
+        }
         let prompt = ChunkChatPrompt {
             book_title: &context.book_title,
             chunk_type: &context.chunk_type,
@@ -2213,6 +2749,7 @@ async fn start_chunk_ai_stream(
     provider: String,
     model: Option<String>,
     history: Vec<ChunkChatMessage>,
+    search_query: Option<String>,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     pool: tauri::State<'_, SqlitePool>,
@@ -2229,6 +2766,11 @@ async fn start_chunk_ai_stream(
     validate_chat_provider(provider)?;
     let model = normalize_model_override(model);
     let history = sanitize_chunk_chat_history(history)?;
+    let search_query = search_query
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
     let cancelled = begin_chat_stream(
         state.inner(),
         &request_id,
@@ -2246,6 +2788,7 @@ async fn start_chunk_ai_stream(
         provider,
         model,
         history,
+        search_query,
         cancelled,
     ));
 
@@ -2259,6 +2802,7 @@ async fn start_page_ai_stream(
     provider: String,
     model: Option<String>,
     history: Vec<ChunkChatMessage>,
+    search_query: Option<String>,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     pool: tauri::State<'_, SqlitePool>,
@@ -2275,6 +2819,11 @@ async fn start_page_ai_stream(
     validate_chat_provider(provider)?;
     let model = normalize_model_override(model);
     let history = sanitize_chunk_chat_history(history)?;
+    let search_query = search_query
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
     let cancelled =
         begin_chat_stream(state.inner(), &request_id, ChatStreamContext::Page(page_id))?;
     let chat_streams = Arc::clone(&state.chat_streams);
@@ -2289,6 +2838,7 @@ async fn start_page_ai_stream(
         provider,
         model,
         history,
+        search_query,
         cancelled,
     ));
 
@@ -2310,6 +2860,57 @@ async fn cancel_chunk_ai_stream(
         emit_chunk_ai_stream(&app, &request_id, &handle.context, "cancelled", None, None);
     }
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct ResolvedChunkMentionView {
+    matched_text: String,
+    alias: String,
+    span_start: i64,
+    span_end: i64,
+    target_id: i64,
+    target_type: String,
+    target_title: Option<String>,
+    target_subject: Option<String>,
+    page_number: Option<i64>,
+    body_preview: Option<String>,
+}
+
+#[tauri::command]
+async fn resolve_chunk_mentions(
+    source_document_id: i64,
+    source: String,
+    limit: Option<usize>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<Vec<ResolvedChunkMentionView>, String> {
+    if source_document_id < 1 {
+        return Err(format!("invalid source_document_id {}", source_document_id));
+    }
+
+    let limit = limit.unwrap_or(32);
+    let rows = references::resolve_mentions_in_document(
+        pool.inner(),
+        source_document_id,
+        &source,
+        limit,
+    )
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ResolvedChunkMentionView {
+            matched_text: row.matched_text,
+            alias: row.alias,
+            span_start: row.span_start as i64,
+            span_end: row.span_end as i64,
+            target_id: row.target_id,
+            target_type: row.target_type,
+            target_title: row.target_title,
+            target_subject: row.target_subject,
+            page_number: row.page_number,
+            body_preview: row.body_preview,
+        })
+        .collect())
 }
 
 #[derive(serde::Serialize)]
@@ -2378,6 +2979,28 @@ async fn get_chunk_references(
     let mut out: Vec<ChunkReferenceView> = seen.into_values().collect();
     out.sort_by_key(|v| v.span_start);
     Ok(out)
+}
+
+#[tauri::command]
+async fn search_chunks_for_ai(
+    source_document_id: i64,
+    query: String,
+    limit: Option<usize>,
+    exclude_chunk_id: Option<i64>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<Vec<ChunkSearchResultView>, String> {
+    if source_document_id < 1 {
+        return Err(format!("invalid source_document_id {}", source_document_id));
+    }
+
+    search_chunks_for_ai_internal(
+        pool.inner(),
+        source_document_id,
+        &query,
+        limit.unwrap_or(5),
+        exclude_chunk_id.filter(|value| *value > 0),
+    )
+    .await
 }
 
 #[derive(serde::Serialize)]
@@ -4834,7 +5457,9 @@ pub fn run() {
             start_chunk_ai_stream,
             start_page_ai_stream,
             cancel_chunk_ai_stream,
+            resolve_chunk_mentions,
             get_chunk_references,
+            search_chunks_for_ai,
             get_chunk_preview,
             get_question_source_slices,
             get_proof_chunk_for_target,

@@ -11,7 +11,7 @@
 
 use log::{debug, info};
 use sqlx::{Row, SqlitePool};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const LOG_TARGET: &str = "gloss_lib::references";
 
@@ -36,6 +36,28 @@ pub struct ExtractedRef {
     pub span_start: usize,
     pub span_end: usize,
     pub ref_kind: RefKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct MentionSpan {
+    pub matched_text: String,
+    pub alias: String,
+    pub span_start: usize,
+    pub span_end: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct MentionResolution {
+    pub matched_text: String,
+    pub alias: String,
+    pub span_start: usize,
+    pub span_end: usize,
+    pub target_id: i64,
+    pub target_type: String,
+    pub target_title: Option<String>,
+    pub target_subject: Option<String>,
+    pub page_number: Option<i64>,
+    pub body_preview: Option<String>,
 }
 
 /// Document-wide alias index built from `chunk_aliases`. Cheap to construct;
@@ -206,6 +228,10 @@ fn overlaps_any(start: usize, end: usize, ranges: &[(usize, usize)]) -> bool {
     ranges.iter().any(|(s, e)| start < *e && *s < end)
 }
 
+fn is_mention_alias_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+}
+
 /// Byte ranges of the body where linkification must be skipped. Covers
 /// inline / display math and code blocks, mirroring the protection done by
 /// the frontend renderer in src/lib/chunkBody.ts.
@@ -326,6 +352,185 @@ fn compute_unsafe_ranges(body: &str) -> Vec<(usize, usize)> {
         i += 1;
     }
     ranges
+}
+
+/// Scan `source` for `@alias` mentions outside math/code regions. Mentions are
+/// single-token only in v1: letters/digits plus `.`, `-`, and `_`.
+pub fn extract_mentions(source: &str) -> Vec<MentionSpan> {
+    if source.is_empty() {
+        return Vec::new();
+    }
+
+    let unsafe_ranges = compute_unsafe_ranges(source);
+    let bytes = source.as_bytes();
+    let mut mentions: Vec<MentionSpan> = Vec::new();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] != b'@' {
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        if overlaps_any(start, start + 1, &unsafe_ranges) {
+            i += 1;
+            continue;
+        }
+
+        let previous = prev_byte(bytes, i);
+        if is_word_char_byte(previous) || previous == Some(b'@') {
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        let alias_start = i;
+        while i < bytes.len() && is_mention_alias_byte(bytes[i]) {
+            i += 1;
+        }
+        let alias_end = i;
+        if alias_end <= alias_start {
+            continue;
+        }
+        if overlaps_any(start, alias_end, &unsafe_ranges) {
+            continue;
+        }
+
+        let alias = &source[alias_start..alias_end];
+        if !alias.bytes().any(|byte| byte.is_ascii_alphanumeric()) {
+            continue;
+        }
+
+        mentions.push(MentionSpan {
+            matched_text: source[start..alias_end].to_string(),
+            alias: alias.to_string(),
+            span_start: start,
+            span_end: alias_end,
+        });
+    }
+
+    mentions
+}
+
+#[derive(Debug, Clone)]
+struct MentionTarget {
+    target_id: i64,
+    target_type: String,
+    target_title: Option<String>,
+    target_subject: Option<String>,
+    page_number: Option<i64>,
+    body_preview: Option<String>,
+}
+
+fn truncate_preview_text(source: &str, limit: usize) -> String {
+    let collapsed = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= limit {
+        return collapsed;
+    }
+
+    let mut out = String::new();
+    for ch in collapsed.chars().take(limit) {
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
+}
+
+pub async fn ensure_document_aliases(
+    pool: &SqlitePool,
+    document_id: i64,
+) -> Result<usize, String> {
+    backfill_aliases_from_titles(pool, document_id).await
+}
+
+pub async fn resolve_mentions_in_document(
+    pool: &SqlitePool,
+    document_id: i64,
+    source: &str,
+    limit: usize,
+) -> Result<Vec<MentionResolution>, String> {
+    ensure_document_aliases(pool, document_id).await?;
+
+    let mentions = extract_mentions(source);
+    if mentions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query(
+        "SELECT a.alias, c.id AS target_id, c.chunk_type, c.title, c.subject, \
+                p.page_number, \
+                COALESCE(NULLIF(TRIM(c.formatted_body_md), ''), NULLIF(TRIM(c.ocr_text), '')) AS body_markdown \
+         FROM chunk_aliases a \
+         JOIN chunks c ON c.id = a.chunk_id \
+         LEFT JOIN pages p ON p.id = c.page_id \
+         WHERE c.source_document_id = ?",
+    )
+    .bind(document_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut alias_targets: HashMap<String, Option<MentionTarget>> = HashMap::new();
+    for row in rows {
+        let alias: String = row.get("alias");
+        let key = alias.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+
+        let target = MentionTarget {
+            target_id: row.get("target_id"),
+            target_type: row.get("chunk_type"),
+            target_title: row.get("title"),
+            target_subject: row.get("subject"),
+            page_number: row.get("page_number"),
+            body_preview: row
+                .get::<Option<String>, _>("body_markdown")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|value| truncate_preview_text(&value, 240)),
+        };
+
+        match alias_targets.get_mut(&key) {
+            None => {
+                alias_targets.insert(key, Some(target));
+            }
+            Some(existing) => {
+                if let Some(existing_target) = existing {
+                    if existing_target.target_id != target.target_id {
+                        *existing = None;
+                    }
+                }
+            }
+        }
+    }
+
+    let max_results = if limit == 0 { usize::MAX } else { limit };
+    let mut resolved: Vec<MentionResolution> = Vec::new();
+    for mention in mentions {
+        if resolved.len() >= max_results {
+            break;
+        }
+        let key = mention.alias.trim().to_ascii_lowercase();
+        let Some(Some(target)) = alias_targets.get(&key) else {
+            continue;
+        };
+        resolved.push(MentionResolution {
+            matched_text: mention.matched_text,
+            alias: mention.alias,
+            span_start: mention.span_start,
+            span_end: mention.span_end,
+            target_id: target.target_id,
+            target_type: target.target_type.clone(),
+            target_title: target.target_title.clone(),
+            target_subject: target.target_subject.clone(),
+            page_number: target.page_number,
+            body_preview: target.body_preview.clone(),
+        });
+    }
+
+    Ok(resolved)
 }
 
 /// Extract a numeric label from the leading part of a chunk title.
@@ -704,5 +909,31 @@ mod tests {
             &body[r.span_start..r.span_end],
             "finite-dimensional vector space"
         );
+    }
+
+    #[test]
+    fn extracts_numeric_mention() {
+        let mentions = extract_mentions("Use @1.13 here.");
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].matched_text, "@1.13");
+        assert_eq!(mentions[0].alias, "1.13");
+    }
+
+    #[test]
+    fn skips_mentions_inside_inline_math() {
+        let mentions = extract_mentions("See $@1.13$ later.");
+        assert!(mentions.is_empty());
+    }
+
+    #[test]
+    fn skips_mentions_inside_code_fence() {
+        let mentions = extract_mentions("```\n@1.13\n```");
+        assert!(mentions.is_empty());
+    }
+
+    #[test]
+    fn skips_email_like_at_signs() {
+        let mentions = extract_mentions("write to foo@bar.com");
+        assert!(mentions.is_empty());
     }
 }
