@@ -31,13 +31,13 @@ Gloss is early-stage personal software — built by one person, used by that per
 - Multiple AI providers: Claude (Anthropic), Gemini, DeepSeek, OpenAI, Ollama (offline/local)
 - Batch chunking with live progress across all pages of a document
 - References system for cross-chunk linking
+- RAG over chunks — AI chat that can pull in related chunks from across all your sources, handling maths synonym and notation variation via semantic tags and embeddings
+- Android tablet support (Tauri's Android target is already wired up)
 
 **Planned:**
 - Progress tracking — complete / in-progress / incomplete status across all exercises in a document, with an overview per textbook
 - Personal glossary — self-explanations in your own words, attached to a chunk, feeding back into the AI as a learner model
 - Cross-source linking — an exercise can link to a worked example in different notes
-- RAG over chunks — AI chat that can pull in related chunks from across all your sources, handling maths synonym and notation variation via semantic tags and embeddings
-- Android tablet support (Tauri's Android target is already wired up)
 - Cross-device sync via Syncthing
 
 ---
@@ -48,12 +48,6 @@ Gloss is early-stage personal software — built by one person, used by that per
 |---|---|
 | Framework | [Tauri](https://tauri.app) — Rust backend, Svelte 5 frontend |
 | PDF rendering | pdfium (via `pdfium_render`) on a dedicated thread |
-| Database | SQLite via `sqlx` with automatic migrations |
-| AI (primary) | Claude Sonnet via Anthropic API |
-| AI (offline fallback) | Mathstral 7B via Ollama |
-| Embeddings | OpenAI `text-embedding-3-small` |
-| Math rendering | Typst |
-| Sync | Syncthing (external, user-managed) |
 
 PDF text extraction from pdfium is unreliable for mathematical content — rendered formulae and special characters come back garbled. The chunking pipeline uses a vision LLM to read page images directly, which produces clean text for maths.
 
@@ -61,7 +55,17 @@ PDF text extraction from pdfium is unreliable for mathematical content — rende
 
 ## Getting started
 
-Prerequisites: [Rust](https://rustup.rs), [Node.js](https://nodejs.org), the [Tauri prerequisites](https://tauri.app/start/prerequisites/) for your platform, and a copy of the pdfium shared library placed where Tauri expects it.
+Prerequisites: [Rust](https://rustup.rs), [Node.js](https://nodejs.org), and the [Tauri prerequisites](https://tauri.app/start/prerequisites/) for your platform.
+
+**pdfium** — the app requires the pdfium shared library at runtime. Download the prebuilt binary for your platform from [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries/releases/latest) and place it next to the compiled executable:
+
+| Platform | Archive | File to extract |
+|---|---|---|
+| Windows | `pdfium-win-x64.tgz` | `lib/pdfium.dll` → `src-tauri/pdfium.dll` |
+| macOS | `pdfium-mac-x64.tgz` | `lib/libpdfium.dylib` → `src-tauri/libpdfium.dylib` |
+| Linux | `pdfium-linux-x64.tgz` | `lib/libpdfium.so` → `src-tauri/libpdfium.so` |
+
+For development you also need to copy the file to `src-tauri/target/debug/` so it sits next to the dev binary. CI handles this automatically.
 
 ```bash
 # Install frontend dependencies
