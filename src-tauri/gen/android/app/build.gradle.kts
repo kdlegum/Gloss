@@ -13,6 +13,16 @@ val tauriProperties = Properties().apply {
     }
 }
 
+val keyProperties = Properties().apply {
+    val propFile = rootProject.file("key.properties")
+    if (propFile.exists()) {
+        propFile.inputStream().use { load(it) }
+    }
+}
+
+val hasReleaseSigning = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
+    .all { !keyProperties.getProperty(it).isNullOrBlank() }
+
 android {
     compileSdk = 36
     namespace = "com.gloss.app"
@@ -23,6 +33,16 @@ android {
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+    }
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = rootProject.file(keyProperties.getProperty("storeFile"))
+                storePassword = keyProperties.getProperty("storePassword")
+                keyAlias = keyProperties.getProperty("keyAlias")
+                keyPassword = keyProperties.getProperty("keyPassword")
+            }
+        }
     }
     buildTypes {
         getByName("debug") {
@@ -38,6 +58,9 @@ android {
         }
         getByName("release") {
             isMinifyEnabled = true
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
                     .plus(getDefaultProguardFile("proguard-android-optimize.txt"))

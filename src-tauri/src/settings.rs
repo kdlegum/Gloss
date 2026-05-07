@@ -32,10 +32,16 @@ pub const LOCAL_ONLY_DB_KEYS: [&str; 7] = [
 static LOCAL_SETTINGS_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct LocalSettings {
     pub device_id: Option<String>,
+    pub sync_folder_kind: Option<String>,
     pub sync_folder_path: Option<String>,
     pub last_sync_folder_path: Option<String>,
+    pub sync_folder_tree_uri: Option<String>,
+    pub last_sync_folder_tree_uri: Option<String>,
+    pub sync_folder_label: Option<String>,
+    pub last_sync_folder_label: Option<String>,
     pub sync_dirty: bool,
     pub last_exported_revision: Option<i64>,
     pub last_imported_revision: Option<i64>,
@@ -76,7 +82,12 @@ pub async fn init_local_store(data_dir: &Path, pool: &SqlitePool) -> Result<(), 
                             .or_insert_with(|| value.to_string());
                     }
                     LOCAL_SYNC_FOLDER_PATH => {
-                        if local.sync_folder_path.as_deref().unwrap_or_default().is_empty() {
+                        if local
+                            .sync_folder_path
+                            .as_deref()
+                            .unwrap_or_default()
+                            .is_empty()
+                        {
                             local.sync_folder_path = Some(value.to_string());
                         }
                     }
@@ -226,8 +237,13 @@ fn ensure_device_id(settings: &mut LocalSettings) {
 impl LocalSettings {
     fn is_default(&self) -> bool {
         self.device_id.is_none()
+            && self.sync_folder_kind.is_none()
             && self.sync_folder_path.is_none()
             && self.last_sync_folder_path.is_none()
+            && self.sync_folder_tree_uri.is_none()
+            && self.last_sync_folder_tree_uri.is_none()
+            && self.sync_folder_label.is_none()
+            && self.last_sync_folder_label.is_none()
             && !self.sync_dirty
             && self.last_exported_revision.is_none()
             && self.last_imported_revision.is_none()

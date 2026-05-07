@@ -76,6 +76,9 @@
   const remoteIsNewer = $derived(remoteRevision !== null && remoteRevision > localRevision);
   const hasSyncConflicts = $derived((syncState?.conflicts.length ?? 0) > 0);
   const hasMissingPdfs = $derived((syncState?.missing_pdfs.length ?? 0) > 0);
+  const syncFolderDisplay = $derived(
+    syncState?.folder_label || syncFolderInput || syncState?.folder_path || "No folder selected",
+  );
   const canSyncNow = $derived(
     !!syncState?.enabled && !(syncState?.read_only ?? false) && !hasSyncConflicts && !hasMissingPdfs,
   );
@@ -321,9 +324,9 @@
       <p class="sync-message">{syncState?.message ?? "Choose a local folder to connect Gloss with Syncthing."}</p>
 
       <div class="sync-folder-row">
-        <code>{syncFolderInput || syncState?.folder_path || "No folder selected"}</code>
+        <code>{syncFolderDisplay}</code>
         <button type="button" onclick={() => void chooseSyncFolder()} disabled={syncBusy}>
-          {syncBusy && syncMode === "choose" ? "Connecting..." : "Choose"}
+          {syncBusy && syncMode === "choose" ? "Connecting..." : syncState?.running_on_android ? "Choose folder" : "Choose"}
         </button>
         <button type="button" onclick={() => void enableSyncFolder()} disabled={syncBusy || !(syncFolderInput || syncState?.folder_path)}>
           {syncBusy && syncMode === "enable" ? "Connecting..." : syncState?.enabled ? "Reconnect" : "Connect"}

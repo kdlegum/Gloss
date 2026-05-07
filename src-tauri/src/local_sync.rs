@@ -1,9 +1,13 @@
+#[cfg(target_os = "android")]
+use crate::android_sync;
 use crate::settings;
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::path::{Path, PathBuf};
 use tauri::Manager;
+#[cfg(desktop)]
 use tauri_plugin_dialog::DialogExt;
+#[cfg(desktop)]
 use tauri_plugin_fs::FilePath;
 
 const SYNC_SCHEMA_VERSION: i64 = 1;
@@ -17,7 +21,10 @@ const FNV_PRIME: u64 = 0x100000001b3;
 pub struct SyncState {
     pub setup_status: String,
     pub enabled: bool,
+    pub folder_kind: String,
     pub folder_path: Option<String>,
+    pub folder_label: Option<String>,
+    pub running_on_android: bool,
     pub folder_ready: bool,
     pub device_id: String,
     pub dirty: bool,
@@ -80,9 +87,302 @@ struct SnapshotDocumentRow {
     title: String,
 }
 
+#[derive(Clone)]
+enum SyncFolder {
+    Path(PathBuf),
+    #[cfg(target_os = "android")]
+    AndroidTree {
+        tree_uri: String,
+        label: String,
+    },
+}
+
+#[derive(Clone)]
+struct SyncFileEntry {
+    path: String,
+    is_dir: bool,
+}
+
+impl SyncFolder {
+    fn from_local(local: &settings::LocalSettings) -> Option<Self> {
+        #[cfg(target_os = "android")]
+        {
+            if local.sync_folder_kind.as_deref() == Some("android_tree") {
+                let tree_uri = local
+                    .sync_folder_tree_uri
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())?;
+                return Some(Self::AndroidTree {
+                    tree_uri: tree_uri.to_string(),
+                    label: local
+                        .sync_folder_label
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("Gloss Sync")
+                        .to_string(),
+                });
+            }
+        }
+
+        local
+            .sync_folder_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|path| Self::Path(PathBuf::from(path)))
+    }
+
+    fn from_last_local(local: &settings::LocalSettings) -> Option<Self> {
+        #[cfg(target_os = "android")]
+        {
+            if let Some(tree_uri) = local
+                .last_sync_folder_tree_uri
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(Self::AndroidTree {
+                    tree_uri: tree_uri.to_string(),
+                    label: local
+                        .last_sync_folder_label
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("Gloss Sync")
+                        .to_string(),
+                });
+            }
+        }
+
+        local
+            .last_sync_folder_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|path| Self::Path(PathBuf::from(path)))
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Path(_) => "path",
+            #[cfg(target_os = "android")]
+            Self::AndroidTree { .. } => "android_tree",
+        }
+    }
+
+    fn display_path(&self) -> String {
+        match self {
+            Self::Path(path) => path.to_string_lossy().to_string(),
+            #[cfg(target_os = "android")]
+            Self::AndroidTree { tree_uri, .. } => tree_uri.clone(),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Path(path) => path.to_string_lossy().to_string(),
+            #[cfg(target_os = "android")]
+            Self::AndroidTree { label, .. } => label.clone(),
+        }
+    }
+
+    fn is_ready(&self) -> Result<bool, String> {
+        match self {
+            Self::Path(path) => Ok(path.is_dir()),
+            #[cfg(target_os = "android")]
+            Self::AndroidTree { tree_uri, .. } => android_sync::folder_ready(tree_uri),
+        }
+    }
+
+    fn ensure_dir(&self, relative: &str) -> Result<(), String> {
+        match self {
+            Self::Path(path) => {
+                std::fs::create_dir_all(path.join(relative)).map_err(|e| e.to_string())
+            }
+            #[cfg(target_os = "android")]
+            Self::AndroidTree { tree_uri, .. } => android_sync::ensure_dir(tree_uri, relative),
+        }
+    }
+
+    fn file_exists(&self, relative: &str) -> Result<bool, String> {
+        Ok(self.file_entry(relative)?.is_some())
+    }
+
+    fn file_entry(&self, relative: &str) -> Result<Option<SyncFileEntry>, String> {
+        match self {
+            Self::Path(path) => {
+                let candidate = path.join(relative);
+                match std::fs::metadata(&candidate) {
+                    Ok(metadata) => Ok(Some(SyncFileEntry {
+                        path: relative.to_string(),
+                        is_dir: metadata.is_dir(),
+                    })),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(err) => Err(err.to_string()),
+                }
+            }
+            #[cfg(target_os = "android")]
+            Self::AndroidTree { tree_uri, .. } => Ok(android_sync::exists(tree_uri, relative)?
+                .map(|(is_dir, _)| SyncFileEntry {
+                    path: relative.to_string(),
+                    is_dir,
+                })),
+        }
+    }
+
+    fn read_text(&self, relative: &str) -> Result<Option<String>, String> {
+        match self {
+            Self::Path(path) => {
+                let path = path.join(relative);
+                match std::fs::read_to_string(path) {
+                    Ok(contents) => Ok(Some(contents)),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(err) => Err(err.to_string()),
+                }
+            }
+            #[cfg(target_os = "android")]
+            Self::AndroidTree { tree_uri, .. } => {
+                if !android_sync::exists(tree_uri, relative)?.is_some_and(|(is_dir, _)| !is_dir) {
+                    return Ok(None);
+                }
+                android_sync::read_text(tree_uri, relative).map(Some)
+            }
+        }
+    }
+
+    fn write_text_atomic(&self, relative: &str, contents: &str) -> Result<(), String> {
+        match self {
+            Self::Path(path) => {
+                let path = path.join(relative);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                let tmp = sibling_tmp_path(&path);
+                std::fs::write(&tmp, contents).map_err(|e| e.to_string())?;
+                publish_path_file(&tmp, &path)
+            }
+            #[cfg(target_os = "android")]
+            Self::AndroidTree { tree_uri, .. } => {
+                android_sync::write_text_atomic(tree_uri, relative, contents)
+            }
+        }
+    }
+
+    fn list_recursive(&self, relative: &str) -> Result<Vec<SyncFileEntry>, String> {
+        match self {
+            Self::Path(root) => {
+                let start = root.join(relative);
+                let mut entries = Vec::new();
+                collect_file_entries(root, &start, &mut entries)?;
+                Ok(entries)
+            }
+            #[cfg(target_os = "android")]
+            Self::AndroidTree { tree_uri, .. } => {
+                if !relative.trim_matches('/').is_empty()
+                    && !android_sync::exists(tree_uri, relative)?.is_some_and(|(is_dir, _)| is_dir)
+                {
+                    return Ok(Vec::new());
+                }
+                Ok(android_sync::list_recursive(tree_uri, relative)?
+                    .into_iter()
+                    .map(|entry| SyncFileEntry {
+                        path: entry.path,
+                        is_dir: entry.is_dir,
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    fn copy_app_file_to_sync(
+        &self,
+        source: &Path,
+        destination_relative: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Path(root) => copy_path_file_if_changed(source, &root.join(destination_relative)),
+            #[cfg(target_os = "android")]
+            Self::AndroidTree { tree_uri, .. } => {
+                let source_len = source.metadata().map_err(|e| e.to_string())?.len();
+                if android_sync::exists(tree_uri, destination_relative)?
+                    .is_some_and(|(is_dir, size)| !is_dir && size == source_len)
+                {
+                    return Ok(());
+                }
+                android_sync::copy_path_to_tree(
+                    tree_uri,
+                    &source.to_string_lossy(),
+                    destination_relative,
+                )
+            }
+        }
+    }
+
+    fn publish_app_file_to_sync(
+        &self,
+        source: &Path,
+        destination_relative: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Path(root) => {
+                let destination = root.join(destination_relative);
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                let tmp = sibling_tmp_path(&destination);
+                std::fs::copy(source, &tmp).map_err(|e| e.to_string())?;
+                publish_path_file(&tmp, &destination)
+            }
+            #[cfg(target_os = "android")]
+            Self::AndroidTree { tree_uri, .. } => android_sync::copy_path_to_tree(
+                tree_uri,
+                &source.to_string_lossy(),
+                destination_relative,
+            ),
+        }
+    }
+
+    fn copy_sync_file_to_app(
+        &self,
+        source_relative: &str,
+        destination: &Path,
+    ) -> Result<(), String> {
+        match self {
+            Self::Path(root) => copy_path_file_if_changed(&root.join(source_relative), destination),
+            #[cfg(target_os = "android")]
+            Self::AndroidTree { tree_uri, .. } => android_sync::copy_tree_to_path(
+                tree_uri,
+                source_relative,
+                &destination.to_string_lossy(),
+            ),
+        }
+    }
+
+    fn hash_file(&self, relative: &str) -> Result<String, String> {
+        match self {
+            Self::Path(root) => hash_path_file(&root.join(relative)),
+            #[cfg(target_os = "android")]
+            Self::AndroidTree { tree_uri, .. } => android_sync::hash_file(tree_uri, relative),
+        }
+    }
+
+    fn snapshot_display_path(&self) -> String {
+        match self {
+            Self::Path(root) => root
+                .join(SNAPSHOT_RELATIVE_PATH)
+                .to_string_lossy()
+                .to_string(),
+            #[cfg(target_os = "android")]
+            Self::AndroidTree { label, .. } => format!("{label}/{SNAPSHOT_RELATIVE_PATH}"),
+        }
+    }
+}
+
 pub fn mark_dirty() {
     if let Err(err) = settings::update_local_settings(|local| {
-        if local.sync_folder_path.is_some() {
+        if SyncFolder::from_local(local).is_some() {
             local.sync_dirty = true;
         }
     }) {
@@ -92,11 +392,10 @@ pub fn mark_dirty() {
 
 pub fn guard_write() -> Result<(), String> {
     let local = settings::read_local_settings()?;
-    let Some(folder_path) = local.sync_folder_path else {
+    let Some(folder) = SyncFolder::from_local(&local) else {
         return Ok(());
     };
-    let folder = PathBuf::from(folder_path);
-    if !folder.is_dir() {
+    if !folder.is_ready()? {
         return Ok(());
     }
     let device_id = local
@@ -194,11 +493,19 @@ pub async fn get_sync_state(app: tauri::AppHandle, pool: &SqlitePool) -> Result<
         }
     };
 
-    let Some(folder_path) = local.sync_folder_path.clone() else {
+    let Some(folder) = SyncFolder::from_local(&local) else {
+        let last_folder = SyncFolder::from_last_local(&local);
         return Ok(SyncState {
             setup_status: "not_configured".to_string(),
             enabled: false,
-            folder_path: local.last_sync_folder_path.clone(),
+            folder_kind: last_folder
+                .as_ref()
+                .map(SyncFolder::kind)
+                .unwrap_or("path")
+                .to_string(),
+            folder_path: last_folder.as_ref().map(SyncFolder::display_path),
+            folder_label: last_folder.as_ref().map(SyncFolder::label),
+            running_on_android: cfg!(target_os = "android"),
             folder_ready: false,
             device_id,
             dirty: local.sync_dirty,
@@ -214,8 +521,7 @@ pub async fn get_sync_state(app: tauri::AppHandle, pool: &SqlitePool) -> Result<
         });
     };
 
-    let folder = PathBuf::from(&folder_path);
-    let folder_ready = folder.is_dir();
+    let folder_ready = folder.is_ready()?;
     let manifest = if folder_ready {
         read_manifest(&folder)?
     } else {
@@ -260,10 +566,7 @@ pub async fn get_sync_state(app: tauri::AppHandle, pool: &SqlitePool) -> Result<
                 hash: hash.clone(),
                 updated_at_unix: manifest.updated_at_unix,
                 updated_by: manifest.updated_by.clone().unwrap_or_default(),
-                path: folder
-                    .join(SNAPSHOT_RELATIVE_PATH)
-                    .to_string_lossy()
-                    .to_string(),
+                path: folder.snapshot_display_path(),
             })
     });
     let local_tip = local
@@ -299,7 +602,10 @@ pub async fn get_sync_state(app: tauri::AppHandle, pool: &SqlitePool) -> Result<
     Ok(SyncState {
         setup_status: setup_status.to_string(),
         enabled: true,
-        folder_path: Some(folder_path),
+        folder_kind: folder.kind().to_string(),
+        folder_path: Some(folder.display_path()),
+        folder_label: Some(folder.label()),
+        running_on_android: cfg!(target_os = "android"),
         folder_ready,
         device_id,
         dirty: local.sync_dirty,
@@ -322,21 +628,40 @@ pub async fn choose_sync_folder(app: tauri::AppHandle) -> Result<String, String>
         return store_picked_sync_folder(picked);
     }
 
-    #[cfg(mobile)]
+    #[cfg(target_os = "android")]
     {
         let _ = app;
-        Err("Folder picking is not available on Android yet. Enter the Syncthing folder path manually.".to_string())
+        let picked = android_sync::pick_folder()?;
+        settings::update_local_settings(|local| {
+            local.sync_folder_kind = Some("android_tree".to_string());
+            local.sync_folder_tree_uri = Some(picked.tree_uri.clone());
+            local.last_sync_folder_tree_uri = Some(picked.tree_uri.clone());
+            local.sync_folder_label = Some(picked.label.clone());
+            local.last_sync_folder_label = Some(picked.label.clone());
+            local.sync_folder_path = None;
+        })?;
+        Ok(picked.tree_uri)
+    }
+
+    #[cfg(all(mobile, not(target_os = "android")))]
+    {
+        let _ = app;
+        Err("Folder picking is not available on this mobile platform yet.".to_string())
     }
 }
 
+#[cfg(desktop)]
 fn store_picked_sync_folder(picked: Option<FilePath>) -> Result<String, String> {
     match picked {
         Some(FilePath::Path(path)) => {
             let folder = normalize_folder_path(&path.to_string_lossy())?;
             settings::update_local_settings(|local| {
                 let folder_path = folder.to_string_lossy().to_string();
+                local.sync_folder_kind = Some("path".to_string());
                 local.sync_folder_path = Some(folder_path.clone());
                 local.last_sync_folder_path = Some(folder_path);
+                local.sync_folder_tree_uri = None;
+                local.sync_folder_label = None;
             })?;
             Ok(folder.to_string_lossy().to_string())
         }
@@ -352,21 +677,33 @@ pub async fn enable_sync_folder(
     pool: &SqlitePool,
     folder_path: String,
 ) -> Result<SyncState, String> {
-    let folder = normalize_folder_path(&folder_path)?;
-    std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+    let folder = folder_from_enable_input(&folder_path)?;
     initialise_sync_folder(&folder)?;
 
     let had_snapshot = read_manifest(&folder)?
         .and_then(|manifest| manifest.snapshot_hash)
         .is_some();
 
-    settings::update_local_settings(|local| {
-        let folder_path = folder.to_string_lossy().to_string();
-        local.sync_folder_path = Some(folder_path.clone());
-        local.last_sync_folder_path = Some(folder_path);
+    settings::update_local_settings(|local| match &folder {
+        SyncFolder::Path(path) => {
+            let folder_path = path.to_string_lossy().to_string();
+            local.sync_folder_kind = Some("path".to_string());
+            local.sync_folder_path = Some(folder_path.clone());
+            local.last_sync_folder_path = Some(folder_path);
+            local.sync_folder_tree_uri = None;
+            local.sync_folder_label = None;
+        }
+        #[cfg(target_os = "android")]
+        SyncFolder::AndroidTree { tree_uri, label } => {
+            local.sync_folder_kind = Some("android_tree".to_string());
+            local.sync_folder_tree_uri = Some(tree_uri.clone());
+            local.last_sync_folder_tree_uri = Some(tree_uri.clone());
+            local.sync_folder_label = Some(label.clone());
+            local.last_sync_folder_label = Some(label.clone());
+            local.sync_folder_path = None;
+        }
     })?;
-    let folder_path = folder.to_string_lossy().to_string();
-    settings::save_sync_folder_fallback(pool, Some(&folder_path), Some(&folder_path)).await?;
+    save_sync_folder_fallback_for_backend(pool, &folder).await?;
 
     if !had_snapshot {
         sync_now(app.clone(), pool, true).await?;
@@ -379,13 +716,15 @@ pub async fn enable_sync_folder(
 
 pub async fn disable_sync(app: tauri::AppHandle, pool: &SqlitePool) -> Result<SyncState, String> {
     let local = settings::update_local_settings(|local| {
+        local.sync_folder_kind = None;
         local.sync_folder_path = None;
+        local.sync_folder_tree_uri = None;
+        local.sync_folder_label = None;
         local.sync_dirty = false;
         local.last_exported_revision = None;
         local.last_imported_revision = None;
     })?;
-    settings::save_sync_folder_fallback(pool, None, local.last_sync_folder_path.as_deref())
-        .await?;
+    settings::save_sync_folder_fallback(pool, None, local.last_sync_folder_path.as_deref()).await?;
     get_sync_state(app, pool).await
 }
 
@@ -419,7 +758,7 @@ pub async fn sync_now(
         .max(local.last_imported_revision)
         .unwrap_or(0);
     if local.sync_dirty && manifest.current_revision > local_tip && !force {
-        create_local_conflict_backup(&folder, pool).await?;
+        create_local_conflict_backup(&app, &folder, pool).await?;
         return Err("The sync folder has a newer snapshot and this device has local edits. A recovery DB was saved under conflicts/; import or resolve before syncing.".to_string());
     }
 
@@ -465,7 +804,7 @@ pub async fn import_latest_sync_snapshot(
         .max(local.last_imported_revision)
         .unwrap_or(0);
     if local.sync_dirty && manifest.current_revision > local_tip {
-        create_local_conflict_backup(&folder, pool).await?;
+        create_local_conflict_backup(&app, &folder, pool).await?;
         return Err("This device has unsynced edits and the sync folder is newer. A recovery DB was saved under conflicts/.".to_string());
     }
     if !ignore_conflicts && !local.sync_dirty && manifest.current_revision <= local_tip {
@@ -477,7 +816,8 @@ pub async fn import_latest_sync_snapshot(
     if staged_path.exists() {
         std::fs::remove_file(&staged_path).map_err(|e| e.to_string())?;
     }
-    std::fs::copy(folder.join(SNAPSHOT_RELATIVE_PATH), &staged_path)
+    folder
+        .copy_sync_file_to_app(SNAPSHOT_RELATIVE_PATH, &staged_path)
         .map_err(|e| format!("failed to stage sync snapshot: {e}"))?;
 
     let staged_url = format!("sqlite://{}?mode=rwc", staged_path.display());
@@ -492,7 +832,7 @@ pub async fn import_latest_sync_snapshot(
         .map_err(|e| e.to_string())?;
 
     let snapshot_docs = load_snapshot_document_rows(&staged_pool).await?;
-    let missing = missing_pdfs_for_snapshot_rows(&folder, &snapshot_docs);
+    let missing = missing_pdfs_for_snapshot_rows(&folder, &snapshot_docs)?;
     if !missing.is_empty() {
         staged_pool.close().await;
         let _ = std::fs::remove_file(&staged_path);
@@ -517,8 +857,7 @@ pub async fn import_latest_sync_snapshot(
         local.sync_dirty = false;
         local.last_imported_revision = Some(manifest.current_revision);
     })?;
-    let folder_path = folder.to_string_lossy().to_string();
-    settings::save_sync_folder_fallback(pool, Some(&folder_path), Some(&folder_path)).await?;
+    save_sync_folder_fallback_for_backend(pool, &folder).await?;
     write_device_presence(&folder, false)?;
     get_sync_state(app, pool).await
 }
@@ -546,11 +885,10 @@ pub async fn auto_sync_once(
     allow_import: bool,
 ) -> Result<AutoSyncResult, String> {
     let local = settings::read_local_settings()?;
-    let Some(folder_path) = local.sync_folder_path.clone() else {
+    let Some(folder) = SyncFolder::from_local(&local) else {
         return auto_sync_result(app, pool, "idle", None).await;
     };
-    let folder = normalize_folder_path(&folder_path)?;
-    if !folder.is_dir() {
+    if !folder.is_ready()? {
         return auto_sync_result(app, pool, "idle", None).await;
     }
 
@@ -684,9 +1022,25 @@ async fn auto_sync_result(
     })
 }
 
+async fn save_sync_folder_fallback_for_backend(
+    pool: &SqlitePool,
+    folder: &SyncFolder,
+) -> Result<(), String> {
+    match folder {
+        SyncFolder::Path(path) => {
+            let folder_path = path.to_string_lossy().to_string();
+            settings::save_sync_folder_fallback(pool, Some(&folder_path), Some(&folder_path)).await
+        }
+        #[cfg(target_os = "android")]
+        SyncFolder::AndroidTree { .. } => {
+            settings::save_sync_folder_fallback(pool, None, None).await
+        }
+    }
+}
+
 async fn export_snapshot(
     app: &tauri::AppHandle,
-    folder: &Path,
+    folder: &SyncFolder,
     pool: &SqlitePool,
     revision: i64,
 ) -> Result<(), String> {
@@ -720,9 +1074,9 @@ async fn export_snapshot(
     }
     tmp_pool.close().await;
 
-    let snapshot_path = folder.join(SNAPSHOT_RELATIVE_PATH);
-    publish_file(&tmp_db, &snapshot_path)?;
-    let hash = hash_file(&snapshot_path)?;
+    folder.publish_app_file_to_sync(&tmp_db, SNAPSHOT_RELATIVE_PATH)?;
+    let hash = folder.hash_file(SNAPSHOT_RELATIVE_PATH)?;
+    let _ = std::fs::remove_file(&tmp_db);
     let mut manifest = ensure_manifest(folder)?;
     manifest.current_revision = revision;
     manifest.snapshot_hash = Some(hash);
@@ -736,7 +1090,7 @@ async fn export_snapshot(
 async fn try_adopt_matching_remote_revision(
     app: &tauri::AppHandle,
     pool: &SqlitePool,
-    folder: &Path,
+    folder: &SyncFolder,
     manifest: &SyncManifest,
 ) -> Result<bool, String> {
     let Some(remote_hash) = manifest.snapshot_hash.as_deref() else {
@@ -759,7 +1113,7 @@ async fn try_adopt_matching_remote_revision(
     let matches = if local_hash == remote_hash {
         true
     } else {
-        match local_content_matches_remote_snapshot(pool, folder).await {
+        match local_content_matches_remote_snapshot(app, pool, folder).await {
             Ok(matches) => matches,
             Err(err) => {
                 log::warn!(
@@ -788,13 +1142,22 @@ async fn try_adopt_matching_remote_revision(
 }
 
 async fn local_content_matches_remote_snapshot(
+    app: &tauri::AppHandle,
     pool: &SqlitePool,
-    folder: &Path,
+    folder: &SyncFolder,
 ) -> Result<bool, String> {
-    let snapshot_path = folder.join(SNAPSHOT_RELATIVE_PATH);
-    if !snapshot_path.exists() {
+    if !folder.file_exists(SNAPSHOT_RELATIVE_PATH)? {
         return Ok(false);
     }
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let snapshot_path = data_dir.join(format!(
+        "gloss-sync-remote-compare-{}.tmp.db",
+        settings::make_local_id("snapshot")
+    ));
+    if snapshot_path.exists() {
+        std::fs::remove_file(&snapshot_path).map_err(|e| e.to_string())?;
+    }
+    folder.copy_sync_file_to_app(SNAPSHOT_RELATIVE_PATH, &snapshot_path)?;
 
     let snapshot_url = format!("sqlite://{}?mode=rwc", snapshot_path.display());
     let snapshot_pool = SqlitePoolOptions::new()
@@ -806,6 +1169,7 @@ async fn local_content_matches_remote_snapshot(
     let local_hash = database_content_hash(pool).await;
     let snapshot_hash = database_content_hash(&snapshot_pool).await;
     snapshot_pool.close().await;
+    let _ = std::fs::remove_file(&snapshot_path);
 
     Ok(local_hash? == snapshot_hash?)
 }
@@ -906,7 +1270,7 @@ async fn comparable_local_snapshot_hash(
         }
         tmp_pool.close().await;
 
-        hash_file(&tmp_db)
+        hash_path_file(&tmp_db)
     }
     .await;
 
@@ -966,7 +1330,7 @@ async fn normalize_document_pdfs(app: &tauri::AppHandle, pool: &SqlitePool) -> R
 
 async fn copy_local_pdfs_to_sync(
     app: &tauri::AppHandle,
-    folder: &Path,
+    folder: &SyncFolder,
     pool: &SqlitePool,
 ) -> Result<(), String> {
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -981,22 +1345,20 @@ async fn copy_local_pdfs_to_sync(
         if !source.exists() {
             return Err(format!("PDF for {title:?} is missing locally: {file_path}"));
         }
-        let destination = folder.join(&file_path);
-        copy_file_if_changed(&source, &destination)?;
+        folder.copy_app_file_to_sync(&source, &file_path)?;
     }
     Ok(())
 }
 
 fn copy_sync_pdfs_to_local(
     app: &tauri::AppHandle,
-    folder: &Path,
+    folder: &SyncFolder,
     docs: &[SnapshotDocumentRow],
 ) -> Result<(), String> {
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     for doc in docs {
-        let source = folder.join(&doc.file_path);
         let destination = data_dir.join(&doc.file_path);
-        copy_file_if_changed(&source, &destination)?;
+        folder.copy_sync_file_to_app(&doc.file_path, &destination)?;
     }
     Ok(())
 }
@@ -1017,19 +1379,25 @@ async fn load_snapshot_document_rows(
         .collect())
 }
 
-fn missing_pdfs_for_snapshot_rows(folder: &Path, docs: &[SnapshotDocumentRow]) -> Vec<String> {
-    docs.iter()
-        .filter(|doc| !folder.join(&doc.file_path).exists())
-        .map(|doc| format!("{} ({})", doc.title, doc.file_path))
-        .collect()
+fn missing_pdfs_for_snapshot_rows(
+    folder: &SyncFolder,
+    docs: &[SnapshotDocumentRow],
+) -> Result<Vec<String>, String> {
+    let mut missing = Vec::new();
+    for doc in docs {
+        if !folder.file_exists(&doc.file_path)? {
+            missing.push(format!("{} ({})", doc.title, doc.file_path));
+        }
+    }
+    Ok(missing)
 }
 
 async fn missing_sync_pdfs_for_current_db(
-    folder: &Path,
+    folder: &SyncFolder,
     pool: &SqlitePool,
 ) -> Result<Vec<String>, String> {
     let docs = load_snapshot_document_rows(pool).await?;
-    Ok(missing_pdfs_for_snapshot_rows(folder, &docs))
+    missing_pdfs_for_snapshot_rows(folder, &docs)
 }
 
 async fn local_library_has_documents(pool: &SqlitePool) -> Result<bool, String> {
@@ -1040,26 +1408,34 @@ async fn local_library_has_documents(pool: &SqlitePool) -> Result<bool, String> 
     Ok(count > 0)
 }
 
-async fn create_local_conflict_backup(folder: &Path, pool: &SqlitePool) -> Result<(), String> {
-    let conflicts_dir = folder.join("conflicts");
-    std::fs::create_dir_all(&conflicts_dir).map_err(|e| e.to_string())?;
+async fn create_local_conflict_backup(
+    app: &tauri::AppHandle,
+    folder: &SyncFolder,
+    pool: &SqlitePool,
+) -> Result<(), String> {
+    folder.ensure_dir("conflicts")?;
     let device_id = settings::local_device_id()?;
-    let backup = conflicts_dir.join(format!("{device_id}-{}.db", now_unix()));
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let backup = data_dir.join(format!("{device_id}-{}.conflict.tmp.db", now_unix()));
+    if backup.exists() {
+        std::fs::remove_file(&backup).map_err(|e| e.to_string())?;
+    }
     sqlx::query("VACUUM INTO ?")
         .bind(backup.to_string_lossy().to_string())
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
+    let relative = format!("conflicts/{device_id}-{}.db", now_unix());
+    folder.copy_app_file_to_sync(&backup, &relative)?;
+    let _ = std::fs::remove_file(&backup);
     Ok(())
 }
 
-fn configured_folder() -> Result<PathBuf, String> {
+fn configured_folder() -> Result<SyncFolder, String> {
     let local = settings::read_local_settings()?;
-    let path = local
-        .sync_folder_path
-        .or(local.last_sync_folder_path)
-        .ok_or_else(|| "Local sync is not configured yet.".to_string())?;
-    normalize_folder_path(&path)
+    SyncFolder::from_local(&local)
+        .or_else(|| SyncFolder::from_last_local(&local))
+        .ok_or_else(|| "Local sync is not configured yet.".to_string())
 }
 
 fn normalize_folder_path(path: &str) -> Result<PathBuf, String> {
@@ -1070,11 +1446,50 @@ fn normalize_folder_path(path: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(path))
 }
 
-fn initialise_sync_folder(folder: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(folder.join("library")).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(folder.join("pdfs")).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(folder.join("devices")).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(folder.join("conflicts")).map_err(|e| e.to_string())?;
+fn folder_from_enable_input(input: &str) -> Result<SyncFolder, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("sync folder path was empty".to_string());
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        if trimmed.starts_with("content://") {
+            let local = settings::read_local_settings()?;
+            let label = local
+                .sync_folder_label
+                .or(local.last_sync_folder_label)
+                .unwrap_or_else(|| "Gloss Sync".to_string());
+            return Ok(SyncFolder::AndroidTree {
+                tree_uri: trimmed.to_string(),
+                label,
+            });
+        }
+        let local = settings::read_local_settings()?;
+        if let Some(folder) = SyncFolder::from_local(&local) {
+            if folder.kind() == "android_tree"
+                && (trimmed == folder.display_path() || trimmed == folder.label())
+            {
+                return Ok(folder);
+            }
+        }
+    }
+
+    normalize_folder_path(trimmed).map(SyncFolder::Path)
+}
+
+fn initialise_sync_folder(folder: &SyncFolder) -> Result<(), String> {
+    match folder {
+        SyncFolder::Path(path) => {
+            std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+        }
+        #[cfg(target_os = "android")]
+        SyncFolder::AndroidTree { .. } => {}
+    }
+    folder.ensure_dir("library")?;
+    folder.ensure_dir("pdfs")?;
+    folder.ensure_dir("devices")?;
+    folder.ensure_dir("conflicts")?;
     write_stignore(folder)?;
     if read_manifest(folder)?.is_none() {
         write_manifest(
@@ -1092,38 +1507,29 @@ fn initialise_sync_folder(folder: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn ensure_manifest(folder: &Path) -> Result<SyncManifest, String> {
+fn ensure_manifest(folder: &SyncFolder) -> Result<SyncManifest, String> {
     initialise_sync_folder(folder)?;
     read_manifest(folder)?.ok_or_else(|| "sync manifest is missing".to_string())
 }
 
-fn read_manifest(folder: &Path) -> Result<Option<SyncManifest>, String> {
-    let path = folder.join(MANIFEST_FILE);
-    if !path.exists() {
+fn read_manifest(folder: &SyncFolder) -> Result<Option<SyncManifest>, String> {
+    let Some(contents) = folder.read_text(MANIFEST_FILE)? else {
         return Ok(None);
-    }
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.to_string()),
     };
-    serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+    serde_json::from_str(&contents).map(Some).map_err(|e| {
         format!(
             "failed to read Gloss sync manifest at {}: {e}",
-            path.display()
+            folder.label()
         )
     })
 }
 
-fn write_manifest(folder: &Path, manifest: &SyncManifest) -> Result<(), String> {
-    let path = folder.join(MANIFEST_FILE);
-    let tmp = folder.join(".gloss-sync.tmp.json");
-    let bytes = serde_json::to_vec_pretty(manifest).map_err(|e| e.to_string())?;
-    std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
-    publish_file(&tmp, &path)
+fn write_manifest(folder: &SyncFolder, manifest: &SyncManifest) -> Result<(), String> {
+    let contents = serde_json::to_string_pretty(manifest).map_err(|e| e.to_string())?;
+    folder.write_text_atomic(MANIFEST_FILE, &contents)
 }
 
-fn write_stignore(folder: &Path) -> Result<(), String> {
+fn write_stignore(folder: &SyncFolder) -> Result<(), String> {
     let contents = "\
 // Managed by Gloss. Syncthing keeps .stignore local to each device.
 (?d)library/*.tmp
@@ -1139,29 +1545,19 @@ fn write_stignore(folder: &Path) -> Result<(), String> {
 Thumbs.db
 desktop.ini
 ";
-    std::fs::write(folder.join(".stignore"), contents).map_err(|e| e.to_string())
+    folder.write_text_atomic(".stignore", contents)
 }
 
-fn read_devices(folder: &Path) -> Result<Vec<SyncDevicePresence>, String> {
-    let devices_dir = folder.join("devices");
-    if !devices_dir.exists() {
-        return Ok(Vec::new());
-    }
+fn read_devices(folder: &SyncFolder) -> Result<Vec<SyncDevicePresence>, String> {
     let mut devices = Vec::new();
-    let entries = match std::fs::read_dir(devices_dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err.to_string()),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
+    for entry in folder.list_recursive("devices")? {
+        if entry.is_dir || !entry.path.ends_with(".json") {
             continue;
         }
-        let Ok(bytes) = std::fs::read(entry.path()) else {
+        let Some(contents) = folder.read_text(&entry.path)? else {
             continue;
         };
-        if let Ok(device) = serde_json::from_slice::<SyncDevicePresence>(&bytes) {
+        if let Ok(device) = serde_json::from_str::<SyncDevicePresence>(&contents) {
             devices.push(device);
         }
     }
@@ -1169,30 +1565,23 @@ fn read_devices(folder: &Path) -> Result<Vec<SyncDevicePresence>, String> {
     Ok(devices)
 }
 
-fn claim_editing_lease(folder: &Path) -> Result<(), String> {
+fn claim_editing_lease(folder: &SyncFolder) -> Result<(), String> {
     let device_id = settings::local_device_id()?;
     clear_other_editing_leases(folder, &device_id)?;
     write_device_presence(folder, true)
 }
 
-fn clear_other_editing_leases(folder: &Path, current_device_id: &str) -> Result<(), String> {
-    let devices_dir = folder.join("devices");
-    if !devices_dir.exists() {
-        return Ok(());
-    }
-
+fn clear_other_editing_leases(folder: &SyncFolder, current_device_id: &str) -> Result<(), String> {
     let now = now_unix();
-    for entry in std::fs::read_dir(devices_dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+    for entry in folder.list_recursive("devices")? {
+        if entry.is_dir || !entry.path.ends_with(".json") {
             continue;
         }
 
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Some(contents) = folder.read_text(&entry.path)? else {
             continue;
         };
-        let Ok(mut device) = serde_json::from_slice::<SyncDevicePresence>(&bytes) else {
+        let Ok(mut device) = serde_json::from_str::<SyncDevicePresence>(&contents) else {
             continue;
         };
         if device.device_id == current_device_id || !device.active_writer {
@@ -1201,13 +1590,13 @@ fn clear_other_editing_leases(folder: &Path, current_device_id: &str) -> Result<
 
         device.active_writer = false;
         device.lease_expires_unix = now;
-        let bytes = serde_json::to_vec_pretty(&device).map_err(|e| e.to_string())?;
-        std::fs::write(path, bytes).map_err(|e| e.to_string())?;
+        let contents = serde_json::to_string_pretty(&device).map_err(|e| e.to_string())?;
+        folder.write_text_atomic(&entry.path, &contents)?;
     }
     Ok(())
 }
 
-fn write_device_presence(folder: &Path, active_writer: bool) -> Result<(), String> {
+fn write_device_presence(folder: &SyncFolder, active_writer: bool) -> Result<(), String> {
     let device_id = settings::local_device_id()?;
     let now = now_unix();
     let presence = SyncDevicePresence {
@@ -1221,22 +1610,47 @@ fn write_device_presence(folder: &Path, active_writer: bool) -> Result<(), Strin
             now
         },
     };
-    let path = folder.join("devices").join(format!("{device_id}.json"));
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let bytes = serde_json::to_vec_pretty(&presence).map_err(|e| e.to_string())?;
-    std::fs::write(path, bytes).map_err(|e| e.to_string())
+    let contents = serde_json::to_string_pretty(&presence).map_err(|e| e.to_string())?;
+    folder.write_text_atomic(&format!("devices/{device_id}.json"), &contents)
 }
 
-fn detect_conflicts(folder: &Path) -> Result<Vec<SyncConflict>, String> {
+fn detect_conflicts(folder: &SyncFolder) -> Result<Vec<SyncConflict>, String> {
     let mut conflicts = Vec::new();
-    collect_conflicts(folder, folder, &mut conflicts)?;
+    for entry in folder.list_recursive("")? {
+        if entry.is_dir {
+            continue;
+        }
+        let file_name = Path::new(&entry.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let is_syncthing_conflict = file_name.contains("sync-conflict");
+        let is_gloss_conflict = entry
+            .path
+            .split('/')
+            .any(|component| component == "conflicts")
+            && entry.path.ends_with(".db");
+        if is_syncthing_conflict || is_gloss_conflict {
+            conflicts.push(SyncConflict {
+                id: stable_path_id(&entry.path),
+                path: entry.path,
+                kind: if is_syncthing_conflict {
+                    "syncthing".to_string()
+                } else {
+                    "local_recovery".to_string()
+                },
+            });
+        }
+    }
     conflicts.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(conflicts)
 }
 
-fn collect_conflicts(root: &Path, dir: &Path, out: &mut Vec<SyncConflict>) -> Result<(), String> {
+fn collect_file_entries(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<SyncFileEntry>,
+) -> Result<(), String> {
     if !dir.exists() {
         return Ok(());
     }
@@ -1248,36 +1662,21 @@ fn collect_conflicts(root: &Path, dir: &Path, out: &mut Vec<SyncConflict>) -> Re
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
+        let metadata = entry.metadata().map_err(|e| e.to_string())?;
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        out.push(SyncFileEntry {
+            path: relative,
+            is_dir: metadata.is_dir(),
+        });
         if path.is_dir() {
-            collect_conflicts(root, &path, out)?;
-            continue;
-        }
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        let is_syncthing_conflict = file_name.contains("sync-conflict");
-        let is_gloss_conflict = path
-            .components()
-            .any(|component| component.as_os_str().to_string_lossy() == "conflicts")
-            && path.extension().and_then(|ext| ext.to_str()) == Some("db");
-        if is_syncthing_conflict || is_gloss_conflict {
-            let relative = path.strip_prefix(root).unwrap_or(&path);
-            out.push(SyncConflict {
-                id: stable_path_id(relative),
-                path: relative.to_string_lossy().to_string(),
-                kind: if is_syncthing_conflict {
-                    "syncthing".to_string()
-                } else {
-                    "local_recovery".to_string()
-                },
-            });
+            collect_file_entries(root, &path, out)?;
         }
     }
     Ok(())
 }
 
-fn copy_file_if_changed(source: &Path, destination: &Path) -> Result<(), String> {
+fn copy_path_file_if_changed(source: &Path, destination: &Path) -> Result<(), String> {
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -1288,12 +1687,20 @@ fn copy_file_if_changed(source: &Path, destination: &Path) -> Result<(), String>
             return Ok(());
         }
     }
-    let tmp = destination.with_extension("tmp");
+    let tmp = sibling_tmp_path(destination);
     std::fs::copy(source, &tmp).map_err(|e| e.to_string())?;
-    publish_file(&tmp, destination)
+    publish_path_file(&tmp, destination)
 }
 
-fn publish_file(source: &Path, destination: &Path) -> Result<(), String> {
+fn sibling_tmp_path(destination: &Path) -> PathBuf {
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("gloss-sync");
+    destination.with_file_name(format!("{file_name}.tmp"))
+}
+
+fn publish_path_file(source: &Path, destination: &Path) -> Result<(), String> {
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -1303,13 +1710,13 @@ fn publish_file(source: &Path, destination: &Path) -> Result<(), String> {
     std::fs::rename(source, destination).map_err(|e| e.to_string())
 }
 
-fn hash_file(path: &Path) -> Result<String, String> {
+fn hash_path_file(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     Ok(format!("{:016x}", fnv1a(&bytes)))
 }
 
-fn stable_path_id(path: &Path) -> String {
-    format!("{:016x}", fnv1a(path.to_string_lossy().as_bytes()))
+fn stable_path_id(path: &str) -> String {
+    format!("{:016x}", fnv1a(path.as_bytes()))
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -1385,11 +1792,11 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-fn info_snapshot_export(folder: &Path, revision: i64) {
+fn info_snapshot_export(folder: &SyncFolder, revision: i64) {
     log::info!(
         target: "gloss_lib::sync",
         "exported sync snapshot revision={} folder={}",
         revision,
-        folder.display()
+        folder.label()
     );
 }

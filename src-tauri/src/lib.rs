@@ -1,3 +1,4 @@
+mod android_sync;
 mod chunking;
 mod deepseek;
 mod gemini;
@@ -5463,6 +5464,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(android_sync::init())
         .setup(|app| {
             let pool = tauri::async_runtime::block_on(init_db(app))
                 .expect("failed to initialise database");

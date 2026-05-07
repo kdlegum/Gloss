@@ -100,7 +100,7 @@ File versioning is configured per device and per folder, so repeat the versionin
 6. Enable `Simple File Versioning` with at least `5` versions.
 7. Wait until Syncthing says the folder is `Up to Date`.
 
-On Android, choose a normal shared-storage folder that the Android sync app can write to and Gloss can select. Also allow the Android sync app to run in the background, and consider disabling battery optimization for it so it can finish syncing large PDFs.
+On Android, choose a normal shared-storage folder that the Android sync app can write to and Gloss can select through Android's folder picker. A folder such as `Documents/Gloss Sync` is a good choice. Do not use the storage root, `Download` itself, or anything under `Android/data`, because modern Android versions restrict those locations. Also allow the Android sync app to run in the background, and consider disabling battery optimization for it so it can finish syncing large PDFs.
 
 ## Device 2: Connect Gloss
 
@@ -108,7 +108,7 @@ On Android, choose a normal shared-storage folder that the Android sync app can 
 2. Go to the library screen.
 3. Click `Local sync`.
 4. Click `Choose`.
-5. Select the same local `Gloss Sync` folder that Syncthing is managing on this device.
+5. Select the same local `Gloss Sync` folder that Syncthing is managing on this device. On Android this uses the system folder picker and Gloss keeps the read/write permission after restart.
 6. Leave Gloss on the library screen for a few seconds.
 
 Gloss will automatically stage the synced snapshot, copy missing PDFs into its local cache, preserve device-local secrets, and then replace this device's local Gloss library with the synced copy.

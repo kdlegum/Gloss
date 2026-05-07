@@ -57,7 +57,10 @@ export interface SyncConflict {
 export interface SyncState {
   setup_status: SyncSetupStatus;
   enabled: boolean;
+  folder_kind: "path" | "android_tree";
   folder_path: string | null;
+  folder_label: string | null;
+  running_on_android: boolean;
   folder_ready: boolean;
   device_id: string;
   dirty: boolean;

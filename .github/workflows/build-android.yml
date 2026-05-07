@@ -32,7 +32,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+          targets: aarch64-linux-android
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -43,18 +43,46 @@ jobs:
         run: npm ci
 
       - name: Initialize Android project
-        run: npm run tauri android init
+        run: npm run tauri -- android init
         env:
           NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
 
-      - name: Build APK
-        run: npm run tauri android build -- --apk
+      - name: Download Android pdfium
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pdfium src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a
+          curl -L https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-android-arm64.tgz \
+            | tar -xz -C /tmp/pdfium
+          find /tmp/pdfium -name "libpdfium.so" -exec cp {} src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a/libpdfium.so \;
+          test -s src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a/libpdfium.so
+
+      - name: Build installable arm64 APK
+        run: npm run tauri -- android build --debug --apk --target aarch64
         env:
           NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_path="src-tauri/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk"
+          build_tools_dir="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          test -f "$apk_path"
+          "$build_tools_dir/apksigner" verify --print-certs "$apk_path"
+          "$build_tools_dir/aapt" dump badging "$apk_path" | tee apk-badging.txt
+          grep -F "native-code: 'arm64-v8a'" apk-badging.txt
+
+      - name: Prepare APK artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cp src-tauri/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk artifacts/gloss-android-arm64-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: gloss-android
-          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
-          if-no-files-found: warn
+          name: gloss-android-arm64-debug
+          path: artifacts/gloss-android-arm64-debug.apk
+          if-no-files-found: error
