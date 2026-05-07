@@ -316,7 +316,20 @@ pub async fn get_sync_state(app: tauri::AppHandle, pool: &SqlitePool) -> Result<
 }
 
 pub async fn choose_sync_folder(app: tauri::AppHandle) -> Result<String, String> {
-    let picked = app.dialog().file().blocking_pick_folder();
+    #[cfg(desktop)]
+    {
+        let picked = app.dialog().file().blocking_pick_folder();
+        return store_picked_sync_folder(picked);
+    }
+
+    #[cfg(mobile)]
+    {
+        let _ = app;
+        Err("Folder picking is not available on Android yet. Enter the Syncthing folder path manually.".to_string())
+    }
+}
+
+fn store_picked_sync_folder(picked: Option<FilePath>) -> Result<String, String> {
     match picked {
         Some(FilePath::Path(path)) => {
             let folder = normalize_folder_path(&path.to_string_lossy())?;
