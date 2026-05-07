@@ -1,5 +1,5 @@
 export type DocumentMode = "textbook" | "past_paper";
-export type DatabaseTransferMode = "export" | "import";
+export type SyncSetupStatus = "not_configured" | "folder_missing" | "initialised" | "ready";
 
 export interface SourceDocument {
   id: number;
@@ -30,6 +30,54 @@ export interface AiSettingsState {
   gemini_api_key_set: boolean;
   deepseek_api_key_set: boolean;
   zai_api_key_set: boolean;
+}
+
+export interface SyncSnapshotInfo {
+  revision: number;
+  hash: string;
+  updated_at_unix: number;
+  updated_by: string;
+  path: string;
+}
+
+export interface SyncDevicePresence {
+  device_id: string;
+  device_name: string;
+  active_writer: boolean;
+  last_seen_unix: number;
+  lease_expires_unix: number;
+}
+
+export interface SyncConflict {
+  id: string;
+  path: string;
+  kind: string;
+}
+
+export interface SyncState {
+  setup_status: SyncSetupStatus;
+  enabled: boolean;
+  folder_path: string | null;
+  folder_ready: boolean;
+  device_id: string;
+  dirty: boolean;
+  last_exported_revision: number | null;
+  last_imported_revision: number | null;
+  remote_snapshot: SyncSnapshotInfo | null;
+  devices: SyncDevicePresence[];
+  conflicts: SyncConflict[];
+  missing_pdfs: string[];
+  read_only: boolean;
+  active_writer: SyncDevicePresence | null;
+  message: string;
+}
+
+export type AutoSyncAction = "idle" | "waiting" | "blocked" | "imported" | "exported";
+
+export interface AutoSyncResult {
+  action: AutoSyncAction;
+  message: string | null;
+  state: SyncState;
 }
 
 export type ChunkingProvider = "ollama" | "openai" | "gemini" | "deepseek";

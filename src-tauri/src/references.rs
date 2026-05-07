@@ -437,10 +437,7 @@ fn truncate_preview_text(source: &str, limit: usize) -> String {
     out
 }
 
-pub async fn ensure_document_aliases(
-    pool: &SqlitePool,
-    document_id: i64,
-) -> Result<usize, String> {
+pub async fn ensure_document_aliases(pool: &SqlitePool, document_id: i64) -> Result<usize, String> {
     backfill_aliases_from_titles(pool, document_id).await
 }
 

@@ -59,7 +59,6 @@
   } = $props();
 
   type DocumentMode = "textbook" | "past_paper";
-  type DatabaseTransferMode = "export" | "import";
 
   interface SourceDocument {
     id: number;
@@ -282,10 +281,6 @@
 
   let sourceDocuments = $state<SourceDocument[]>([]);
   let importing = $state(false);
-  let dbTransferBusy = $state(false);
-  let dbTransferMode = $state<DatabaseTransferMode | null>(null);
-  let dbTransferError = $state<string | null>(null);
-  let dbTransferFeedback = $state<string | null>(null);
   let pendingDeleteSourceDocumentId = $state<number | null>(null);
   let deletingSourceDocumentId = $state<number | null>(null);
   let error = $state<string | null>(null);
@@ -3619,62 +3614,7 @@
     }
   }
 
-  async function exportDatabaseFile() {
-    if (importing || deletingSourceDocumentId !== null || dbTransferBusy) return;
-
-    error = null;
-    pendingDeleteSourceDocumentId = null;
-    dbTransferError = null;
-    dbTransferFeedback = null;
-    dbTransferBusy = true;
-    dbTransferMode = "export";
-    try {
-      const destination = await invoke<string>("export_database_file");
-      dbTransferFeedback = `Database exported to ${destination}.`;
-      await appLogInfo(`[sync] database exported to ${destination}`);
-    } catch (err) {
-      if (err !== "cancelled") {
-        dbTransferError = formatLogError(err);
-        await appLogError(`[sync] database export failed: ${dbTransferError}`);
-      }
-    } finally {
-      dbTransferBusy = false;
-      dbTransferMode = null;
-    }
-  }
-
-  async function importDatabaseFile() {
-    if (importing || deletingSourceDocumentId !== null || dbTransferBusy) return;
-
-    const confirmed = window.confirm(
-      "Import a database backup?\n\nThis replaces your current local Gloss database (notes, chunk data, and settings). PDFs are not included, so keep your PDF files synced separately.",
-    );
-    if (!confirmed) return;
-
-    error = null;
-    pendingDeleteSourceDocumentId = null;
-    dbTransferError = null;
-    dbTransferFeedback = null;
-    dbTransferBusy = true;
-    dbTransferMode = "import";
-    try {
-      const source = await invoke<string>("import_database_file");
-      await loadSourceDocuments();
-      dbTransferFeedback = `Database imported from ${source}.`;
-      await appLogInfo(`[sync] database imported from ${source}`);
-    } catch (err) {
-      if (err !== "cancelled") {
-        dbTransferError = formatLogError(err);
-        await appLogError(`[sync] database import failed: ${dbTransferError}`);
-      }
-    } finally {
-      dbTransferBusy = false;
-      dbTransferMode = null;
-    }
-  }
-
   async function importPdf(documentMode: DocumentMode = "textbook") {
-    if (dbTransferBusy) return;
     error = null;
     pendingDeleteSourceDocumentId = null;
     importing = true;
@@ -3701,7 +3641,6 @@
   async function deleteSourceDocument(book: SourceDocument) {
     if (
       importing
-      || dbTransferBusy
       || deletingSourceDocumentId !== null
       || pendingDeleteSourceDocumentId !== book.id
     ) return;
@@ -3724,7 +3663,7 @@
   }
 
   function requestSourceDocumentDelete(bookId: number) {
-    if (importing || dbTransferBusy || deletingSourceDocumentId !== null) return;
+    if (importing || deletingSourceDocumentId !== null) return;
     pendingDeleteSourceDocumentId = bookId;
   }
 

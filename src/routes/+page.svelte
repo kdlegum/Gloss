@@ -22,22 +22,29 @@
     AiTask,
     AiTaskSettings,
     AnyProvider,
+    AutoSyncResult,
     ChatProvider,
     ChunkingProvider,
-    DatabaseTransferMode,
     SourceDocument,
+    SyncState,
     ViewerBatchSettingsState,
     VisionProvider,
   } from "$lib/app/types";
 
   let sourceDocuments = $state<SourceDocument[]>([]);
   let importing = $state(false);
-  let dbTransferBusy = $state(false);
-  let dbTransferMode = $state<DatabaseTransferMode | null>(null);
-  let dbTransferError = $state<string | null>(null);
-  let dbTransferFeedback = $state<string | null>(null);
+  let syncState = $state<SyncState | null>(null);
+  let syncBusy = $state(false);
+  let syncMode = $state<string | null>(null);
+  let syncError = $state<string | null>(null);
+  let syncFeedback = $state<string | null>(null);
+  let showSyncSheet = $state(false);
+  let syncFolderInput = $state("");
+  let autoSyncBusy = $state(false);
+  let lastAutoSyncNotice = $state<string | null>(null);
   let pendingDeleteSourceDocumentId = $state<number | null>(null);
   let deletingSourceDocumentId = $state<number | null>(null);
+  let renamingSourceDocumentId = $state<number | null>(null);
   let error = $state<string | null>(null);
   let selectedBook = $state<SourceDocument | null>(null);
 
@@ -410,62 +417,238 @@
     }
   }
 
-  async function exportDatabaseFile() {
-    if (importing || deletingSourceDocumentId !== null || dbTransferBusy) return;
-
-    error = null;
-    pendingDeleteSourceDocumentId = null;
-    dbTransferError = null;
-    dbTransferFeedback = null;
-    dbTransferBusy = true;
-    dbTransferMode = "export";
+  async function loadSyncState() {
     try {
-      const destination = await invoke<string>("export_database_file");
-      dbTransferFeedback = `Database exported to ${destination}.`;
-      await appLogInfo(`[sync] database exported to ${destination}`);
-    } catch (err) {
-      if (err !== "cancelled") {
-        dbTransferError = formatLogError(err);
-        await appLogError(`[sync] database export failed: ${dbTransferError}`);
+      syncState = await invoke<SyncState>("get_sync_state");
+      if (syncState.folder_path) {
+        syncFolderInput = syncState.folder_path;
       }
-    } finally {
-      dbTransferBusy = false;
-      dbTransferMode = null;
+    } catch (err) {
+      syncError = formatLogError(err);
+      void appLogWarn(`[sync] failed to load local sync state: ${syncError}`);
     }
   }
 
-  async function importDatabaseFile() {
-    if (importing || deletingSourceDocumentId !== null || dbTransferBusy) return;
+  function openLocalSyncSheet() {
+    syncError = null;
+    syncFeedback = null;
+    if (syncState?.folder_path) syncFolderInput = syncState.folder_path;
+    showSyncSheet = true;
+    void loadSyncState();
+  }
 
-    const confirmed = window.confirm(
-      "Import a database backup?\n\nThis replaces your current local Gloss database (notes, chunk data, and settings). PDFs are not included, so keep your PDF files synced separately.",
-    );
-    if (!confirmed) return;
+  function closeLocalSyncSheet() {
+    if (syncBusy) return;
+    showSyncSheet = false;
+  }
 
+  async function runSyncAction<T>(mode: string, action: () => Promise<T>, after?: (result: T) => Promise<void> | void) {
+    if (
+      syncBusy
+      || autoSyncBusy
+      || importing
+      || deletingSourceDocumentId !== null
+      || renamingSourceDocumentId !== null
+    ) return;
     error = null;
+    syncError = null;
+    syncFeedback = null;
     pendingDeleteSourceDocumentId = null;
-    dbTransferError = null;
-    dbTransferFeedback = null;
-    dbTransferBusy = true;
-    dbTransferMode = "import";
+    syncBusy = true;
+    syncMode = mode;
     try {
-      const source = await invoke<string>("import_database_file");
-      await loadSourceDocuments();
-      dbTransferFeedback = `Database imported from ${source}.`;
-      await appLogInfo(`[sync] database imported from ${source}`);
+      const result = await action();
+      await after?.(result);
+      await loadSyncState();
     } catch (err) {
       if (err !== "cancelled") {
-        dbTransferError = formatLogError(err);
-        await appLogError(`[sync] database import failed: ${dbTransferError}`);
+        syncError = formatLogError(err);
+        await appLogError(`[sync] ${mode} failed: ${syncError}`);
       }
     } finally {
-      dbTransferBusy = false;
-      dbTransferMode = null;
+      syncBusy = false;
+      syncMode = null;
     }
+  }
+
+  async function runAutoSyncOnce() {
+    if (
+      syncBusy
+      || autoSyncBusy
+      || importing
+      || deletingSourceDocumentId !== null
+      || renamingSourceDocumentId !== null
+      || showAiKeySheet
+    ) return;
+
+    const state = syncState;
+    if (!state?.enabled || !state.folder_ready) return;
+
+    autoSyncBusy = true;
+    syncMode = "auto";
+    const clearAutoSyncNotice = () => {
+      if (lastAutoSyncNotice !== null && syncError?.includes(lastAutoSyncNotice)) {
+        syncError = null;
+      }
+      lastAutoSyncNotice = null;
+    };
+    try {
+      const result = await invoke<AutoSyncResult>("auto_sync_once", {
+        allowImport: selectedBook === null,
+      });
+      syncState = result.state;
+      if (result.state.folder_path) {
+        syncFolderInput = result.state.folder_path;
+      }
+      if (result.action === "imported") {
+        await loadSourceDocuments();
+        syncFeedback = result.message ?? "Imported synced changes.";
+        clearAutoSyncNotice();
+        await appLogInfo(`[sync] ${syncFeedback}`);
+      } else if (result.action === "exported") {
+        syncFeedback = result.message ?? "Published local changes.";
+        clearAutoSyncNotice();
+        await appLogInfo(`[sync] ${syncFeedback}`);
+      } else if (result.action === "blocked" && result.message) {
+        syncError = result.message;
+        if (lastAutoSyncNotice !== result.message) {
+          lastAutoSyncNotice = result.message;
+          await appLogWarn(`[sync] ${result.message}`);
+        }
+      } else if (result.action === "idle" || result.action === "waiting") {
+        clearAutoSyncNotice();
+      }
+    } catch (err) {
+      const message = formatLogError(err);
+      syncError = `Auto sync paused: ${message}`;
+      if (lastAutoSyncNotice !== message) {
+        lastAutoSyncNotice = message;
+        await appLogWarn(`[sync] auto sync failed: ${message}`);
+      }
+    } finally {
+      autoSyncBusy = false;
+      syncMode = null;
+    }
+  }
+
+  async function chooseSyncFolder() {
+    await runSyncAction("choose", async () => {
+      const folder = await invoke<string>("choose_sync_folder");
+      syncFolderInput = folder;
+      return invoke<SyncState>("enable_sync_folder", { folderPath: folder });
+    }, async (state) => {
+      syncState = state;
+      syncFolderInput = state.folder_path ?? syncFolderInput;
+      syncFeedback = state.remote_snapshot
+        ? "Local sync is connected. Gloss will import or publish automatically when it is safe."
+        : "Local sync folder initialized. Gloss will publish local changes automatically.";
+      await appLogInfo(`[sync] chose and connected folder=${syncFolderInput}`);
+    });
+  }
+
+  async function enableSyncFolder() {
+    const folderPath = syncFolderInput.trim();
+    if (!folderPath) {
+      syncError = "Choose a folder first.";
+      return;
+    }
+    await runSyncAction(
+      "enable",
+      () => invoke<SyncState>("enable_sync_folder", { folderPath }),
+      async (state) => {
+        syncState = state;
+        syncFeedback = state.remote_snapshot
+          ? "Local sync is connected. Gloss will import or publish automatically when it is safe."
+          : "Local sync folder initialized. Gloss will publish local changes automatically.";
+        await appLogInfo(`[sync] enabled folder=${folderPath}`);
+      },
+    );
+  }
+
+  async function syncNow() {
+    await runSyncAction(
+      "sync",
+      () => invoke<SyncState>("sync_now"),
+      async (state) => {
+        syncState = state;
+        syncFeedback = `Published snapshot revision ${state.remote_snapshot?.revision ?? "new"}.`;
+        await appLogInfo("[sync] published latest local snapshot");
+      },
+    );
+  }
+
+  async function importLatestSyncSnapshot() {
+    const state = syncState;
+    const remoteRevision = state?.remote_snapshot?.revision ?? null;
+    const localRevision = Math.max(
+      state?.last_exported_revision ?? 0,
+      state?.last_imported_revision ?? 0,
+    );
+    if (remoteRevision === null || remoteRevision <= localRevision) {
+      syncFeedback = "Local sync is already up to date.";
+      return;
+    }
+
+    const confirmed = window.confirm(
+      "Import the latest Gloss sync snapshot?\n\nThis replaces this device's local Gloss library with the synced copy. Local AI API keys stay on this device.",
+    );
+    if (!confirmed) return;
+    await runSyncAction(
+      "import",
+      () => invoke<SyncState>("import_latest_sync_snapshot"),
+      async (state) => {
+        syncState = state;
+        await loadSourceDocuments();
+        syncFeedback = `Imported snapshot revision ${state.last_imported_revision ?? state.remote_snapshot?.revision ?? ""}.`;
+        await appLogInfo("[sync] imported latest snapshot");
+      },
+    );
+  }
+
+  async function takeSyncEditingLease() {
+    await runSyncAction(
+      "lease",
+      () => invoke<SyncState>("take_sync_editing_lease"),
+      async (state) => {
+        syncState = state;
+        syncFeedback = "This device is now the active editor for the next 10 minutes.";
+      },
+    );
+  }
+
+  async function disableSync() {
+    const confirmed = window.confirm("Disable local sync on this device? The sync folder and local Gloss data will not be deleted.");
+    if (!confirmed) return;
+    await runSyncAction(
+      "disable",
+      () => invoke<SyncState>("disable_sync"),
+      async (state) => {
+        syncState = state;
+        syncFeedback = "Local sync disabled on this device.";
+      },
+    );
+  }
+
+  async function resolveSyncConflict(resolution: "keep_local" | "use_remote") {
+    const confirmed = window.confirm(
+      resolution === "keep_local"
+        ? "Publish this device's local copy over the synced snapshot?"
+        : "Replace this device's local copy with the synced snapshot?",
+    );
+    if (!confirmed) return;
+    await runSyncAction(
+      "resolve",
+      () => invoke<SyncState>("resolve_sync_conflict", { resolution }),
+      async (state) => {
+        syncState = state;
+        await loadSourceDocuments();
+        syncFeedback = resolution === "keep_local" ? "Published this device's copy." : "Imported the synced copy.";
+      },
+    );
   }
 
   async function importPdf(documentMode: "textbook" | "past_paper" = "textbook") {
-    if (dbTransferBusy) return;
+    if (syncBusy || autoSyncBusy || renamingSourceDocumentId !== null) return;
     error = null;
     pendingDeleteSourceDocumentId = null;
     importing = true;
@@ -475,6 +658,7 @@
         `[import] imported doc=${doc.id} mode=${doc.document_mode} title="${doc.title}" path="${doc.file_path}"`,
       );
       await loadSourceDocuments();
+      await loadSyncState();
     } catch (e: unknown) {
       if (e !== "cancelled") {
         error = String(e);
@@ -488,8 +672,10 @@
   async function deleteSourceDocument(book: SourceDocument) {
     if (
       importing
-      || dbTransferBusy
+      || syncBusy
+      || autoSyncBusy
       || deletingSourceDocumentId !== null
+      || renamingSourceDocumentId !== null
       || pendingDeleteSourceDocumentId !== book.id
     ) return;
 
@@ -498,6 +684,7 @@
     try {
       await invoke("delete_source_document", { sourceDocumentId: book.id });
       await loadSourceDocuments();
+      await loadSyncState();
       pendingDeleteSourceDocumentId = null;
       await appLogInfo(`[library] deleted doc=${book.id} title="${book.title}"`);
     } catch (err) {
@@ -510,8 +697,57 @@
     }
   }
 
+  async function renameSourceDocument(book: SourceDocument, title: string): Promise<boolean> {
+    if (
+      importing
+      || syncBusy
+      || autoSyncBusy
+      || deletingSourceDocumentId !== null
+      || renamingSourceDocumentId !== null
+    ) return false;
+
+    const nextTitle = title.trim();
+    if (!nextTitle) {
+      error = "Book title cannot be empty.";
+      return false;
+    }
+    error = null;
+    if (nextTitle === book.title) {
+      return true;
+    }
+
+    pendingDeleteSourceDocumentId = null;
+    renamingSourceDocumentId = book.id;
+    try {
+      const updated = await invoke<SourceDocument>("rename_source_document", {
+        sourceDocumentId: book.id,
+        title: nextTitle,
+      });
+      applyUpdatedSourceDocument(updated);
+      await loadSyncState();
+      await appLogInfo(
+        `[library] renamed doc=${book.id} from "${book.title}" to "${updated.title}"`,
+      );
+      return true;
+    } catch (err) {
+      error = formatLogError(err);
+      await appLogError(
+        `[library] rename failed doc=${book.id} title="${book.title}": ${formatLogError(err)}`,
+      );
+      return false;
+    } finally {
+      renamingSourceDocumentId = null;
+    }
+  }
+
   function requestSourceDocumentDelete(bookId: number) {
-    if (importing || dbTransferBusy || deletingSourceDocumentId !== null) return;
+    if (
+      importing
+      || syncBusy
+      || autoSyncBusy
+      || deletingSourceDocumentId !== null
+      || renamingSourceDocumentId !== null
+    ) return;
     pendingDeleteSourceDocumentId = pendingDeleteSourceDocumentId === bookId ? null : bookId;
   }
 
@@ -528,6 +764,7 @@
   function closeBook() {
     selectedBook = null;
     viewerBatchState = null;
+    void loadSyncState();
   }
 
   function handleReaderAiTaskSettingsChange(settings: AiTaskSettings) {
@@ -540,6 +777,27 @@
     refreshCustomModelMode(aiTaskSettings);
     void loadAiSettings();
     void loadSourceDocuments();
+    void loadSyncState();
+    const autoSyncTimer = window.setInterval(() => {
+      void runAutoSyncOnce();
+    }, 15_000);
+    const leaseTimer = window.setInterval(() => {
+      const state = syncState;
+      const self = state?.devices.find((device) => device.device_id === state.device_id);
+      const leaseStillActive = !!self?.active_writer && self.lease_expires_unix * 1000 > Date.now();
+      if (!state?.enabled || !leaseStillActive || syncBusy || autoSyncBusy) return;
+      void (async () => {
+        try {
+          syncState = await invoke<SyncState>("take_sync_editing_lease");
+        } catch (err) {
+          void appLogWarn(`[sync] failed to refresh editing lease: ${formatLogError(err)}`);
+        }
+      })();
+    }, 60_000);
+    return () => {
+      window.clearInterval(autoSyncTimer);
+      window.clearInterval(leaseTimer);
+    };
   });
 </script>
 
@@ -556,24 +814,36 @@
       onViewerBatchStateChange={(state) => viewerBatchState = state}
     />
   {:else}
-    <LibraryScreen
-      {sourceDocuments}
-      {importing}
-      {dbTransferBusy}
-      {dbTransferMode}
-      {dbTransferError}
-      {dbTransferFeedback}
-      {pendingDeleteSourceDocumentId}
-      {deletingSourceDocumentId}
-      {error}
-      openAiSettings={() => openAiKeySettings(false)}
-      {importPdf}
-      {exportDatabaseFile}
-      {importDatabaseFile}
-      {openBook}
-      {deleteSourceDocument}
-      {requestSourceDocumentDelete}
-      {cancelSourceDocumentDelete}
+      <LibraryScreen
+        {sourceDocuments}
+        {importing}
+        {syncState}
+        syncBusy={syncBusy || autoSyncBusy}
+        {syncMode}
+        {syncError}
+        {syncFeedback}
+        {showSyncSheet}
+        {syncFolderInput}
+        {pendingDeleteSourceDocumentId}
+        {deletingSourceDocumentId}
+        {renamingSourceDocumentId}
+        {error}
+        openAiSettings={() => openAiKeySettings(false)}
+        {importPdf}
+        {openLocalSyncSheet}
+        {closeLocalSyncSheet}
+        {chooseSyncFolder}
+        {enableSyncFolder}
+        {syncNow}
+        {importLatestSyncSnapshot}
+        {takeSyncEditingLease}
+        {disableSync}
+        {resolveSyncConflict}
+        {openBook}
+        {renameSourceDocument}
+        {deleteSourceDocument}
+        {requestSourceDocumentDelete}
+        {cancelSourceDocumentDelete}
     />
   {/if}
 

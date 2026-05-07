@@ -2,6 +2,7 @@ mod chunking;
 mod deepseek;
 mod gemini;
 mod llm;
+mod local_sync;
 mod ollama;
 mod openai;
 mod references;
@@ -222,6 +223,7 @@ fn spawn_chunking_job(
             zai_transcription_semaphore,
         )
         .await;
+        local_sync::mark_dirty();
         finish_chunking_job(&chunking_jobs, doc_id, page_number);
     });
     Ok(true)
@@ -862,6 +864,7 @@ async fn save_chunk_glossary(
     glossary_format: String,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<(), String> {
+    local_sync::guard_write()?;
     let trimmed = glossary_md
         .as_deref()
         .map(str::trim)
@@ -876,6 +879,7 @@ async fn save_chunk_glossary(
         .execute(pool.inner())
         .await
         .map_err(|e| e.to_string())?;
+    local_sync::mark_dirty();
     Ok(())
 }
 
@@ -937,6 +941,7 @@ async fn save_chunk_title(
     title: Option<String>,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<(), String> {
+    local_sync::guard_write()?;
     let trimmed = title
         .as_deref()
         .map(str::trim)
@@ -948,6 +953,7 @@ async fn save_chunk_title(
         .execute(pool.inner())
         .await
         .map_err(|e| e.to_string())?;
+    local_sync::mark_dirty();
     Ok(())
 }
 
@@ -957,6 +963,7 @@ async fn save_chunk_body_markdown(
     body_markdown: Option<String>,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<(), String> {
+    local_sync::guard_write()?;
     let trimmed = body_markdown
         .as_deref()
         .map(str::trim)
@@ -977,6 +984,7 @@ async fn save_chunk_body_markdown(
             e
         );
     }
+    local_sync::mark_dirty();
     Ok(())
 }
 
@@ -1562,8 +1570,7 @@ fn tokenize_search_text(source: &str) -> Vec<String> {
 fn is_search_stop_word(token: &str) -> bool {
     matches!(
         token,
-        "a"
-            | "an"
+        "a" | "an"
             | "about"
             | "called"
             | "chunk"
@@ -1629,7 +1636,10 @@ fn build_search_variants(source: Option<&str>) -> Vec<String> {
 
     let mut variants = vec![source.to_string()];
     if let Some(stripped) = strip_search_numeric_prefix(source) {
-        if !variants.iter().any(|existing| existing.eq_ignore_ascii_case(&stripped)) {
+        if !variants
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&stripped))
+        {
             variants.push(stripped);
         }
     }
@@ -1887,14 +1897,12 @@ async fn search_chunks_for_ai_internal(
             glossary_markdown: row.get("glossary_markdown"),
         };
 
-        if let Some(result) =
-            build_search_result_for_candidate(
-                &candidate,
-                &query_normalized,
-                &query_phrase,
-                &query_tokens,
-            )
-        {
+        if let Some(result) = build_search_result_for_candidate(
+            &candidate,
+            &query_normalized,
+            &query_phrase,
+            &query_tokens,
+        ) {
             scored.push(result);
         }
     }
@@ -1929,7 +1937,12 @@ fn format_search_results_context(query: &str, results: &[ChunkSearchResultView])
             result.page_number,
             result.chunk_type
         ));
-        if let Some(title) = result.title.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(title) = result
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             out.push_str(&format!("   title: {}\n", title));
         }
         if let Some(subject) = result
@@ -2143,7 +2156,11 @@ async fn load_chunk_chat_context(
     }
 
     if glossary_format == ChunkNoteFormat::Markdown {
-        if let Some(glossary_source) = glossary_markdown.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(glossary_source) = glossary_markdown
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             let glossary_mentions = references::resolve_mentions_in_document(
                 pool,
                 source_document_id,
@@ -2343,7 +2360,10 @@ async fn run_page_ai_stream(
             .map(|query| format_search_results_context(query, &search_results))
             .filter(|value| !value.trim().is_empty());
         let prompt_body = if let Some(search_context) = search_context {
-            format!("{}\n\nSupplemental chunk search results:\n---\n{}\n---\n", context.body_markdown, search_context)
+            format!(
+                "{}\n\nSupplemental chunk search results:\n---\n{}\n---\n",
+                context.body_markdown, search_context
+            )
         } else {
             context.body_markdown.clone()
         };
@@ -2457,9 +2477,15 @@ async fn run_chunk_ai_stream(
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            search_chunks_for_ai_internal(&pool, context.source_document_id, query, 4, Some(chunk_id))
-                .await
-                .map_err(LlmError::Config)?
+            search_chunks_for_ai_internal(
+                &pool,
+                context.source_document_id,
+                query,
+                4,
+                Some(chunk_id),
+            )
+            .await
+            .map_err(LlmError::Config)?
         } else {
             Vec::new()
         };
@@ -2888,13 +2914,9 @@ async fn resolve_chunk_mentions(
     }
 
     let limit = limit.unwrap_or(32);
-    let rows = references::resolve_mentions_in_document(
-        pool.inner(),
-        source_document_id,
-        &source,
-        limit,
-    )
-    .await?;
+    let rows =
+        references::resolve_mentions_in_document(pool.inner(), source_document_id, &source, limit)
+            .await?;
 
     Ok(rows
         .into_iter()
@@ -3212,6 +3234,7 @@ async fn save_question_available_marks(
     available_marks: Option<i64>,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<(), String> {
+    local_sync::guard_write()?;
     let row = sqlx::query("SELECT chunk_type, achieved_marks FROM chunks WHERE id = ?")
         .bind(chunk_id)
         .fetch_optional(pool.inner())
@@ -3233,6 +3256,7 @@ async fn save_question_available_marks(
         .await
         .map_err(|e| e.to_string())?;
 
+    local_sync::mark_dirty();
     Ok(())
 }
 
@@ -3242,6 +3266,7 @@ async fn save_question_achieved_marks(
     achieved_marks: Option<f64>,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<(), String> {
+    local_sync::guard_write()?;
     let row = sqlx::query("SELECT chunk_type, available_marks FROM chunks WHERE id = ?")
         .bind(chunk_id)
         .fetch_optional(pool.inner())
@@ -3279,6 +3304,7 @@ async fn save_question_achieved_marks(
     .map_err(|e| e.to_string())?;
 
     tx.commit().await.map_err(|e| e.to_string())?;
+    local_sync::mark_dirty();
     Ok(())
 }
 
@@ -3419,6 +3445,7 @@ async fn apply_question_mark_attempt(
     model: Option<String>,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<(), String> {
+    local_sync::guard_write()?;
     let source = source.trim().to_lowercase();
     if source != "ai" && source != "manual" {
         return Err("source must be 'ai' or 'manual'".to_string());
@@ -3482,6 +3509,7 @@ async fn apply_question_mark_attempt(
     .map_err(|e| e.to_string())?;
 
     tx.commit().await.map_err(|e| e.to_string())?;
+    local_sync::mark_dirty();
     Ok(())
 }
 
@@ -3701,6 +3729,7 @@ async fn ensure_chunking_for_page(
     state: tauri::State<'_, AppState>,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<bool, String> {
+    local_sync::guard_write()?;
     if page_number < 1 {
         return Err(format!("invalid page number {}", page_number));
     }
@@ -3790,6 +3819,7 @@ async fn ensure_chunking_for_page_range(
     state: tauri::State<'_, AppState>,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<EnsureChunkingRangeResult, String> {
+    local_sync::guard_write()?;
     if start_page < 1 {
         return Err(format!("invalid start page {}", start_page));
     }
@@ -3876,6 +3906,7 @@ async fn ensure_chunking_for_page_range(
                 )
                 .await;
             }
+            local_sync::mark_dirty();
             finish_chunking_job(&chunking_jobs, source_document_id, 1);
         });
 
@@ -3985,6 +4016,7 @@ async fn ensure_chunking_for_page_range(
                 }
                 finish_chunking_job(&chunking_jobs, source_document_id, page_number);
             }
+            local_sync::mark_dirty();
         });
     }
 
@@ -4007,6 +4039,7 @@ async fn rechunk_page(
     state: tauri::State<'_, AppState>,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<(), String> {
+    local_sync::guard_write()?;
     if page_number < 1 {
         return Err(format!("invalid page number {}", page_number));
     }
@@ -4040,6 +4073,9 @@ async fn rechunk_page(
     )
     .await;
     finish_chunking_job(&state.chunking_jobs, source_document_id, effective_page);
+    if result.is_ok() {
+        local_sync::mark_dirty();
+    }
     result
 }
 
@@ -4049,6 +4085,7 @@ async fn import_pdf(
     app: tauri::AppHandle,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<SourceDocument, String> {
+    local_sync::guard_write()?;
     // Open file picker — returns FilePath::Path on desktop, FilePath::Url on Android
     let picked = app
         .dialog()
@@ -4095,23 +4132,8 @@ async fn import_pdf(
     let pdfs_dir = data_dir.join("pdfs");
     std::fs::create_dir_all(&pdfs_dir).map_err(|e| e.to_string())?;
 
-    // Avoid overwriting an existing file by appending a counter if needed
-    let mut dest_path = pdfs_dir.join(&file_name);
-    if dest_path.exists() {
-        let stem = std::path::Path::new(&file_name)
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let mut counter: u32 = 1;
-        loop {
-            dest_path = pdfs_dir.join(format!("{}_{}.pdf", stem, counter));
-            if !dest_path.exists() {
-                break;
-            }
-            counter += 1;
-        }
-    }
+    let document_sync_id = settings::make_local_id("doc");
+    let dest_path = pdfs_dir.join(format!("{document_sync_id}.pdf"));
 
     // Read via tauri-plugin-fs — handles content:// URIs on Android via JNI,
     // falls back to plain std::fs on desktop.
@@ -4144,14 +4166,16 @@ async fn import_pdf(
 
     let row = sqlx::query(
         "INSERT INTO source_documents \
-         (title, file_path, document_mode, instruction_page_start, instruction_page_end) \
-         VALUES (?, ?, ?, ?, ?) RETURNING id",
+         (title, file_path, document_mode, instruction_page_start, instruction_page_end, document_sync_id, original_file_name) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(&title)
     .bind(&relative_path)
     .bind(document_mode)
     .bind(instruction_page_start)
     .bind(instruction_page_end)
+    .bind(&document_sync_id)
+    .bind(&file_name)
     .fetch_one(pool.inner())
     .await
     .map_err(|e| e.to_string())?;
@@ -4165,6 +4189,7 @@ async fn import_pdf(
         relative_path
     );
 
+    local_sync::mark_dirty();
     Ok(SourceDocument {
         id,
         title,
@@ -4195,42 +4220,55 @@ fn open_file_for_overwrite(
     app.fs().open(path, options).map_err(|e| e.to_string())
 }
 
-async fn replace_main_database_from_staged_import(
+pub(crate) async fn replace_main_database_from_staged_import(
     pool: &SqlitePool,
     staged_import_path: &std::path::Path,
 ) -> Result<(), String> {
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+
+    sqlx::query("PRAGMA busy_timeout = 10000")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?;
+
     sqlx::query("PRAGMA foreign_keys = OFF")
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .map_err(|e| e.to_string())?;
 
     let attach_result = sqlx::query("ATTACH DATABASE ? AS imported")
         .bind(staged_import_path.to_string_lossy().to_string())
-        .execute(pool)
+        .execute(&mut *conn)
         .await;
     if let Err(err) = attach_result {
-        let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(pool).await;
+        let _ = sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *conn)
+            .await;
         return Err(err.to_string());
     }
 
     let table_rows = match sqlx::query(
         "SELECT name FROM main.sqlite_master \
-         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != '_sqlx_migrations' \
          ORDER BY name",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     {
         Ok(rows) => rows,
         Err(err) => {
-            let _ = sqlx::query("DETACH DATABASE imported").execute(pool).await;
-            let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(pool).await;
+            let _ = sqlx::query("DETACH DATABASE imported")
+                .execute(&mut *conn)
+                .await;
+            let _ = sqlx::query("PRAGMA foreign_keys = ON")
+                .execute(&mut *conn)
+                .await;
             return Err(err.to_string());
         }
     };
 
     let mut restore_result = sqlx::query("BEGIN IMMEDIATE TRANSACTION")
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .map(|_| ())
         .map_err(|e| e.to_string());
@@ -4240,7 +4278,7 @@ async fn replace_main_database_from_staged_import(
             let table_name: String = row.get("name");
             let quoted = quote_sqlite_identifier(&table_name);
             let delete_sql = format!("DELETE FROM {quoted}");
-            if let Err(err) = sqlx::query(&delete_sql).execute(pool).await {
+            if let Err(err) = sqlx::query(&delete_sql).execute(&mut *conn).await {
                 restore_result = Err(format!(
                     "failed clearing table {table_name} during import: {err}"
                 ));
@@ -4248,7 +4286,7 @@ async fn replace_main_database_from_staged_import(
             }
 
             let insert_sql = format!("INSERT INTO {quoted} SELECT * FROM imported.{quoted}");
-            if let Err(err) = sqlx::query(&insert_sql).execute(pool).await {
+            if let Err(err) = sqlx::query(&insert_sql).execute(&mut *conn).await {
                 restore_result = Err(format!(
                     "failed copying table {table_name} during import: {err}"
                 ));
@@ -4258,29 +4296,36 @@ async fn replace_main_database_from_staged_import(
     }
 
     if restore_result.is_ok() {
-        let imported_has_sqlite_sequence = sqlx::query_scalar::<_, i64>(
+        let imported_has_sqlite_sequence = match sqlx::query_scalar::<_, i64>(
             "SELECT 1 FROM imported.sqlite_master \
              WHERE type = 'table' AND name = 'sqlite_sequence' \
              LIMIT 1",
         )
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await
-        .map_err(|e| e.to_string())?
-        .is_some();
+        {
+            Ok(value) => value.is_some(),
+            Err(err) => {
+                restore_result = Err(err.to_string());
+                false
+            }
+        };
 
         if imported_has_sqlite_sequence {
-            if let Err(err) = sqlx::query("DELETE FROM sqlite_sequence")
-                .execute(pool)
-                .await
+            if let Err(err) =
+                sqlx::query("DELETE FROM sqlite_sequence WHERE name != '_sqlx_migrations'")
+                    .execute(&mut *conn)
+                    .await
             {
                 restore_result = Err(format!(
                     "failed clearing sqlite_sequence during import: {err}"
                 ));
             } else if let Err(err) = sqlx::query(
                 "INSERT INTO sqlite_sequence(name, seq) \
-                 SELECT name, seq FROM imported.sqlite_sequence",
+                 SELECT name, seq FROM imported.sqlite_sequence \
+                 WHERE name != '_sqlx_migrations'",
             )
-            .execute(pool)
+            .execute(&mut *conn)
             .await
             {
                 restore_result = Err(format!(
@@ -4291,24 +4336,26 @@ async fn replace_main_database_from_staged_import(
     }
 
     if restore_result.is_ok() {
-        if let Err(err) = sqlx::query("COMMIT").execute(pool).await {
+        if let Err(err) = sqlx::query("COMMIT").execute(&mut *conn).await {
             restore_result = Err(err.to_string());
         }
     } else {
-        let _ = sqlx::query("ROLLBACK").execute(pool).await;
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
     }
 
     let detach_result = sqlx::query("DETACH DATABASE imported")
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .map_err(|e| e.to_string());
-    let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(pool).await;
+    let _ = sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *conn)
+        .await;
 
     restore_result?;
     detach_result?;
 
     let fk_violation = sqlx::query("PRAGMA foreign_key_check")
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| e.to_string())?;
     if fk_violation.is_some() {
@@ -4319,110 +4366,75 @@ async fn replace_main_database_from_staged_import(
 }
 
 #[tauri::command]
-async fn export_database_file(
+async fn get_sync_state(
     app: tauri::AppHandle,
     pool: tauri::State<'_, SqlitePool>,
-) -> Result<String, String> {
-    let destination = app
-        .dialog()
-        .file()
-        .add_filter("SQLite DB", &["db", "sqlite", "sqlite3"])
-        .set_file_name("gloss-backup.db")
-        .blocking_save_file();
-    let destination = match destination {
-        Some(path) => path,
-        None => return Err("cancelled".into()),
-    };
-    let destination_label = file_path_label(&destination);
-
-    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
-    let temp_export_path = data_dir.join("gloss-db-export.tmp.db");
-    if temp_export_path.exists() {
-        std::fs::remove_file(&temp_export_path).map_err(|e| e.to_string())?;
-    }
-
-    let export_result = async {
-        sqlx::query("VACUUM INTO ?")
-            .bind(temp_export_path.to_string_lossy().to_string())
-            .execute(pool.inner())
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let bytes = std::fs::read(&temp_export_path).map_err(|e| e.to_string())?;
-        let mut output = open_file_for_overwrite(&app, destination)?;
-        output.write_all(&bytes).map_err(|e| e.to_string())?;
-        output.flush().map_err(|e| e.to_string())?;
-        Ok::<String, String>(destination_label)
-    }
-    .await;
-
-    let _ = std::fs::remove_file(&temp_export_path);
-
-    if let Ok(path) = &export_result {
-        info!(target: "gloss_lib::sync", "exported database backup to {}", path);
-    }
-    export_result
+) -> Result<local_sync::SyncState, String> {
+    local_sync::get_sync_state(app, pool.inner()).await
 }
 
 #[tauri::command]
-async fn import_database_file(
+async fn choose_sync_folder(app: tauri::AppHandle) -> Result<String, String> {
+    local_sync::choose_sync_folder(app).await
+}
+
+#[tauri::command]
+async fn enable_sync_folder(
+    folder_path: String,
     app: tauri::AppHandle,
     pool: tauri::State<'_, SqlitePool>,
-) -> Result<String, String> {
-    let picked = app
-        .dialog()
-        .file()
-        .add_filter("SQLite DB", &["db", "sqlite", "sqlite3"])
-        .blocking_pick_file();
+) -> Result<local_sync::SyncState, String> {
+    local_sync::enable_sync_folder(app, pool.inner(), folder_path).await
+}
 
-    let picked = match picked {
-        Some(path) => path,
-        None => return Err("cancelled".into()),
-    };
-    let picked_label = file_path_label(&picked);
-    let picked_label_result = picked_label.clone();
+#[tauri::command]
+async fn disable_sync(
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<local_sync::SyncState, String> {
+    local_sync::disable_sync(app, pool.inner()).await
+}
 
-    let bytes = app.fs().read(picked).map_err(|e| e.to_string())?;
+#[tauri::command]
+async fn sync_now(
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<local_sync::SyncState, String> {
+    local_sync::sync_now(app, pool.inner(), false).await
+}
 
-    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
-    let staged_import_path = data_dir.join("gloss-db-import.tmp.db");
-    if staged_import_path.exists() {
-        std::fs::remove_file(&staged_import_path).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(&staged_import_path, &bytes).map_err(|e| e.to_string())?;
+#[tauri::command]
+async fn import_latest_sync_snapshot(
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<local_sync::SyncState, String> {
+    local_sync::import_latest_sync_snapshot(app, pool.inner(), false).await
+}
 
-    let import_result = async {
-        let staged_db_url = format!("sqlite://{}?mode=rwc", staged_import_path.display());
-        let staged_pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(&staged_db_url)
-            .await
-            .map_err(|e| e.to_string())?;
+#[tauri::command]
+async fn resolve_sync_conflict(
+    resolution: String,
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<local_sync::SyncState, String> {
+    local_sync::resolve_sync_conflict(app, pool.inner(), resolution).await
+}
 
-        sqlx::migrate!("./migrations")
-            .run(&staged_pool)
-            .await
-            .map_err(|e| e.to_string())?;
-        staged_pool.close().await;
+#[tauri::command]
+async fn take_sync_editing_lease(
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<local_sync::SyncState, String> {
+    local_sync::take_sync_editing_lease(app, pool.inner()).await
+}
 
-        replace_main_database_from_staged_import(pool.inner(), &staged_import_path).await?;
-        sqlx::migrate!("./migrations")
-            .run(pool.inner())
-            .await
-            .map_err(|e| e.to_string())?;
-
-        Ok::<String, String>(picked_label_result)
-    }
-    .await;
-
-    let _ = std::fs::remove_file(&staged_import_path);
-
-    if let Ok(path) = &import_result {
-        info!(target: "gloss_lib::sync", "imported database backup from {}", path);
-    }
-    import_result
+#[tauri::command]
+async fn auto_sync_once(
+    allow_import: bool,
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<local_sync::AutoSyncResult, String> {
+    local_sync::auto_sync_once(app, pool.inner(), allow_import).await
 }
 
 #[tauri::command]
@@ -4453,6 +4465,56 @@ async fn list_textbooks(pool: tauri::State<'_, SqlitePool>) -> Result<Vec<Source
             instruction_page_end: r.get("instruction_page_end"),
         })
         .collect())
+}
+
+#[tauri::command]
+async fn rename_source_document(
+    source_document_id: i64,
+    title: String,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<SourceDocument, String> {
+    local_sync::guard_write()?;
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err("book title cannot be empty".to_string());
+    }
+    if title.chars().count() > 240 {
+        return Err("book title must be 240 characters or fewer".to_string());
+    }
+
+    let row = sqlx::query(
+        "SELECT id, title, file_path, document_mode, instruction_page_start, instruction_page_end \
+         FROM source_documents WHERE id = ?",
+    )
+    .bind(source_document_id)
+    .fetch_optional(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("source document {} not found", source_document_id))?;
+
+    let mut document = SourceDocument {
+        id: row.get("id"),
+        title: row.get("title"),
+        file_path: row.get("file_path"),
+        document_mode: row.get("document_mode"),
+        instruction_page_start: row.get("instruction_page_start"),
+        instruction_page_end: row.get("instruction_page_end"),
+    };
+
+    if document.title == title {
+        return Ok(document);
+    }
+
+    sqlx::query("UPDATE source_documents SET title = ? WHERE id = ?")
+        .bind(&title)
+        .bind(source_document_id)
+        .execute(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    document.title = title;
+    local_sync::mark_dirty();
+    Ok(document)
 }
 
 fn resolve_document_pdf_path(
@@ -4489,6 +4551,7 @@ async fn delete_source_document(
     pool: tauri::State<'_, SqlitePool>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    local_sync::guard_write()?;
     {
         let jobs = state.chunking_jobs.lock().map_err(|e| e.to_string())?;
         if jobs.iter().any(|(doc_id, _)| *doc_id == source_document_id) {
@@ -4650,6 +4713,7 @@ async fn delete_source_document(
         relative_path
     );
 
+    local_sync::mark_dirty();
     Ok(())
 }
 
@@ -4660,6 +4724,7 @@ async fn save_past_paper_instruction_range(
     end_page: Option<i64>,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<SourceDocument, String> {
+    local_sync::guard_write()?;
     let mode_row = sqlx::query("SELECT document_mode FROM source_documents WHERE id = ?")
         .bind(source_document_id)
         .fetch_optional(pool.inner())
@@ -4706,6 +4771,7 @@ async fn save_past_paper_instruction_range(
     .execute(pool.inner())
     .await
     .map_err(|e| e.to_string())?;
+    local_sync::mark_dirty();
 
     let row = sqlx::query(
         "SELECT id, title, file_path, document_mode, instruction_page_start, instruction_page_end \
@@ -4889,6 +4955,7 @@ async fn save_stroke(
     stroke: StrokeInput,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<i64, String> {
+    local_sync::guard_write()?;
     let bounds = stroke_bounds(&stroke.points)?;
     let data = encode_stroke_points(&stroke.points)?;
 
@@ -4909,6 +4976,7 @@ async fn save_stroke(
     .await
     .map_err(|e| e.to_string())?;
 
+    local_sync::mark_dirty();
     Ok(row.get("id"))
 }
 
@@ -4918,6 +4986,7 @@ async fn update_stroke(
     stroke: StrokeInput,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<(), String> {
+    local_sync::guard_write()?;
     let bounds = stroke_bounds(&stroke.points)?;
     let data = encode_stroke_points(&stroke.points)?;
 
@@ -4938,16 +5007,19 @@ async fn update_stroke(
     .await
     .map_err(|e| e.to_string())?;
 
+    local_sync::mark_dirty();
     Ok(())
 }
 
 #[tauri::command]
 async fn delete_stroke(stroke_id: i64, pool: tauri::State<'_, SqlitePool>) -> Result<(), String> {
+    local_sync::guard_write()?;
     sqlx::query("DELETE FROM strokes WHERE id = ?")
         .bind(stroke_id)
         .execute(pool.inner())
         .await
         .map_err(|e| e.to_string())?;
+    local_sync::mark_dirty();
     Ok(())
 }
 
@@ -5013,6 +5085,7 @@ async fn save_surface_stroke(
     stroke: SurfaceStrokeInput,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<i64, String> {
+    local_sync::guard_write()?;
     let bounds = stroke_bounds(&stroke.points)?;
     let data = encode_stroke_points(&stroke.points)?;
 
@@ -5032,6 +5105,7 @@ async fn save_surface_stroke(
     .await
     .map_err(|e| e.to_string())?;
 
+    local_sync::mark_dirty();
     Ok(row.get("id"))
 }
 
@@ -5041,6 +5115,7 @@ async fn update_surface_stroke(
     stroke: SurfaceStrokeInput,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<(), String> {
+    local_sync::guard_write()?;
     let bounds = stroke_bounds(&stroke.points)?;
     let data = encode_stroke_points(&stroke.points)?;
 
@@ -5060,6 +5135,7 @@ async fn update_surface_stroke(
     .await
     .map_err(|e| e.to_string())?;
 
+    local_sync::mark_dirty();
     Ok(())
 }
 
@@ -5100,11 +5176,13 @@ async fn delete_surface_stroke(
     stroke_id: i64,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<(), String> {
+    local_sync::guard_write()?;
     sqlx::query("DELETE FROM surface_strokes WHERE id = ?")
         .bind(stroke_id)
         .execute(pool.inner())
         .await
         .map_err(|e| e.to_string())?;
+    local_sync::mark_dirty();
     Ok(())
 }
 
@@ -5114,6 +5192,7 @@ async fn save_surface_graph_object(
     graph: SurfaceGraphObjectInput,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<i64, String> {
+    local_sync::guard_write()?;
     let normalized = normalize_surface_graph_input(graph)?;
     let row = sqlx::query(
         "INSERT INTO surface_graph_objects \
@@ -5138,6 +5217,7 @@ async fn save_surface_graph_object(
     .await
     .map_err(|e| e.to_string())?;
 
+    local_sync::mark_dirty();
     Ok(row.get("id"))
 }
 
@@ -5183,6 +5263,7 @@ async fn update_surface_graph_object(
     graph: SurfaceGraphObjectInput,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<(), String> {
+    local_sync::guard_write()?;
     let normalized = normalize_surface_graph_input(graph)?;
     let result = sqlx::query(
         "UPDATE surface_graph_objects \
@@ -5212,6 +5293,7 @@ async fn update_surface_graph_object(
         return Err(format!("surface graph object {} not found", graph_id));
     }
 
+    local_sync::mark_dirty();
     Ok(())
 }
 
@@ -5220,11 +5302,13 @@ async fn delete_surface_graph_object(
     graph_id: i64,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<(), String> {
+    local_sync::guard_write()?;
     sqlx::query("DELETE FROM surface_graph_objects WHERE id = ?")
         .bind(graph_id)
         .execute(pool.inner())
         .await
         .map_err(|e| e.to_string())?;
+    local_sync::mark_dirty();
     Ok(())
 }
 
@@ -5347,6 +5431,9 @@ async fn init_db(app: &tauri::App) -> Result<SqlitePool, Box<dyn std::error::Err
         .await?;
 
     sqlx::migrate!("./migrations").run(&pool).await?;
+    settings::init_local_store(&data_dir, &pool)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     Ok(pool)
 }
@@ -5417,9 +5504,17 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             import_pdf,
-            export_database_file,
-            import_database_file,
+            get_sync_state,
+            choose_sync_folder,
+            enable_sync_folder,
+            disable_sync,
+            sync_now,
+            import_latest_sync_snapshot,
+            resolve_sync_conflict,
+            take_sync_editing_lease,
+            auto_sync_once,
             list_textbooks,
+            rename_source_document,
             delete_source_document,
             save_past_paper_instruction_range,
             inspect_past_paper_instruction_context,
