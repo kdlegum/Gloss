@@ -23,17 +23,17 @@ use crate::openai::OpenAiClient;
 use crate::typst_render::{TypstPreviewDocument, TypstRenderer};
 use crate::zai::ZaiClient;
 use base64::Engine as _;
-use log::info;
+use log::{error, info};
 use pdfium_render::prelude::*;
 use percent_encoding::percent_decode_str;
-use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use sqlx::{migrate::MigrateError, sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::Manager;
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_fs::{FilePath, FsExt, OpenOptions};
 use tauri_plugin_log::{Target, TargetKind, TimezoneStrategy};
 use tokio::sync::Semaphore;
@@ -560,9 +560,17 @@ struct SourceDocument {
     id: i64,
     title: String,
     file_path: String,
+    page_count: Option<i64>,
     document_mode: String,
     instruction_page_start: Option<i64>,
     instruction_page_end: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+struct NotebookCanvasOutput {
+    page_id: i64,
+    surface_id: i64,
+    canvas_count: i64,
 }
 
 #[derive(serde::Serialize)]
@@ -2213,6 +2221,7 @@ async fn load_chunk_chat_context(
 struct PageChatContext {
     book_title: String,
     source_document_id: i64,
+    document_mode: String,
     page_number: i64,
     body_markdown: String,
 }
@@ -2222,7 +2231,7 @@ async fn load_page_chat_context(
     page_id: i64,
 ) -> Result<PageChatContext, String> {
     let page_row = sqlx::query(
-        "SELECT p.page_number, p.source_document_id, sd.title AS book_title \
+        "SELECT p.page_number, p.source_document_id, sd.title AS book_title, sd.document_mode \
          FROM pages p \
          JOIN source_documents sd ON sd.id = p.source_document_id \
          WHERE p.id = ?",
@@ -2236,6 +2245,7 @@ async fn load_page_chat_context(
     let page_number: i64 = page_row.get("page_number");
     let source_document_id: i64 = page_row.get("source_document_id");
     let book_title: String = page_row.get("book_title");
+    let document_mode: String = page_row.get("document_mode");
 
     let block_rows = sqlx::query(
         "SELECT COALESCE(NULLIF(TRIM(transcribed_text), ''), NULLIF(TRIM(text), '')) AS body \
@@ -2297,12 +2307,21 @@ async fn load_page_chat_context(
     }
     let chunk_body = chunk_sections.join("\n\n");
 
-    if block_body.is_empty() && chunk_body.is_empty() {
+    if block_body.is_empty() && chunk_body.is_empty() && document_mode != "notebook" {
         return Err("No page text is available for AI chat yet.".to_string());
     }
 
     let mut page_context = String::new();
-    page_context.push_str(&format!("Page number: {}\n", page_number));
+    if document_mode == "notebook" {
+        page_context.push_str(&format!(
+            "Notebook canvas number: {}\n\
+             This is a blank notebook canvas with no imported PDF text. \
+             Use the visual ink, graph attachments, and any ink transcriptions in the chat history as the source of truth.\n",
+            page_number
+        ));
+    } else {
+        page_context.push_str(&format!("Page number: {}\n", page_number));
+    }
     if !block_body.is_empty() {
         page_context.push_str("\nExtracted page text (reading order):\n---\n");
         page_context.push_str(&block_body);
@@ -2317,6 +2336,7 @@ async fn load_page_chat_context(
     Ok(PageChatContext {
         book_title,
         source_document_id,
+        document_mode,
         page_number,
         body_markdown: page_context.trim().to_string(),
     })
@@ -2368,10 +2388,15 @@ async fn run_page_ai_stream(
         } else {
             context.body_markdown.clone()
         };
-        let page_title = format!("Page {}", context.page_number);
+        let is_notebook = context.document_mode == "notebook";
+        let page_title = if is_notebook {
+            format!("Canvas {}", context.page_number)
+        } else {
+            format!("Page {}", context.page_number)
+        };
         let prompt = ChunkChatPrompt {
             book_title: &context.book_title,
-            chunk_type: "page",
+            chunk_type: if is_notebook { "notebook_canvas" } else { "page" },
             title: Some(page_title.as_str()),
             subject: None,
             body_markdown: &prompt_body,
@@ -4195,9 +4220,169 @@ async fn import_pdf(
         id,
         title,
         file_path: relative_path,
+        page_count: None,
         document_mode: document_mode.to_string(),
         instruction_page_start,
         instruction_page_end,
+    })
+}
+
+#[tauri::command]
+async fn create_blank_notebook(
+    title: Option<String>,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<SourceDocument, String> {
+    local_sync::guard_write()?;
+
+    let title = title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Untitled notebook")
+        .to_string();
+    if title.chars().count() > 240 {
+        return Err("notebook title must be 240 characters or fewer".to_string());
+    }
+
+    let document_sync_id = settings::make_local_id("doc");
+    let relative_path = format!("notebooks/{document_sync_id}");
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let row = sqlx::query(
+        "INSERT INTO source_documents \
+         (title, file_path, page_count, document_mode, chunking_status, document_sync_id) \
+         VALUES (?, ?, 1, 'notebook', 'done', ?) RETURNING id",
+    )
+    .bind(&title)
+    .bind(&relative_path)
+    .bind(&document_sync_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    let id: i64 = row.get("id");
+
+    let page_row = sqlx::query(
+        "INSERT INTO pages (source_document_id, page_number) VALUES (?, 1) RETURNING id",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    let page_id: i64 = page_row.get("id");
+
+    sqlx::query("INSERT OR IGNORE INTO note_surfaces (page_id, kind) VALUES (?, 'page_notes')")
+        .bind(page_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    local_sync::mark_dirty();
+    info!(
+        target: "gloss_lib::library",
+        "created blank notebook doc_id={} title=\"{}\"",
+        id,
+        title
+    );
+    Ok(SourceDocument {
+        id,
+        title,
+        file_path: relative_path,
+        page_count: Some(1),
+        document_mode: "notebook".to_string(),
+        instruction_page_start: None,
+        instruction_page_end: None,
+    })
+}
+
+#[tauri::command]
+async fn get_or_create_notebook_canvas(
+    source_document_id: i64,
+    canvas_number: i64,
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<NotebookCanvasOutput, String> {
+    if canvas_number < 1 {
+        return Err("canvas number must be >= 1".to_string());
+    }
+
+    let row = sqlx::query("SELECT document_mode, page_count FROM source_documents WHERE id = ?")
+        .bind(source_document_id)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("source document {} not found", source_document_id))?;
+
+    let document_mode: String = row.get("document_mode");
+    if !document_mode.eq_ignore_ascii_case("notebook") {
+        return Err("notebook canvases can only be opened for notebook documents".to_string());
+    }
+
+    let stored_count = row.get::<Option<i64>, _>("page_count").unwrap_or(0);
+    let existing_max = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MAX(page_number) FROM pages WHERE source_document_id = ?",
+    )
+    .bind(source_document_id)
+    .fetch_one(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?
+    .unwrap_or(0);
+    let mut canvas_count = stored_count.max(existing_max).max(1);
+
+    if canvas_number > canvas_count + 1 {
+        return Err(format!(
+            "cannot create canvas {}; next available canvas is {}",
+            canvas_number,
+            canvas_count + 1
+        ));
+    }
+
+    let creates_new_canvas = canvas_number == canvas_count + 1;
+    if creates_new_canvas {
+        local_sync::guard_write()?;
+        canvas_count = canvas_number;
+    }
+
+    sqlx::query("INSERT OR IGNORE INTO pages (source_document_id, page_number) VALUES (?, ?)")
+        .bind(source_document_id)
+        .bind(canvas_number)
+        .execute(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let page_row = sqlx::query("SELECT id FROM pages WHERE source_document_id = ? AND page_number = ?")
+        .bind(source_document_id)
+        .bind(canvas_number)
+        .fetch_one(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+    let page_id: i64 = page_row.get("id");
+
+    let updates_page_count = creates_new_canvas || stored_count < canvas_count;
+    if updates_page_count {
+        sqlx::query("UPDATE source_documents SET page_count = ? WHERE id = ?")
+            .bind(canvas_count)
+            .bind(source_document_id)
+            .execute(pool.inner())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let surface_id = get_or_create_note_surface_id(
+        NoteSurfaceOwner::Page(page_id),
+        NoteSurfaceKind::PageNotes,
+        pool.inner(),
+    )
+    .await?;
+
+    if creates_new_canvas || updates_page_count {
+        local_sync::mark_dirty();
+    }
+
+    Ok(NotebookCanvasOutput {
+        page_id,
+        surface_id,
+        canvas_count,
     })
 }
 
@@ -4448,7 +4633,7 @@ async fn get_pdf_path(app: tauri::AppHandle, relative_path: String) -> Result<St
 #[tauri::command]
 async fn list_textbooks(pool: tauri::State<'_, SqlitePool>) -> Result<Vec<SourceDocument>, String> {
     let rows = sqlx::query(
-        "SELECT id, title, file_path, document_mode, instruction_page_start, instruction_page_end \
+        "SELECT id, title, file_path, page_count, document_mode, instruction_page_start, instruction_page_end \
          FROM source_documents ORDER BY id DESC",
     )
     .fetch_all(pool.inner())
@@ -4461,6 +4646,7 @@ async fn list_textbooks(pool: tauri::State<'_, SqlitePool>) -> Result<Vec<Source
             id: r.get("id"),
             title: r.get("title"),
             file_path: r.get("file_path"),
+            page_count: r.get("page_count"),
             document_mode: r.get("document_mode"),
             instruction_page_start: r.get("instruction_page_start"),
             instruction_page_end: r.get("instruction_page_end"),
@@ -4484,7 +4670,7 @@ async fn rename_source_document(
     }
 
     let row = sqlx::query(
-        "SELECT id, title, file_path, document_mode, instruction_page_start, instruction_page_end \
+        "SELECT id, title, file_path, page_count, document_mode, instruction_page_start, instruction_page_end \
          FROM source_documents WHERE id = ?",
     )
     .bind(source_document_id)
@@ -4497,6 +4683,7 @@ async fn rename_source_document(
         id: row.get("id"),
         title: row.get("title"),
         file_path: row.get("file_path"),
+        page_count: row.get("page_count"),
         document_mode: row.get("document_mode"),
         instruction_page_start: row.get("instruction_page_start"),
         instruction_page_end: row.get("instruction_page_end"),
@@ -4560,7 +4747,7 @@ async fn delete_source_document(
         }
     }
 
-    let row = sqlx::query("SELECT title, file_path FROM source_documents WHERE id = ?")
+    let row = sqlx::query("SELECT title, file_path, document_mode FROM source_documents WHERE id = ?")
         .bind(source_document_id)
         .fetch_optional(pool.inner())
         .await
@@ -4569,8 +4756,14 @@ async fn delete_source_document(
 
     let title: String = row.get("title");
     let relative_path: String = row.get("file_path");
+    let document_mode: String = row.get("document_mode");
+    let is_notebook = document_mode.eq_ignore_ascii_case("notebook");
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let abs_pdf_path = resolve_document_pdf_path(&data_dir, &relative_path)?;
+    let abs_pdf_path = if is_notebook {
+        None
+    } else {
+        Some(resolve_document_pdf_path(&data_dir, &relative_path)?)
+    };
 
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
@@ -4689,20 +4882,24 @@ async fn delete_source_document(
 
     tx.commit().await.map_err(|e| e.to_string())?;
 
-    if let Ok(mut cache) = state.pdf_cache.lock() {
-        cache.remove_document(&relative_path);
+    if !is_notebook {
+        if let Ok(mut cache) = state.pdf_cache.lock() {
+            cache.remove_document(&relative_path);
+        }
     }
 
-    if let Err(err) = std::fs::remove_file(&abs_pdf_path) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            log::warn!(
-                target: "gloss_lib::library",
-                "deleted doc_id={} title=\"{}\" but failed to remove file {}: {}",
-                source_document_id,
-                title,
-                abs_pdf_path.display(),
-                err
-            );
+    if let Some(abs_pdf_path) = abs_pdf_path {
+        if let Err(err) = std::fs::remove_file(&abs_pdf_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    target: "gloss_lib::library",
+                    "deleted doc_id={} title=\"{}\" but failed to remove file {}: {}",
+                    source_document_id,
+                    title,
+                    abs_pdf_path.display(),
+                    err
+                );
+            }
         }
     }
 
@@ -4775,7 +4972,7 @@ async fn save_past_paper_instruction_range(
     local_sync::mark_dirty();
 
     let row = sqlx::query(
-        "SELECT id, title, file_path, document_mode, instruction_page_start, instruction_page_end \
+        "SELECT id, title, file_path, page_count, document_mode, instruction_page_start, instruction_page_end \
          FROM source_documents WHERE id = ?",
     )
     .bind(source_document_id)
@@ -4787,6 +4984,7 @@ async fn save_past_paper_instruction_range(
         id: row.get("id"),
         title: row.get("title"),
         file_path: row.get("file_path"),
+        page_count: row.get("page_count"),
         document_mode: row.get("document_mode"),
         instruction_page_start: row.get("instruction_page_start"),
         instruction_page_end: row.get("instruction_page_end"),
@@ -5439,6 +5637,51 @@ async fn init_db(app: &tauri::App) -> Result<SqlitePool, Box<dyn std::error::Err
     Ok(pool)
 }
 
+fn startup_database_error_message(error: &(dyn std::error::Error + 'static)) -> String {
+    if let Some(migrate_error) = error.downcast_ref::<MigrateError>() {
+        match migrate_error {
+            MigrateError::VersionMissing(version) => {
+                return format!(
+                    "Gloss cannot open your local data with this installer.\n\n\
+                     Your database has already been upgraded to migration {version}, but this app build does not include that migration. \
+                     This usually happens when a newer local/dev build has run, then an older packaged installer is launched.\n\n\
+                     Install a newer Gloss build that includes migration {version}, or back up and move %APPDATA%\\com.gloss.app\\gloss.db before opening this older build."
+                );
+            }
+            MigrateError::VersionMismatch(version) => {
+                return format!(
+                    "Gloss cannot open your local data because migration {version} in this app does not match the migration that was previously applied.\n\n\
+                     Install the build that created this database, or restore a database backup made before that migration changed."
+                );
+            }
+            _ => {}
+        }
+    }
+
+    format!(
+        "Gloss could not initialise its local database.\n\n\
+         Error: {error}\n\n\
+         Your notes database is at %APPDATA%\\com.gloss.app\\gloss.db."
+    )
+}
+
+fn show_startup_error_dialog(app: &tauri::AppHandle, message: String) {
+    let app = app.clone();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        app.dialog()
+            .message(message)
+            .title("Gloss could not start")
+            .kind(MessageDialogKind::Error)
+            .buttons(MessageDialogButtons::Ok)
+            .blocking_show();
+        let _ = closed_tx.send(());
+    });
+
+    let _ = closed_rx.recv();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -5466,8 +5709,15 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(android_sync::init())
         .setup(|app| {
-            let pool = tauri::async_runtime::block_on(init_db(app))
-                .expect("failed to initialise database");
+            let pool = match tauri::async_runtime::block_on(init_db(app)) {
+                Ok(pool) => pool,
+                Err(err) => {
+                    let message = startup_database_error_message(err.as_ref());
+                    error!(target: "gloss_lib::startup", "failed to initialise database: {err}");
+                    show_startup_error_dialog(app.handle(), message);
+                    return Err(err);
+                }
+            };
             info!(target: "gloss_lib::startup", "database initialised");
             app.manage(pool);
 
@@ -5506,6 +5756,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             import_pdf,
+            create_blank_notebook,
+            get_or_create_notebook_canvas,
             get_sync_state,
             choose_sync_folder,
             enable_sync_folder,
@@ -5574,5 +5826,8 @@ pub fn run() {
             rechunk_page,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .unwrap_or_else(|err| {
+            error!(target: "gloss_lib::startup", "error while running tauri application: {err}");
+            eprintln!("error while running tauri application: {err}");
+        });
 }

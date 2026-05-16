@@ -80,12 +80,15 @@ const ALLOWED_TYPES: &[&str] = &[
 enum DocumentMode {
     Textbook,
     PastPaper,
+    Notebook,
 }
 
 impl DocumentMode {
     fn from_db(value: &str) -> Self {
         if value.trim().eq_ignore_ascii_case("past_paper") {
             Self::PastPaper
+        } else if value.trim().eq_ignore_ascii_case("notebook") {
+            Self::Notebook
         } else {
             Self::Textbook
         }
@@ -240,6 +243,9 @@ async fn run_inner(
             false,
         )
         .await;
+    }
+    if document_mode == DocumentMode::Notebook {
+        return Err("notebook documents do not support PDF chunking".to_string());
     }
 
     let page_id = get_or_create_page(pool, doc_id, page_number).await?;
@@ -1511,6 +1517,9 @@ async fn rechunk_inner(
             true,
         )
         .await;
+    }
+    if document_mode == DocumentMode::Notebook {
+        return Err("notebook documents do not support PDF chunking".to_string());
     }
 
     let page_id = get_or_create_page(pool, doc_id, page_number).await?;

@@ -58,12 +58,13 @@
     onViewerBatchStateChange: (state: ParentViewerBatchSettingsState | null) => void;
   } = $props();
 
-  type DocumentMode = "textbook" | "past_paper";
+  type DocumentMode = "textbook" | "past_paper" | "notebook";
 
   interface SourceDocument {
     id: number;
     title: string;
     file_path: string;
+    page_count: number | null;
     document_mode: DocumentMode;
     instruction_page_start: number | null;
     instruction_page_end: number | null;
@@ -97,6 +98,12 @@
     bitmapHeight: number;
     pageWidthPoints: number;
     pageHeightPoints: number;
+  }
+
+  interface NotebookCanvasOutput {
+    page_id: number;
+    surface_id: number;
+    canvas_count: number;
   }
 
   type ChunkingProvider = "ollama" | "openai" | "gemini" | "deepseek";
@@ -390,6 +397,10 @@
   let totalPages = $state(0);
   let rendering = $state(false);
 
+  function isNotebookDocument(book: SourceDocument | null = selectedBook): boolean {
+    return book?.document_mode === "notebook";
+  }
+
   // DB row id for the current (source_document, page) pair; null until resolved
   let currentPageId = $state<number | null>(null);
   let currentPageSurfaceId = $state<number | null>(null);
@@ -549,6 +560,21 @@
       points: s.points.map(p => ({ x: p.x, y: p.y, pressure: 0.5 })),
       bbox: { minX: s.min_x, minY: s.min_y, maxX: s.max_x, maxY: s.max_y },
       chunkId: s.chunk_id,
+    }));
+    redoStack = [];
+    clearPageStrokeTransformHistory();
+    markDirty();
+  }
+
+  async function loadAndDrawSurfaceStrokes(surfaceId: number) {
+    const loaded = await invoke<SurfaceStrokeOutput[]>("load_surface_strokes", { surfaceId });
+    strokes = loaded.map(s => ({
+      id: s.id,
+      colour: s.colour,
+      thickness: s.thickness ?? 1,
+      points: s.points.map(p => ({ x: p.x, y: p.y, pressure: 0.5 })),
+      bbox: { minX: s.min_x, minY: s.min_y, maxX: s.max_x, maxY: s.max_y },
+      chunkId: null,
     }));
     redoStack = [];
     clearPageStrokeTransformHistory();
@@ -960,6 +986,8 @@
   const PDF_BITMAP_CACHE_MAX = 10;
   const PDF_PREVIEW_DPR_CAP = 1.25;
   const PDF_PREVIEW_MAX_WIDTH = 1280;
+  const NOTEBOOK_PAGE_ASPECT = Math.SQRT2;
+  const INK_DOCUMENT_BUFFER_PAGES = 1;
   const pdfBitmapCacheOrder: string[] = [];
   const pdfBitmapCache = new Map<string, ImageBitmap>();
   const pdfBitmapMetaCache = new Map<string, Omit<RenderedPdfBitmap, "bitmap">>();
@@ -1049,6 +1077,7 @@
   }
 
   async function fetchPdfBitmap(pageNum: number, targetPixelWidth: number): Promise<{ key: string; rendered: RenderedPdfBitmap }> {
+    if (isNotebookDocument()) throw new Error("Notebook documents do not have PDF bitmaps");
     if (!selectedBook) throw new Error("No selected book");
     const bookPath = selectedBook.file_path;
     const cacheKey = makePdfBitmapCacheKey(bookPath, pageNum, targetPixelWidth);
@@ -1096,6 +1125,7 @@
   }
 
   function prefetchPdfBitmap(pageNum: number, targetPixelWidth: number) {
+    if (isNotebookDocument()) return;
     if (!selectedBook) return;
     if (pageNum < 1 || (totalPages > 0 && pageNum > totalPages)) return;
 
@@ -1131,6 +1161,7 @@
   }
 
   async function requestCurrentPdfBitmap() {
+    if (isNotebookDocument()) return;
     if (!selectedBook || !currentPdfPagePoints.w) return;
     const bookPath = selectedBook.file_path;
     const targetPixelWidth = getUpgradePdfPixelWidth();
@@ -1167,10 +1198,11 @@
     const sy = clientY - rect.top;
     const wx = (sx - camera.x) / camera.scale;
     const wy = (sy - camera.y) / camera.scale;
-    return {
-      x: (wx - pageOrigin.x) / pageSize.w,
-      y: (wy - pageOrigin.y) / pageSize.h,
-    };
+    const x = (wx - pageOrigin.x) / pageSize.w;
+    const y = (wy - pageOrigin.y) / pageSize.h;
+    return isNotebookDocument()
+      ? { x: clampNorm(x), y: Math.max(0, y) }
+      : { x, y };
   }
 
   /** Normalised page space â†’ world space coordinates. */
@@ -1329,6 +1361,37 @@
     stroke: Stroke,
     stillPresent: () => boolean = () => true,
   ): Promise<void> {
+    if (isNotebookDocument()) {
+      let surfaceId = currentPageSurfaceId;
+      if (surfaceId == null) {
+        try {
+          const pageSurface = await ensurePageSurface(pageId);
+          surfaceId = pageSurface.surfaceId;
+          if (currentPageId === pageId) currentPageSurfaceId = surfaceId;
+        } catch (err) {
+          void appLogWarn(`[ink] failed to resolve notebook surface pageId=${pageId}: ${formatLogError(err)}`);
+          return;
+        }
+      }
+      if (surfaceId == null) return;
+      const initial = serialiseSurfaceStrokeInput(stroke);
+      try {
+        const id = await invoke<number>("save_surface_stroke", { surfaceId, stroke: initial });
+        stroke.id = id;
+        if (currentPageId === pageId && !stillPresent()) {
+          await invoke("delete_surface_stroke", { strokeId: id });
+          return;
+        }
+        const latest = serialiseSurfaceStrokeInput(stroke);
+        if (!surfaceStrokeInputsMatch(initial, latest)) {
+          await invoke("update_surface_stroke", { strokeId: id, stroke: latest });
+        }
+      } catch (err) {
+        void appLogWarn(`[ink] save_surface_stroke failed: ${formatLogError(err)}`);
+      }
+      return;
+    }
+
     const initial = serialisePageStrokeInput(stroke);
     try {
       const id = await invoke<number>("save_stroke", { pageId, stroke: initial });
@@ -1369,6 +1432,20 @@
   }
 
   async function persistPageStrokeUpdates(targetStrokes: Stroke[]): Promise<void> {
+    if (isNotebookDocument()) {
+      if (targetStrokes.length === 0) return;
+      await Promise.all(targetStrokes.map(async (stroke) => {
+        if (stroke.id === null) return;
+        await invoke("update_surface_stroke", {
+          strokeId: stroke.id,
+          stroke: serialiseSurfaceStrokeInput(stroke),
+        });
+      })).catch((err) => {
+        void appLogWarn(`[ink] update_surface_stroke failed: ${formatLogError(err)}`);
+      });
+      return;
+    }
+
     const pageId = currentPageId;
     if (pageId === null || targetStrokes.length === 0) return;
     cacheEvict(pageId);
@@ -1381,6 +1458,12 @@
     })).catch((err) => {
       void appLogWarn(`[ink] update_stroke failed: ${formatLogError(err)}`);
     });
+  }
+
+  function deletePageStroke(strokeId: number): Promise<void> {
+    return isNotebookDocument()
+      ? invoke("delete_surface_stroke", { strokeId })
+      : invoke("delete_stroke", { strokeId });
   }
 
   async function persistChunkStrokeUpdates(targetStrokes: Stroke[]): Promise<void> {
@@ -1756,7 +1839,9 @@
     const w = clampNorm(Math.max(MIN_GRAPH_BBOX_SIZE, rect.w));
     const h = clampNorm(Math.max(MIN_GRAPH_BBOX_SIZE, rect.h));
     const x = Math.max(0, Math.min(1 - w, rect.x));
-    const y = Math.max(0, Math.min(1 - h, rect.y));
+    const y = isNotebookDocument()
+      ? Math.max(0, rect.y)
+      : Math.max(0, Math.min(1 - h, rect.y));
     return { x, y, w, h };
   }
 
@@ -2052,7 +2137,7 @@
     }
     if (currentPageId !== null) cacheEvict(currentPageId);
     for (const s of toDelete) {
-      if (s.id !== null) invoke("delete_stroke", { strokeId: s.id }).catch(() => {});
+      if (s.id !== null) deletePageStroke(s.id).catch(() => {});
     }
     markDirty();
   }
@@ -2122,6 +2207,10 @@
 
     if (!isPenOrMouse(e)) return;
     if (activePointerId !== null) return;
+    if (rendering || currentPageId === null) {
+      e.preventDefault();
+      return;
+    }
 
     if (pendingGraphPlacement?.scope === "page") {
       const { x, y } = pointerToNorm(e.clientX, e.clientY);
@@ -2415,12 +2504,15 @@
       const strokeDrag = pageStrokeDrag;
       if (strokeDrag) {
         const { x, y } = pointerToNorm(e.clientX, e.clientY);
-        const deltaX = x - strokeDrag.startPoint.x;
-        const deltaY = y - strokeDrag.startPoint.y;
-        translateDraggedStrokes(strokeDrag, deltaX, deltaY);
+        const rawDeltaX = x - strokeDrag.startPoint.x;
+        const rawDeltaY = y - strokeDrag.startPoint.y;
+        const delta = isNotebookDocument()
+          ? clampChunkStrokeDragDelta(strokeDrag.startSelection, rawDeltaX, rawDeltaY)
+          : { deltaX: rawDeltaX, deltaY: rawDeltaY };
+        translateDraggedStrokes(strokeDrag, delta.deltaX, delta.deltaY);
         selection = {
-          x: strokeDrag.startSelection.x + deltaX,
-          y: strokeDrag.startSelection.y + deltaY,
+          x: strokeDrag.startSelection.x + delta.deltaX,
+          y: strokeDrag.startSelection.y + delta.deltaY,
           width: strokeDrag.startSelection.width,
           height: strokeDrag.startSelection.height,
         };
@@ -2688,7 +2780,7 @@
     ctx.clearRect(0, 0, w, h);
 
     const GRID_WORLD = 40;
-    const DOT_R = 1.5;
+    const DOT_R = isNotebookDocument() ? 1.3 : 1.5;
     const spacing = GRID_WORLD * camera.scale;
     if (spacing < 8 || spacing > 300) return;
 
@@ -2696,7 +2788,7 @@
     const startX = Math.floor(startW.x / GRID_WORLD) * GRID_WORLD;
     const startY = Math.floor(startW.y / GRID_WORLD) * GRID_WORLD;
 
-    ctx.fillStyle = 'rgba(0,0,0,0.18)';
+    ctx.fillStyle = isNotebookDocument() ? "rgba(15, 23, 42, 0.18)" : "rgba(0,0,0,0.18)";
     for (let wx = startX; ; wx += GRID_WORLD) {
       const sx = (wx * camera.scale + camera.x) * dpr;
       if (sx > w + DOT_R * dpr) break;
@@ -2712,8 +2804,102 @@
     }
   }
 
+  function getNotebookDocumentPageCount(): number {
+    let maxPage = 1;
+    for (const stroke of strokes) {
+      if (!strokeHasFiniteBounds(stroke)) continue;
+      maxPage = Math.max(maxPage, Math.ceil(Math.max(0, stroke.bbox.maxY)));
+    }
+    for (const graph of pageGraphs) {
+      if (!graphHasFiniteChunkBounds(graph)) continue;
+      maxPage = Math.max(maxPage, Math.ceil(Math.max(0, graph.bboxY + graph.bboxH)));
+    }
+    return maxPage + INK_DOCUMENT_BUFFER_PAGES;
+  }
+
+  function drawInkPageGuides(
+    ctx: CanvasRenderingContext2D,
+    options: {
+      originX?: number;
+      originY?: number;
+      pageWidth: number;
+      pageHeight: number;
+      pageCount: number;
+      scale: number;
+      visMinY: number;
+      visMaxY: number;
+      labelPrefix?: string;
+    },
+  ) {
+    const {
+      originX = 0,
+      originY = 0,
+      pageWidth,
+      pageHeight,
+      pageCount,
+      scale,
+      visMinY,
+      visMaxY,
+      labelPrefix = "Page",
+    } = options;
+    if (pageWidth <= 0 || pageHeight <= 0 || pageCount <= 0) return;
+    const px = 1 / scale;
+    const startPage = Math.max(0, Math.floor((visMinY - originY) / pageHeight));
+    const endPage = Math.min(pageCount - 1, Math.floor((visMaxY - originY) / pageHeight));
+
+    for (let pageIndex = startPage; pageIndex <= endPage; pageIndex += 1) {
+      const pageTop = originY + pageIndex * pageHeight;
+      const inset = px * 0.5;
+      const label = `${labelPrefix} ${pageIndex + 1}`;
+      const fontSize = 11 * px;
+      const padX = 8 * px;
+      const padY = 4 * px;
+      const labelX = originX + 14 * px;
+      const labelY = pageTop + 14 * px;
+
+      ctx.save();
+      ctx.strokeStyle = "rgba(100, 116, 139, 0.32)";
+      ctx.lineWidth = 1.2 * px;
+      ctx.strokeRect(
+        originX + inset,
+        pageTop + inset,
+        Math.max(0, pageWidth - px),
+        Math.max(0, pageHeight - px),
+      );
+
+      ctx.font = `${fontSize}px Inter, system-ui, sans-serif`;
+      ctx.textBaseline = "top";
+      const labelW = ctx.measureText(label).width + padX * 2;
+      const labelH = fontSize + padY * 2;
+      ctx.fillStyle = "rgba(248, 250, 252, 0.94)";
+      ctx.fillRect(labelX, labelY, labelW, labelH);
+      ctx.strokeStyle = "rgba(148, 163, 184, 0.45)";
+      ctx.lineWidth = px;
+      ctx.strokeRect(labelX, labelY, labelW, labelH);
+      ctx.fillStyle = "rgba(51, 65, 85, 0.82)";
+      ctx.fillText(label, labelX + padX, labelY + padY);
+      ctx.restore();
+    }
+  }
+
+  function renderNotebookPageGuides(ctx: CanvasRenderingContext2D) {
+    if (!canvasContainer || !pageSize.w || !pageSize.h) return;
+    const visMinY = -camera.y / camera.scale;
+    const visMaxY = visMinY + canvasContainer.clientHeight / camera.scale;
+    drawInkPageGuides(ctx, {
+      originX: pageOrigin.x,
+      originY: pageOrigin.y,
+      pageWidth: pageSize.w,
+      pageHeight: pageSize.h,
+      pageCount: getNotebookDocumentPageCount(),
+      scale: camera.scale,
+      visMinY,
+      visMaxY,
+    });
+  }
+
   function renderPdf() {
-    if (!pdfCtx || !pdfCanvas || !currentPdfBitmap) return;
+    if (!pdfCtx || !pdfCanvas) return;
     const ctx = pdfCtx;
     const dpr = window.devicePixelRatio || 1;
     ctx.setTransform(camera.scale * dpr, 0, 0, camera.scale * dpr, camera.x * dpr, camera.y * dpr);
@@ -2721,6 +2907,11 @@
       -camera.x / camera.scale, -camera.y / camera.scale,
       pdfCanvas.width / (camera.scale * dpr), pdfCanvas.height / (camera.scale * dpr),
     );
+    if (isNotebookDocument()) {
+      renderNotebookPageGuides(ctx);
+      return;
+    }
+    if (!currentPdfBitmap) return;
     ctx.drawImage(currentPdfBitmap, pageOrigin.x, pageOrigin.y, pageSize.w, pageSize.h);
   }
 
@@ -3021,6 +3212,7 @@
     wetCtx  = wetCanvas.getContext("2d")!;
     if (dryCtx) { dryCtx.lineCap = "round"; dryCtx.lineJoin = "round"; }
     if (wetCtx) { wetCtx.lineCap = "round"; wetCtx.lineJoin = "round"; }
+    if (isNotebookDocument()) configureNotebookCanvasLayout();
     markDirty();
   }
 
@@ -3057,10 +3249,33 @@
     markDirty();
   }
 
+  function configureNotebookCanvasLayout(options: { recenter?: boolean } = {}) {
+    if (!canvasContainer || !isNotebookDocument()) return;
+    const pageDisplayW = getPageDisplayWidth();
+    pageOrigin = { x: 0, y: 0 };
+    pageSize = {
+      w: pageDisplayW,
+      h: pageDisplayW * NOTEBOOK_PAGE_ASPECT,
+    };
+    currentPdfPagePoints = { w: pageSize.w, h: pageSize.h };
+    currentPdfBitmap = null;
+    currentPdfBitmapKey = null;
+    if (options.recenter) {
+      centreOnPage();
+    } else {
+      markDirty();
+    }
+  }
+
   // â”€â”€ PDF loading â”€â”€
 
   async function loadPdfPage(pageNum: number) {
-    if (!selectedBook || !canvasContainer) return;
+    if (!selectedBook) return;
+    if (!canvasContainer) {
+      await tick();
+      setupCanvases();
+    }
+    if (!canvasContainer) throw new Error("Viewer canvas is not ready");
     rendering = true;
     const loadVersion = ++pdfLoadVersion;
     void appLogInfo(`[viewer] loading doc=${selectedBook.id} page=${pageNum}`);
@@ -3094,6 +3309,49 @@
       void appLogError(
         `[viewer] failed to load doc=${selectedBook.id} page=${pageNum}: ${formatLogError(err)}`,
       );
+      throw err;
+    } finally {
+      rendering = false;
+    }
+  }
+
+  async function loadNotebookCanvas(canvasNumber: number) {
+    if (!selectedBook || !isNotebookDocument(selectedBook)) return;
+    if (!canvasContainer) {
+      await tick();
+      setupCanvases();
+    }
+    if (!canvasContainer) throw new Error("Notebook canvas is not ready");
+    rendering = true;
+    void appLogInfo(`[notebook] loading doc=${selectedBook.id} canvas=${canvasNumber}`);
+    try {
+      configureNotebookCanvasLayout({ recenter: true });
+      const canvas = await invoke<NotebookCanvasOutput>("get_or_create_notebook_canvas", {
+        sourceDocumentId: selectedBook.id,
+        canvasNumber,
+      });
+      currentPageId = canvas.page_id;
+      currentPageSurfaceId = canvas.surface_id;
+      clearNotebookInkContextCache();
+      totalPages = Math.max(1, canvas.canvas_count);
+      if (selectedBook.page_count !== totalPages) {
+        const updated = { ...selectedBook, page_count: totalPages };
+        selectedBook = updated;
+        onBookUpdated(updated);
+      }
+      await loadAndDrawSurfaceStrokes(canvas.surface_id);
+      const pageSurface = await ensurePageSurface(canvas.page_id);
+      if (!selectedBook || currentPage !== canvasNumber || currentPageId !== canvas.page_id) return;
+      currentPageSurfaceId = canvas.surface_id;
+      pageGraphs = cloneGraphObjects(pageSurface.graphs);
+      currentChunks = [];
+      chunkNavigationPageChunks = [];
+      currentPageChunkingActive = false;
+      currentChunkingStatus = "done";
+      markDirty();
+      void appLogInfo(`[notebook] loaded doc=${selectedBook.id} canvas=${canvasNumber} count=${totalPages}`);
+    } catch (err) {
+      void appLogError(`[notebook] failed to load doc=${selectedBook?.id ?? "unknown"} canvas=${canvasNumber}: ${formatLogError(err)}`);
       throw err;
     } finally {
       rendering = false;
@@ -3715,14 +3973,22 @@
     pageSurfaceCache.clear();
     pageSurfaceRequests.clear();
 
-    // Get page count from backend
+    await tick();
+    setupCanvases();
+
     try {
-      totalPages = await invoke<number>("get_page_count", { relativePath: book.file_path });
-      void appLogInfo(`[viewer] doc=${book.id} page_count=${totalPages}`);
-      void logChunkingStatus(book.id, "on open");
-      if (currentPage > totalPages) currentPage = 1;
-      await loadPdfPage(currentPage);
-      resolvePageId(book.id, currentPage);
+      if (isNotebookDocument(book)) {
+        totalPages = Math.max(1, book.page_count ?? 1);
+        if (currentPage > totalPages) currentPage = totalPages;
+        await loadNotebookCanvas(currentPage);
+      } else {
+        totalPages = await invoke<number>("get_page_count", { relativePath: book.file_path });
+        void appLogInfo(`[viewer] doc=${book.id} page_count=${totalPages}`);
+        void logChunkingStatus(book.id, "on open");
+        if (currentPage > totalPages) currentPage = 1;
+        await loadPdfPage(currentPage);
+        resolvePageId(book.id, currentPage);
+      }
     } catch (e) {
       error = String(e);
       void appLogError(`[viewer] failed to open doc=${book.id}: ${formatLogError(e)}`);
@@ -3731,6 +3997,35 @@
 
   async function goToPage(pageNum: number, options: { keepChunkView?: boolean } = {}) {
     if (rendering) return;
+    if (isNotebookDocument()) {
+      const target = Math.max(1, Math.min(totalPages + 1, pageNum));
+      if (target === currentPage && currentPageSurfaceId !== null) return;
+      if (viewerAiOpen || viewerAiContextPageId !== null || pendingChatAttachment) {
+        await closeViewerAiPanel();
+      }
+      if (chunkView && !options.keepChunkView) closeChunkView();
+      pendingChunkTap = null;
+      currentPage = target;
+      currentPageId = null;
+      currentPageSurfaceId = null;
+      strokes = [];
+      redoStack = [];
+      clearPageStrokeTransformHistory();
+      pageGraphs = [];
+      selectedPageGraphId = null;
+      pageGraphDrag = null;
+      pageGraphUndoStack = [];
+      pageGraphRedoStack = [];
+      pendingGraphPlacement = null;
+      selectedStrokes = new Set();
+      selection = null;
+      currentChunks = [];
+      currentPageChunkingActive = false;
+      if (selectedBook) saveCurrentPage(selectedBook.id, currentPage);
+      await loadNotebookCanvas(currentPage);
+      return;
+    }
+
     const clamped = Math.max(1, Math.min(totalPages, pageNum));
     if (clamped === currentPage && currentPdfBitmap) return;
     if (viewerAiOpen || viewerAiContextPageId !== null || pendingChatAttachment) {
@@ -3878,7 +4173,7 @@
     }
     if (currentPageId !== null) cacheEvict(currentPageId);
     for (const stroke of removed) {
-      if (stroke.id !== null) invoke("delete_stroke", { strokeId: stroke.id }).catch(() => {});
+      if (stroke.id !== null) deletePageStroke(stroke.id).catch(() => {});
     }
     markDirty();
   }
@@ -3934,7 +4229,7 @@
     clearPageStrokeTransformHistory();
     if (currentPageId !== null) cacheEvict(currentPageId);
     for (const s of deleted) {
-      if (s.id !== null) invoke("delete_stroke", { strokeId: s.id }).catch(() => {});
+      if (s.id !== null) deletePageStroke(s.id).catch(() => {});
     }
     redoStack = [...redoStack, deleted];
     strokes = strokes.filter(s => !selectedStrokes.has(s));
@@ -3971,7 +4266,7 @@
       clipboard,
       { w: pageSize.w, h: pageSize.h },
       null,
-      { minX: 0, maxX: 1, minY: 0, maxY: 1 },
+      { minX: 0, maxX: 1, minY: 0, maxY: isNotebookDocument() ? Number.POSITIVE_INFINITY : 1 },
       anchorPoint,
     );
     if (!prepared) return false;
@@ -4025,7 +4320,6 @@
   const CHUNK_INK_CONTEXT_TARGET_EDGE = 1200;
   const CHUNK_INK_CONTEXT_MIN_EDGE = 320;
   const CHUNK_INK_CONTEXT_MAX_EDGE = 1600;
-  const CHUNK_DOCUMENT_BUFFER_PAGES = 1;
 
   interface ChunkFormattedBodyOutput {
     body_markdown: string;
@@ -4076,8 +4370,91 @@
     return tmp.toDataURL("image/png").split(",")[1];
   }
 
+  async function rasteriseInkSelection(
+    rect: { x: number; y: number; width: number; height: number },
+    sourceStrokes: Stroke[],
+    sourceGraphs: SurfaceGraphObject[],
+    baseWidth: number,
+    baseHeight: number,
+  ): Promise<string> {
+    const selectionWidth = Math.max(0.001, rect.width);
+    const selectionHeight = Math.max(0.001, rect.height);
+    const sourceWidth = Math.max(1, Math.round(selectionWidth * baseWidth));
+    const sourceHeight = Math.max(1, Math.round(selectionHeight * baseHeight));
+    const sourceLongest = Math.max(sourceWidth, sourceHeight);
+    const targetLongest = Math.min(
+      CHUNK_TRANSCRIPTION_TARGET_WIDTH,
+      Math.max(480, sourceLongest),
+    );
+    const scale = targetLongest / sourceLongest;
+    const outWidth = Math.max(1, Math.round(sourceWidth * scale));
+    const outHeight = Math.max(1, Math.round(sourceHeight * scale));
+
+    const offscreen = new OffscreenCanvas(outWidth, outHeight);
+    const ctx = offscreen.getContext("2d");
+    if (!ctx) throw new Error("Failed to create ink selection canvas");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, outWidth, outHeight);
+
+    const cropMinX = rect.x;
+    const cropMinY = rect.y;
+    const cropMaxX = cropMinX + selectionWidth;
+    const cropMaxY = cropMinY + selectionHeight;
+    const pxPerNormX = outWidth / selectionWidth;
+    const pxPerNormY = outHeight / selectionHeight;
+    const lineWidthScale = pxPerNormX / Math.max(baseWidth, 1);
+
+    for (const stroke of sourceStrokes) {
+      if (stroke.points.length < 2) continue;
+      if (
+        stroke.bbox.maxX < cropMinX || stroke.bbox.minX > cropMaxX
+        || stroke.bbox.maxY < cropMinY || stroke.bbox.minY > cropMaxY
+      ) {
+        continue;
+      }
+      const lineWidth = Math.max(1, stroke.thickness * lineWidthScale);
+      drawChunkInkContextStroke(
+        ctx,
+        stroke,
+        cropMinX,
+        cropMinY,
+        pxPerNormX,
+        pxPerNormY,
+        lineWidth,
+      );
+    }
+
+    for (const graph of sourceGraphs) {
+      const x2 = graph.bboxX + graph.bboxW;
+      const y2 = graph.bboxY + graph.bboxH;
+      if (
+        x2 < cropMinX || graph.bboxX > cropMaxX
+        || y2 < cropMinY || graph.bboxY > cropMaxY
+      ) {
+        continue;
+      }
+      drawGraphCard(
+        ctx as unknown as CanvasRenderingContext2D,
+        graphObjectToSpec(graph),
+        (graph.bboxX - cropMinX) * pxPerNormX,
+        (graph.bboxY - cropMinY) * pxPerNormY,
+        graph.bboxW * pxPerNormX,
+        graph.bboxH * pxPerNormY,
+      );
+    }
+
+    return offscreenToBase64(offscreen);
+  }
+
+  async function rasteriseNotebookSelection(): Promise<string> {
+    if (!selection || !isNotebookDocument()) throw new Error("Nothing selected");
+    return rasteriseInkSelection(selection, strokes, pageGraphs, pageSize.w, pageSize.h);
+  }
+
   async function rasteriseSelection(): Promise<string> {
-    if (!selection || !currentPdfBitmap) throw new Error("Nothing selected");
+    if (!selection) throw new Error("Nothing selected");
+    if (isNotebookDocument()) return rasteriseNotebookSelection();
+    if (!currentPdfBitmap) throw new Error("No PDF bitmap available");
     // PDF bitmap dimensions
     const bw = currentPdfBitmap.width;
     const bh = currentPdfBitmap.height;
@@ -4164,73 +4541,7 @@
   async function rasteriseChunkSelection(): Promise<string> {
     if (!chunkSelection || !chunkView) throw new Error("Nothing selected");
     const { w: baseWidth, h: baseHeight } = getChunkPageWorldSize();
-    const selectionWidth = Math.max(0.001, chunkSelection.width);
-    const selectionHeight = Math.max(0.001, chunkSelection.height);
-    const sourceWidth = Math.max(1, Math.round(selectionWidth * baseWidth));
-    const sourceHeight = Math.max(1, Math.round(selectionHeight * baseHeight));
-    const sourceLongest = Math.max(sourceWidth, sourceHeight);
-    const targetLongest = Math.min(
-      CHUNK_TRANSCRIPTION_TARGET_WIDTH,
-      Math.max(480, sourceLongest),
-    );
-    const scale = targetLongest / sourceLongest;
-    const outWidth = Math.max(1, Math.round(sourceWidth * scale));
-    const outHeight = Math.max(1, Math.round(sourceHeight * scale));
-
-    const offscreen = new OffscreenCanvas(outWidth, outHeight);
-    const ctx = offscreen.getContext("2d");
-    if (!ctx) throw new Error("Failed to create chunk selection canvas");
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, outWidth, outHeight);
-
-    const cropMinX = chunkSelection.x;
-    const cropMinY = chunkSelection.y;
-    const cropMaxX = cropMinX + selectionWidth;
-    const cropMaxY = cropMinY + selectionHeight;
-    const pxPerNormX = outWidth / selectionWidth;
-    const pxPerNormY = outHeight / selectionHeight;
-    const lineWidthScale = pxPerNormX / Math.max(baseWidth, 1);
-
-    for (const stroke of chunkView.strokes) {
-      if (stroke.points.length < 2) continue;
-      if (
-        stroke.bbox.maxX < cropMinX || stroke.bbox.minX > cropMaxX
-        || stroke.bbox.maxY < cropMinY || stroke.bbox.minY > cropMaxY
-      ) {
-        continue;
-      }
-      const lineWidth = Math.max(1, stroke.thickness * lineWidthScale);
-      drawChunkInkContextStroke(
-        ctx,
-        stroke,
-        cropMinX,
-        cropMinY,
-        pxPerNormX,
-        pxPerNormY,
-        lineWidth,
-      );
-    }
-
-    for (const graph of chunkView.graphs) {
-      const x2 = graph.bboxX + graph.bboxW;
-      const y2 = graph.bboxY + graph.bboxH;
-      if (
-        x2 < cropMinX || graph.bboxX > cropMaxX
-        || y2 < cropMinY || graph.bboxY > cropMaxY
-      ) {
-        continue;
-      }
-      drawGraphCard(
-        ctx as unknown as CanvasRenderingContext2D,
-        graphObjectToSpec(graph),
-        (graph.bboxX - cropMinX) * pxPerNormX,
-        (graph.bboxY - cropMinY) * pxPerNormY,
-        graph.bboxW * pxPerNormX,
-        graph.bboxH * pxPerNormY,
-      );
-    }
-
-    return offscreenToBase64(offscreen);
+    return rasteriseInkSelection(chunkSelection, chunkView.strokes, chunkView.graphs, baseWidth, baseHeight);
   }
 
   async function onChunkAiClick() {
@@ -5461,6 +5772,12 @@
     transcription: string | null;
   }
 
+  interface NotebookInkContextCache {
+    pageId: number;
+    fingerprint: string;
+    transcription: string | null;
+  }
+
   interface ChunkVisualPageImage {
     pageIndex: number;
     imageBase64: string;
@@ -5468,6 +5785,7 @@
   }
 
   let chunkInkContextCache = $state<ChunkInkContextCache | null>(null);
+  let notebookInkContextCache = $state<NotebookInkContextCache | null>(null);
 
   let chunkAiRewriteTab = $state<'body' | 'glossary'>('body');
   let chunkRewritePrompt = $state("");
@@ -6321,6 +6639,10 @@
     chunkInkContextCache = null;
   }
 
+  function clearNotebookInkContextCache() {
+    notebookInkContextCache = null;
+  }
+
   function strokeHasFiniteBounds(stroke: Stroke): boolean {
     return Number.isFinite(stroke.bbox.minX)
       && Number.isFinite(stroke.bbox.minY)
@@ -6452,18 +6774,17 @@
     ctx.stroke();
   }
 
-  async function rasteriseChunkVisualPages(chunkId: number): Promise<ChunkVisualPageImage[]> {
-    const view = chunkView;
-    if (!view || view.chunk.id !== chunkId) return [];
-    const drawableStrokes = getLikelyChunkInkStrokes(view.strokes);
-    const drawableGraphs = getRenderableChunkGraphs(view.graphs);
+  async function rasteriseInkVisualPages(
+    drawableStrokes: Stroke[],
+    drawableGraphs: SurfaceGraphObject[],
+    pageAspect: number,
+    pageWidthWorld: number,
+  ): Promise<ChunkVisualPageImage[]> {
     if (drawableStrokes.length === 0 && drawableGraphs.length === 0) return [];
 
     const pageBounds = getChunkVisualPageBounds(drawableStrokes, drawableGraphs);
     if (!pageBounds) return [];
 
-    const pageAspect = getChunkPageAspect();
-    const pageWidthWorld = getChunkPageWorldSize().w;
     const width = CHUNK_INK_CONTEXT_TARGET_EDGE;
     const height = Math.max(
       CHUNK_INK_CONTEXT_MIN_EDGE,
@@ -6530,6 +6851,28 @@
     return pages;
   }
 
+  async function rasteriseChunkVisualPages(chunkId: number): Promise<ChunkVisualPageImage[]> {
+    const view = chunkView;
+    if (!view || view.chunk.id !== chunkId) return [];
+    return rasteriseInkVisualPages(
+      getLikelyChunkInkStrokes(view.strokes),
+      getRenderableChunkGraphs(view.graphs),
+      getChunkPageAspect(),
+      getChunkPageWorldSize().w,
+    );
+  }
+
+  async function rasteriseNotebookVisualPages(pageId: number): Promise<ChunkVisualPageImage[]> {
+    if (!isNotebookDocument() || currentPageId !== pageId) return [];
+    const pageAspect = pageSize.w > 0 ? pageSize.h / pageSize.w : NOTEBOOK_PAGE_ASPECT;
+    return rasteriseInkVisualPages(
+      getLikelyChunkInkStrokes(strokes),
+      getRenderableChunkGraphs(pageGraphs),
+      pageAspect,
+      Math.max(1, pageSize.w),
+    );
+  }
+
   async function transcribeChunkInkContext(chunkId: number): Promise<string | null> {
     if (!includeChunkAiVisuals) return null;
     const view = chunkView;
@@ -6579,6 +6922,61 @@
       if (chunkView?.chunk.id === chunkId) {
         chunkInkContextCache = {
           chunkId,
+          fingerprint,
+          transcription: transcription || null,
+        };
+      }
+      return transcription || null;
+    } finally {
+      chunkInkContextTranscribing = false;
+    }
+  }
+
+  async function transcribeNotebookInkContext(pageId: number): Promise<string | null> {
+    if (!isNotebookDocument() || currentPageId !== pageId) return null;
+    const drawableStrokes = getLikelyChunkInkStrokes(strokes);
+    const drawableGraphs = getRenderableChunkGraphs(pageGraphs);
+    if (drawableStrokes.length === 0 && drawableGraphs.length === 0) return null;
+
+    const fingerprint = chunkInkContextFingerprint(drawableStrokes, drawableGraphs);
+    if (
+      notebookInkContextCache
+      && notebookInkContextCache.pageId === pageId
+      && notebookInkContextCache.fingerprint === fingerprint
+    ) {
+      return notebookInkContextCache.transcription;
+    }
+
+    const visionProvider = aiTaskSettings.vision.provider;
+    const visionModel = aiTaskSettings.vision.model.trim();
+    const title = selectedBook?.title ?? `Canvas ${currentPage}`;
+
+    chunkInkContextTranscribing = true;
+    try {
+      const pages = await rasteriseNotebookVisualPages(pageId);
+      if (pages.length === 0) return null;
+      const sections: string[] = [];
+      for (const page of pages) {
+        const result = await invoke<ChunkFormattedBodyOutput>("transcribe_ai_chat_image", {
+          provider: visionProvider,
+          model: visionModel.length > 0 ? visionModel : null,
+          imageBase64: page.imageBase64,
+          chunkType: "explanation",
+          title,
+          subject: `Notebook canvas ${currentPage}`,
+        });
+        const body = result.body_markdown.trim();
+        if (!body) continue;
+        if (pages.length === 1) {
+          sections.push(body);
+        } else {
+          sections.push(`Notebook canvas page ${page.pageIndex + 1}:\n---\n${body}\n---`);
+        }
+      }
+      const transcription = sections.join("\n\n").trim();
+      if (currentPageId === pageId) {
+        notebookInkContextCache = {
+          pageId,
           fingerprint,
           transcription: transcription || null,
         };
@@ -6652,10 +7050,11 @@
     draftContent: string,
     options: {
       chunkId: number | null;
+      pageId: number | null;
       pageNumber: number;
     },
   ): Promise<PreparedChatUserMessage> {
-    const { chunkId, pageNumber } = options;
+    const { chunkId, pageId, pageNumber } = options;
     const attachment = pendingChatAttachment;
     const supportsDirectImage = chatProviderSupportsDirectImage(aiTaskSettings.chat.provider);
     const historyParts: string[] = [];
@@ -6683,6 +7082,24 @@
       }
     }
 
+    const shouldAttachNotebookVisuals = chunkId == null && pageId != null && isNotebookDocument();
+    let attachedNotebookVisualPages = 0;
+    if (shouldAttachNotebookVisuals && supportsDirectImage) {
+      try {
+        const visualPages = await rasteriseNotebookVisualPages(pageId);
+        if (visualPages.length > 0) {
+          attachedNotebookVisualPages = visualPages.length;
+          imageBase64List.push(...visualPages.map((page) => page.imageBase64));
+          imageDataUrls.push(...visualPages.map((page) => page.imageDataUrl));
+          attachedImageLabel = visualPages.length === 1
+            ? "Attached canvas ink"
+            : `Attached ${visualPages.length} canvas ink pages`;
+        }
+      } catch (err) {
+        await appLogWarn(`[notebook-ai] canvas ink rasterisation failed pageId=${pageId}: ${formatLogError(err)}`);
+      }
+    }
+
     if (attachment) {
       attachmentCreatedAt = attachment.createdAt;
       if (supportsDirectImage) {
@@ -6703,6 +7120,17 @@
         } else {
           historyParts.push("Attached selection image context was provided, but transcription was unavailable.");
         }
+      }
+    }
+
+    if (shouldAttachNotebookVisuals && (!supportsDirectImage || attachedNotebookVisualPages === 0)) {
+      try {
+        const inkTranscription = await transcribeNotebookInkContext(pageId);
+        if (inkTranscription) {
+          historyParts.push(`Notebook canvas ink transcription:\n---\n${inkTranscription}\n---`);
+        }
+      } catch (err) {
+        await appLogWarn(`[notebook-ai] canvas ink context failed pageId=${pageId}: ${formatLogError(err)}`);
       }
     }
 
@@ -6732,9 +7160,11 @@
     const leadText = draftContent || (
       imageBase64List.length > 0 || attachment
         ? `Use the attached ${imageBase64List.length > 1 ? "images" : "image"} as additional context.`
-        : chunkId != null
-          ? "Use the available chunk context."
-          : "Use the current page context."
+        : shouldAttachNotebookVisuals
+          ? "Use the current notebook canvas ink context."
+          : chunkId != null
+            ? "Use the available chunk context."
+            : "Use the current page context."
     );
     historyParts.unshift(leadText);
 
@@ -6797,7 +7227,7 @@
     try {
       await flushChunkTextSaves();
       await flushGlossarySave();
-      prepared = await prepareChunkChatUserMessage(draftContent, { chunkId, pageNumber });
+      prepared = await prepareChunkChatUserMessage(draftContent, { chunkId, pageId, pageNumber });
       if (chunkId != null) {
         await ensureChunkChatContext(chunkId);
         if (getActiveChatChunkId() !== chunkId) {
@@ -7052,10 +7482,10 @@
     reChunkingPage || currentPageChunkingActive,
   );
   let canRechunkPage = $derived(
-    !!selectedBook && currentChunks.length > 0 && !chunkingBusy,
+    !!selectedBook && !isNotebookDocument() && currentChunks.length > 0 && !chunkingBusy,
   );
   let canBatchChunkDocument = $derived(
-    !!selectedBook && totalPages > 0 && !aiSettingsSaving && !batchChunkStarting,
+    !!selectedBook && !isNotebookDocument() && totalPages > 0 && !aiSettingsSaving && !batchChunkStarting,
   );
 
   function parseBatchChunkPageInput(rawValue: string): number | null {
@@ -8225,7 +8655,7 @@
         maxPage = Math.max(maxPage, Math.ceil(Math.max(0, graph.bboxY + graph.bboxH)));
       }
     }
-    return maxPage + CHUNK_DOCUMENT_BUFFER_PAGES;
+    return maxPage + INK_DOCUMENT_BUFFER_PAGES;
   }
 
   function getChunkDocumentWorldHeight(): number {
@@ -8534,46 +8964,19 @@
 
   function drawChunkPageGuides(
     ctx: CanvasRenderingContext2D,
-    visMinX: number,
     visMinY: number,
-    visMaxX: number,
     visMaxY: number,
   ) {
     const { w: pageWidth, h: pageHeight } = getChunkPageWorldSize();
     const pageCount = getChunkDocumentPageCount();
-    if (pageWidth <= 0 || pageHeight <= 0 || pageCount <= 0) return;
-    const px = 1 / chunkCamera.scale;
-    const startPage = Math.max(0, Math.floor(visMinY / pageHeight));
-    const endPage = Math.min(pageCount - 1, Math.floor(visMaxY / pageHeight));
-
-    for (let pageIndex = startPage; pageIndex <= endPage; pageIndex += 1) {
-      const pageTop = pageIndex * pageHeight;
-      const inset = px * 0.5;
-      const label = `Page ${pageIndex + 1}`;
-      const fontSize = 11 * px;
-      const padX = 8 * px;
-      const padY = 4 * px;
-      const labelX = 14 * px;
-      const labelY = pageTop + 14 * px;
-
-      ctx.save();
-      ctx.strokeStyle = "rgba(100, 116, 139, 0.32)";
-      ctx.lineWidth = 1.2 * px;
-      ctx.strokeRect(inset, pageTop + inset, Math.max(0, pageWidth - px), Math.max(0, pageHeight - px));
-
-      ctx.font = `${fontSize}px Inter, system-ui, sans-serif`;
-      ctx.textBaseline = "top";
-      const labelW = ctx.measureText(label).width + padX * 2;
-      const labelH = fontSize + padY * 2;
-      ctx.fillStyle = "rgba(248, 250, 252, 0.94)";
-      ctx.fillRect(labelX, labelY, labelW, labelH);
-      ctx.strokeStyle = "rgba(148, 163, 184, 0.45)";
-      ctx.lineWidth = px;
-      ctx.strokeRect(labelX, labelY, labelW, labelH);
-      ctx.fillStyle = "rgba(51, 65, 85, 0.82)";
-      ctx.fillText(label, labelX + padX, labelY + padY);
-      ctx.restore();
-    }
+    drawInkPageGuides(ctx, {
+      pageWidth,
+      pageHeight,
+      pageCount,
+      scale: chunkCamera.scale,
+      visMinY,
+      visMaxY,
+    });
   }
 
   function restoreChunkHomeView() {
@@ -8639,7 +9042,7 @@
     const visMinY = -chunkCamera.y / chunkCamera.scale;
     const visMaxX = visMinX + chunkSurfaceSize.w / chunkCamera.scale;
     const visMaxY = visMinY + chunkSurfaceSize.h / chunkCamera.scale;
-    drawChunkPageGuides(ctx, visMinX, visMinY, visMaxX, visMaxY);
+    drawChunkPageGuides(ctx, visMinY, visMaxY);
     for (const stroke of chunkView.strokes) {
       if (stroke.points.length < 2) continue;
       const { minX, minY, maxX, maxY } = chunkStrokeWorldBounds(stroke);
@@ -9767,6 +10170,7 @@
         class:mode-erase={mode === 'erase'}
         class:mode-shape={mode === 'shape'}
         class:mode-select={mode === 'select'}
+        class:notebook-surface={isNotebookDocument()}
         use:observeContainerResize
       >
         <canvas bind:this={gridCanvas} class="layer layer-grid"></canvas>
@@ -9803,6 +10207,7 @@
           {chunkChatCodeCopy}
           bind:chunkChatTranscript
           viewerContextReady={getActiveViewerChatPageId() != null}
+          isNotebookContext={isNotebookDocument()}
         />
       {/if}
 
@@ -10975,7 +11380,7 @@
           class="chevron"
           onclick={prevPage}
           disabled={currentPage <= 1 || rendering}
-          aria-label="Previous page"
+          aria-label={isNotebookDocument() ? "Previous canvas" : "Previous page"}
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="15 18 9 12 15 6"/>
@@ -10983,12 +11388,13 @@
         </button>
 
         <div class="page-indicator">
+          <span class="page-kind">{isNotebookDocument() ? "Canvas" : "Page"}</span>
           <input
             class="page-input"
             type="text"
             inputmode="numeric"
             pattern="[0-9]*"
-            aria-label="Page number"
+            aria-label={isNotebookDocument() ? "Canvas number" : "Page number"}
             disabled={rendering}
             value={pageInputValue}
             onfocus={(event) => {
@@ -11011,8 +11417,8 @@
         <button
           class="chevron"
           onclick={nextPage}
-          disabled={currentPage >= totalPages || rendering}
-          aria-label="Next page"
+          disabled={isNotebookDocument() ? rendering : currentPage >= totalPages || rendering}
+          aria-label={isNotebookDocument() ? "Next canvas" : "Next page"}
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="9 18 15 12 9 6"/>
@@ -11201,8 +11607,8 @@
           class:active={viewerAiOpen}
           onclick={onAiClick}
           disabled={aiWorking}
-          aria-label="Open AI chat for this page"
-          title="Open AI chat for this page"
+          aria-label={isNotebookDocument() ? "Open AI chat for this canvas" : "Open AI chat for this page"}
+          title={isNotebookDocument() ? "Open AI chat for this canvas" : "Open AI chat for this page"}
         >
           {#if aiWorking}
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="spin">
@@ -11327,6 +11733,11 @@
     touch-action: none;
   }
 
+  .infinite-canvas.notebook-surface {
+    background-color: #f4f7fb;
+    background-image: linear-gradient(180deg, #fbfcfe 0%, #f2f5fa 100%);
+  }
+
   .infinite-canvas.mode-erase { cursor: cell; }
   .infinite-canvas.mode-shape { cursor: crosshair; }
   .infinite-canvas.mode-select { cursor: default; }
@@ -11421,6 +11832,12 @@
   .layer-chunk { pointer-events: none; }
   .layer-dry  { pointer-events: none; }
   /* .layer-wet receives all pointer events â€” no overrides needed */
+
+  .page-kind {
+    color: #64748b;
+    font-size: 0.78rem;
+    font-weight: 700;
+  }
 
   /* â”€â”€ Chunk note sheet â”€â”€ */
   .chunk-sheet-backdrop {

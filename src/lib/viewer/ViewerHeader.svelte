@@ -32,6 +32,8 @@
     reChunkingPage: boolean;
     closeViewer: () => void;
   } = $props();
+
+  const isNotebook = $derived(selectedBook.document_mode === "notebook");
 </script>
 
 <div class="viewer-header">
@@ -42,34 +44,36 @@
   </button>
   <span class="viewer-title">{selectedBook.title}</span>
   <div class="viewer-header-actions">
-    <div class="provider-shortcuts">
-      <label class="provider-shortcut">
-        <span>CK</span>
-        <select
-          value={aiTaskSettings.chunking.provider}
-          onchange={(event) => setTaskProvider("chunking", (event.currentTarget as HTMLSelectElement).value as ChunkingProvider)}
-        >
-          {#each CHUNKING_PROVIDER_OPTIONS as option}
-            {#if !aiSettings?.running_on_android || option.value !== "ollama"}
-              <option value={option.value}>{option.short}</option>
-            {/if}
-          {/each}
-        </select>
-      </label>
-      <label class="provider-shortcut">
-        <span>AI</span>
-        <select
-          value={aiTaskSettings.chat.provider}
-          onchange={(event) => setTaskProvider("chat", (event.currentTarget as HTMLSelectElement).value as ChatProvider)}
-        >
-          {#each CHAT_PROVIDER_OPTIONS as option}
-            {#if !aiSettings?.running_on_android || option.value !== "ollama"}
-              <option value={option.value}>{option.short}</option>
-            {/if}
-          {/each}
-        </select>
-      </label>
-    </div>
+    {#if !isNotebook}
+      <div class="provider-shortcuts">
+        <label class="provider-shortcut">
+          <span>CK</span>
+          <select
+            value={aiTaskSettings.chunking.provider}
+            onchange={(event) => setTaskProvider("chunking", (event.currentTarget as HTMLSelectElement).value as ChunkingProvider)}
+          >
+            {#each CHUNKING_PROVIDER_OPTIONS as option}
+              {#if !aiSettings?.running_on_android || option.value !== "ollama"}
+                <option value={option.value}>{option.short}</option>
+              {/if}
+            {/each}
+          </select>
+        </label>
+        <label class="provider-shortcut">
+          <span>AI</span>
+          <select
+            value={aiTaskSettings.chat.provider}
+            onchange={(event) => setTaskProvider("chat", (event.currentTarget as HTMLSelectElement).value as ChatProvider)}
+          >
+            {#each CHAT_PROVIDER_OPTIONS as option}
+              {#if !aiSettings?.running_on_android || option.value !== "ollama"}
+                <option value={option.value}>{option.short}</option>
+              {/if}
+            {/each}
+          </select>
+        </label>
+      </div>
+    {/if}
     <button
       class="ai-settings-btn"
       onclick={openAiSettings}
@@ -77,14 +81,16 @@
     >
       AI settings
     </button>
-    <button
-      class="rechunk-btn"
-      onclick={() => void reChunkCurrentPage()}
-      disabled={!canRechunkPage}
-      type="button"
-    >
-      {reChunkingPage ? "Re-chunking..." : "Re-chunk page"}
-    </button>
+    {#if !isNotebook}
+      <button
+        class="rechunk-btn"
+        onclick={() => void reChunkCurrentPage()}
+        disabled={!canRechunkPage}
+        type="button"
+      >
+        {reChunkingPage ? "Re-chunking..." : "Re-chunk page"}
+      </button>
+    {/if}
   </div>
 </div>
 

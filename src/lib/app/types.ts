@@ -1,10 +1,11 @@
-export type DocumentMode = "textbook" | "past_paper";
+export type DocumentMode = "textbook" | "past_paper" | "notebook";
 export type SyncSetupStatus = "not_configured" | "folder_missing" | "initialised" | "ready";
 
 export interface SourceDocument {
   id: number;
   title: string;
   file_path: string;
+  page_count: number | null;
   document_mode: DocumentMode;
   instruction_page_start: number | null;
   instruction_page_end: number | null;

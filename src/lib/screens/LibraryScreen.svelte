@@ -2,9 +2,12 @@
   import { tick } from "svelte";
   import type { DocumentMode, SourceDocument, SyncState } from "$lib/app/types";
 
+  type PdfDocumentMode = Exclude<DocumentMode, "notebook">;
+
   let {
     sourceDocuments,
     importing,
+    creatingNotebook,
     syncState,
     syncBusy,
     syncMode,
@@ -18,6 +21,7 @@
     error,
     openAiSettings,
     importPdf,
+    createBlankNotebook,
     openLocalSyncSheet,
     closeLocalSyncSheet,
     chooseSyncFolder,
@@ -35,6 +39,7 @@
   }: {
     sourceDocuments: SourceDocument[];
     importing: boolean;
+    creatingNotebook: boolean;
     syncState: SyncState | null;
     syncBusy: boolean;
     syncMode: string | null;
@@ -47,7 +52,8 @@
     renamingSourceDocumentId: number | null;
     error: string | null;
     openAiSettings: () => void;
-    importPdf: (documentMode: DocumentMode) => Promise<void>;
+    importPdf: (documentMode: PdfDocumentMode) => Promise<void>;
+    createBlankNotebook: () => Promise<void>;
     openLocalSyncSheet: () => void;
     closeLocalSyncSheet: () => void;
     chooseSyncFolder: () => Promise<void>;
@@ -93,8 +99,17 @@
         : "Ready"
     : "Not set up");
   const libraryMutating = $derived(
-    importing || syncBusy || deletingSourceDocumentId !== null || renamingSourceDocumentId !== null,
+    importing || creatingNotebook || syncBusy || deletingSourceDocumentId !== null || renamingSourceDocumentId !== null,
   );
+
+  function documentMeta(book: SourceDocument): string {
+    if (book.document_mode === "notebook") {
+      const count = Math.max(1, book.page_count ?? 1);
+      return `${count} canvas${count === 1 ? "" : "es"} · Notebook`;
+    }
+    if (book.document_mode === "past_paper") return `${book.file_path} · Past paper`;
+    return `${book.file_path} · Textbook`;
+  }
 
   async function beginSourceDocumentRename(book: SourceDocument) {
     if (libraryMutating) return;
@@ -143,6 +158,13 @@
       </button>
       <div class="import-mode-group">
         <button
+          onclick={() => void createBlankNotebook()}
+          disabled={libraryMutating || editingSourceDocumentId !== null}
+          class="import-btn import-btn-notebook"
+        >
+          {creatingNotebook ? "Creating..." : "New Notebook"}
+        </button>
+        <button
           onclick={() => void importPdf("textbook")}
           disabled={libraryMutating || editingSourceDocumentId !== null}
           class="import-btn import-btn-secondary"
@@ -183,7 +205,7 @@
   {/if}
 
   {#if sourceDocuments.length === 0}
-    <p class="empty">No documents yet. Import a textbook or past paper to get started.</p>
+    <p class="empty">No documents yet. Create a notebook or import a PDF to get started.</p>
   {:else}
     <ul>
       {#each sourceDocuments as book (book.id)}
@@ -202,7 +224,7 @@
                     disabled={renamingSourceDocumentId === book.id}
                     onkeydown={handleRenameKeydown}
                   />
-                  <span class="path">{book.file_path}</span>
+                  <span class="path">{documentMeta(book)}</span>
                 </div>
                 <div class="book-rename-actions">
                   <button
@@ -229,7 +251,7 @@
                 disabled={libraryMutating || editingSourceDocumentId !== null}
               >
                 <span class="title">{book.title}</span>
-                <span class="path">{book.file_path}</span>
+                <span class="path">{documentMeta(book)}</span>
               </button>
               <div class="book-action-group">
                 <button
@@ -449,6 +471,12 @@
     background: #eef2f8;
     color: #243149;
     border: 1px solid #d4dce8;
+  }
+
+  .import-btn-notebook {
+    background: #243149;
+    color: #fff;
+    border: 1px solid #243149;
   }
 
   .import-btn-secondary:hover:not(:disabled) {

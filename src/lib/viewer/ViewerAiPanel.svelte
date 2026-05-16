@@ -37,6 +37,7 @@
     chunkChatCodeCopy,
     chunkChatTranscript = $bindable<HTMLDivElement | null>(null),
     viewerContextReady,
+    isNotebookContext = false,
   }: {
     viewerPageNumber: number;
     chunkChatMessages: ChunkChatMessage[];
@@ -56,6 +57,7 @@
     chunkChatCodeCopy: (node: HTMLDivElement) => { destroy?: () => void } | void;
     chunkChatTranscript?: HTMLDivElement | null;
     viewerContextReady: boolean;
+    isNotebookContext?: boolean;
   } = $props();
 </script>
 
@@ -65,9 +67,9 @@
       <p class="viewer-ai-kicker">AI chat</p>
       <p class="viewer-ai-context">
         {#if viewerContextReady}
-          Context: Page {viewerPageNumber}
+          Context: {isNotebookContext ? "Canvas" : "Page"} {viewerPageNumber}
         {:else}
-          Context: Preparing page context...
+          Context: Preparing {isNotebookContext ? "canvas" : "page"} context...
         {/if}
       </p>
     </div>
@@ -84,8 +86,14 @@
   <div class="chunk-ai-transcript" bind:this={chunkChatTranscript} use:chunkChatCodeCopy>
     {#if chunkChatMessages.length === 0}
       <div class="chunk-ai-empty">
-        <p>Ask about this page.</p>
-        <p>The AI sees the page's extracted text, plus any attached selection image.</p>
+        <p>Ask about this {isNotebookContext ? "canvas" : "page"}.</p>
+        <p>
+          {#if isNotebookContext}
+            The AI sees the current canvas ink and graphs.
+          {:else}
+            The AI sees the page's extracted text, plus any attached selection image.
+          {/if}
+        </p>
       </div>
     {:else}
       {#each chunkChatMessages as message (message.id)}
@@ -130,13 +138,13 @@
 
   <div class="chunk-ai-status-row">
     {#if !viewerContextReady}
-      <span class="chunk-ai-status">Preparing page context...</span>
+      <span class="chunk-ai-status">Preparing {isNotebookContext ? "canvas" : "page"} context...</span>
     {/if}
     {#if chatAttachmentTranscribing}
       <span class="chunk-ai-status">Transcribing attached image...</span>
     {/if}
     {#if chunkInkContextTranscribing}
-      <span class="chunk-ai-status">Reading chunk visuals...</span>
+      <span class="chunk-ai-status">Reading {isNotebookContext ? "canvas" : "chunk"} visuals...</span>
     {/if}
     {#if chunkChatLoadingContext}
       <span class="chunk-ai-status">Preparing context...</span>
@@ -152,7 +160,7 @@
         <img src={pendingChatAttachment.imageDataUrl} alt="Selected area attachment" />
         <div class="chunk-chat-attachment-meta">
           <strong>Selection attached</strong>
-          <span>Page {pendingChatAttachment.pageNumber}</span>
+          <span>{isNotebookContext ? "Canvas" : "Page"} {pendingChatAttachment.pageNumber}</span>
         </div>
         <button
           class="chunk-ai-action chunk-ai-stop"
@@ -168,7 +176,7 @@
       bind:value={chunkChatDraft}
       class="chunk-ai-input"
       rows="3"
-      placeholder="Ask about this page..."
+      placeholder="Ask about this {isNotebookContext ? 'canvas' : 'page'}..."
       onkeydown={onChunkChatKeydown}
       disabled={chunkChatStreaming || chunkChatLoadingContext}
     ></textarea>

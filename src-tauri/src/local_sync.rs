@@ -85,6 +85,7 @@ struct SyncManifest {
 struct SnapshotDocumentRow {
     file_path: String,
     title: String,
+    document_mode: String,
 }
 
 #[derive(Clone)]
@@ -1283,7 +1284,7 @@ async fn normalize_document_pdfs(app: &tauri::AppHandle, pool: &SqlitePool) -> R
     let pdfs_dir = data_dir.join("pdfs");
     std::fs::create_dir_all(&pdfs_dir).map_err(|e| e.to_string())?;
     let rows = sqlx::query(
-        "SELECT id, file_path, document_sync_id, original_file_name FROM source_documents ORDER BY id",
+        "SELECT id, file_path, document_mode, document_sync_id, original_file_name FROM source_documents ORDER BY id",
     )
     .fetch_all(pool)
     .await
@@ -1292,6 +1293,10 @@ async fn normalize_document_pdfs(app: &tauri::AppHandle, pool: &SqlitePool) -> R
     for row in rows {
         let id: i64 = row.get("id");
         let file_path: String = row.get("file_path");
+        let document_mode: String = row.get("document_mode");
+        if document_mode.eq_ignore_ascii_case("notebook") {
+            continue;
+        }
         let document_sync_id = row
             .get::<Option<String>, _>("document_sync_id")
             .map(|value| value.trim().to_string())
@@ -1334,13 +1339,17 @@ async fn copy_local_pdfs_to_sync(
     pool: &SqlitePool,
 ) -> Result<(), String> {
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let rows = sqlx::query("SELECT title, file_path FROM source_documents ORDER BY id")
+    let rows = sqlx::query("SELECT title, file_path, document_mode FROM source_documents ORDER BY id")
         .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
     for row in rows {
         let title: String = row.get("title");
         let file_path: String = row.get("file_path");
+        let document_mode: String = row.get("document_mode");
+        if document_mode.eq_ignore_ascii_case("notebook") {
+            continue;
+        }
         let source = data_dir.join(&file_path);
         if !source.exists() {
             return Err(format!("PDF for {title:?} is missing locally: {file_path}"));
@@ -1357,6 +1366,9 @@ fn copy_sync_pdfs_to_local(
 ) -> Result<(), String> {
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     for doc in docs {
+        if doc.document_mode.eq_ignore_ascii_case("notebook") {
+            continue;
+        }
         let destination = data_dir.join(&doc.file_path);
         folder.copy_sync_file_to_app(&doc.file_path, &destination)?;
     }
@@ -1366,7 +1378,7 @@ fn copy_sync_pdfs_to_local(
 async fn load_snapshot_document_rows(
     pool: &SqlitePool,
 ) -> Result<Vec<SnapshotDocumentRow>, String> {
-    let rows = sqlx::query("SELECT title, file_path FROM source_documents ORDER BY id")
+    let rows = sqlx::query("SELECT title, file_path, document_mode FROM source_documents ORDER BY id")
         .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -1375,6 +1387,7 @@ async fn load_snapshot_document_rows(
         .map(|row| SnapshotDocumentRow {
             title: row.get("title"),
             file_path: row.get("file_path"),
+            document_mode: row.get("document_mode"),
         })
         .collect())
 }
@@ -1385,6 +1398,9 @@ fn missing_pdfs_for_snapshot_rows(
 ) -> Result<Vec<String>, String> {
     let mut missing = Vec::new();
     for doc in docs {
+        if doc.document_mode.eq_ignore_ascii_case("notebook") {
+            continue;
+        }
         if !folder.file_exists(&doc.file_path)? {
             missing.push(format!("{} ({})", doc.title, doc.file_path));
         }

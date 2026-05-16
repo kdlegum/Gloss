@@ -33,6 +33,7 @@
 
   let sourceDocuments = $state<SourceDocument[]>([]);
   let importing = $state(false);
+  let creatingNotebook = $state(false);
   let syncState = $state<SyncState | null>(null);
   let syncBusy = $state(false);
   let syncMode = $state<string | null>(null);
@@ -447,6 +448,7 @@
       syncBusy
       || autoSyncBusy
       || importing
+      || creatingNotebook
       || deletingSourceDocumentId !== null
       || renamingSourceDocumentId !== null
     ) return;
@@ -476,6 +478,7 @@
       syncBusy
       || autoSyncBusy
       || importing
+      || creatingNotebook
       || deletingSourceDocumentId !== null
       || renamingSourceDocumentId !== null
       || showAiKeySheet
@@ -648,7 +651,7 @@
   }
 
   async function importPdf(documentMode: "textbook" | "past_paper" = "textbook") {
-    if (syncBusy || autoSyncBusy || renamingSourceDocumentId !== null) return;
+    if (syncBusy || autoSyncBusy || creatingNotebook || renamingSourceDocumentId !== null) return;
     error = null;
     pendingDeleteSourceDocumentId = null;
     importing = true;
@@ -669,9 +672,29 @@
     }
   }
 
+  async function createBlankNotebook() {
+    if (syncBusy || autoSyncBusy || importing || renamingSourceDocumentId !== null) return;
+    error = null;
+    pendingDeleteSourceDocumentId = null;
+    creatingNotebook = true;
+    try {
+      const doc = await invoke<SourceDocument>("create_blank_notebook", { title: null });
+      void appLogInfo(`[library] created notebook doc=${doc.id} title="${doc.title}"`);
+      await loadSourceDocuments();
+      await loadSyncState();
+      selectedBook = doc;
+    } catch (err) {
+      error = formatLogError(err);
+      void appLogError(`[library] create notebook failed: ${formatLogError(err)}`);
+    } finally {
+      creatingNotebook = false;
+    }
+  }
+
   async function deleteSourceDocument(book: SourceDocument) {
     if (
       importing
+      || creatingNotebook
       || syncBusy
       || autoSyncBusy
       || deletingSourceDocumentId !== null
@@ -700,6 +723,7 @@
   async function renameSourceDocument(book: SourceDocument, title: string): Promise<boolean> {
     if (
       importing
+      || creatingNotebook
       || syncBusy
       || autoSyncBusy
       || deletingSourceDocumentId !== null
@@ -743,6 +767,7 @@
   function requestSourceDocumentDelete(bookId: number) {
     if (
       importing
+      || creatingNotebook
       || syncBusy
       || autoSyncBusy
       || deletingSourceDocumentId !== null
@@ -817,6 +842,7 @@
       <LibraryScreen
         {sourceDocuments}
         {importing}
+        {creatingNotebook}
         {syncState}
         syncBusy={syncBusy || autoSyncBusy}
         {syncMode}
@@ -830,6 +856,7 @@
         {error}
         openAiSettings={() => openAiKeySettings(false)}
         {importPdf}
+        {createBlankNotebook}
         {openLocalSyncSheet}
         {closeLocalSyncSheet}
         {chooseSyncFolder}
