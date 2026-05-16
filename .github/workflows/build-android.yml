@@ -2,7 +2,7 @@ name: Build Android
 
 on:
   push:
-    branches: [main]
+    branches: [main, "claude/**"]
 
 jobs:
   build:
@@ -65,10 +65,21 @@ jobs:
       - name: Verify APK
         shell: bash
         run: |
-          set -euo pipefail
-          apk_path="src-tauri/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk"
+          set -euxo pipefail
           build_tools_dir="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
-          test -f "$apk_path"
+          echo "Build tools: $build_tools_dir"
+
+          echo "--- All APKs produced ---"
+          find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" 2>/dev/null || echo "(none found)"
+
+          apk_path="$(find src-tauri/gen/android/app/build/outputs/apk -name "*arm64*.apk" | head -1)"
+          if [ -z "$apk_path" ]; then
+            apk_path="$(find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" | head -1)"
+          fi
+          echo "Using APK: $apk_path"
+          test -n "$apk_path" && test -f "$apk_path"
+
+          ls -lh "$apk_path"
           "$build_tools_dir/apksigner" verify --print-certs "$apk_path"
           "$build_tools_dir/aapt" dump badging "$apk_path" | tee apk-badging.txt
           grep -F "native-code: 'arm64-v8a'" apk-badging.txt
@@ -77,8 +88,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          apk_path="$(find src-tauri/gen/android/app/build/outputs/apk -name "*arm64*.apk" | head -1)"
+          if [ -z "$apk_path" ]; then
+            apk_path="$(find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" | head -1)"
+          fi
           mkdir -p artifacts
-          cp src-tauri/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk artifacts/gloss-android-arm64-debug.apk
+          cp "$apk_path" artifacts/gloss-android-arm64-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
