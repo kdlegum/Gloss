@@ -12,7 +12,10 @@ node_modules
 .env
 .env.*
 !.env.example
+.android-signing/
 .tauri-signing/
+src-tauri/gen/android/key.properties
+src-tauri/gen/android/*.jks
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 

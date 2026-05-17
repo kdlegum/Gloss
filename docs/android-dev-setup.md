@@ -148,6 +148,21 @@ src-tauri/gen/android/app/build/outputs/apk/arm64/release/
 
 Avoid the universal APK for now unless `libpdfium.so` is bundled for every ABI it advertises. Gloss currently documents and tests the Android tablet path as `arm64-v8a`.
 
+## GitHub Release APKs
+
+The Android workflow also builds a signed `arm64-v8a` release APK for `v*` tags and uploads it to the matching GitHub Release after the Windows release job has created it.
+
+The CI release signing key is stored locally under `.android-signing/`, which is ignored by Git. Add these repository secrets in GitHub:
+
+```text
+ANDROID_RELEASE_KEYSTORE_BASE64  -> contents of .android-signing/gloss-release.jks.base64
+ANDROID_RELEASE_KEYSTORE_PASSWORD -> contents of .android-signing/store-password.txt
+ANDROID_RELEASE_KEY_ALIAS         -> contents of .android-signing/key-alias.txt
+ANDROID_RELEASE_KEY_PASSWORD      -> contents of .android-signing/key-password.txt
+```
+
+Keep this keystore permanently. Android treats a different signing key as a different trust identity, so future APK updates must be signed with the same `.jks` file.
+
 ## Troubleshooting
 
 ### "failed to bind pdfium system library"
