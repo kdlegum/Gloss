@@ -11,6 +11,15 @@ export interface SourceDocument {
   instruction_page_end: number | null;
 }
 
+export interface UpdateCheckResult {
+  current_version: string;
+  latest_version: string | null;
+  release_name: string | null;
+  release_url: string | null;
+  installer_url: string | null;
+  available: boolean;
+}
+
 export interface PastPaperInstructionContextDebug {
   source_document_id: number;
   chunking_status: string;

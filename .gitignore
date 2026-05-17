@@ -12,6 +12,7 @@ node_modules
 .env
 .env.*
 !.env.example
+.tauri-signing/
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 

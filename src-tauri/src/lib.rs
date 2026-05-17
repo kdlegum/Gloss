@@ -26,6 +26,7 @@ use base64::Engine as _;
 use log::{error, info};
 use pdfium_render::prelude::*;
 use percent_encoding::percent_decode_str;
+use semver::Version;
 use sqlx::{migrate::MigrateError, sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -564,6 +565,111 @@ struct SourceDocument {
     document_mode: String,
     instruction_page_start: Option<i64>,
     instruction_page_end: Option<i64>,
+}
+
+const GITHUB_LATEST_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/kdlegum/Gloss/releases/latest";
+
+#[derive(serde::Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    name: Option<String>,
+    html_url: String,
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(serde::Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(serde::Serialize)]
+struct UpdateCheckResult {
+    current_version: String,
+    latest_version: Option<String>,
+    release_name: Option<String>,
+    release_url: Option<String>,
+    installer_url: Option<String>,
+    available: bool,
+}
+
+fn parse_release_version(value: &str) -> Option<Version> {
+    let trimmed = value.trim().trim_start_matches('v').trim_start_matches('V');
+    Version::parse(trimmed).ok()
+}
+
+fn preferred_installer_url(assets: &[GithubReleaseAsset]) -> Option<String> {
+    fn find_asset(assets: &[GithubReleaseAsset], extension: &str) -> Option<String> {
+        assets
+            .iter()
+            .find(|asset| asset.name.to_ascii_lowercase().ends_with(extension))
+            .map(|asset| asset.browser_download_url.clone())
+    }
+
+    if cfg!(target_os = "windows") {
+        find_asset(assets, ".exe").or_else(|| find_asset(assets, ".msi"))
+    } else if cfg!(target_os = "macos") {
+        find_asset(assets, ".dmg")
+    } else if cfg!(target_os = "linux") {
+        find_asset(assets, ".appimage")
+            .or_else(|| find_asset(assets, ".deb"))
+            .or_else(|| find_asset(assets, ".rpm"))
+    } else if cfg!(target_os = "android") {
+        find_asset(assets, ".apk")
+    } else {
+        None
+    }
+}
+
+#[tauri::command]
+async fn check_for_update(app: tauri::AppHandle) -> Result<UpdateCheckResult, String> {
+    let current_version = app.package_info().version.to_string();
+    if !cfg!(target_os = "windows") {
+        return Ok(UpdateCheckResult {
+            current_version,
+            latest_version: None,
+            release_name: None,
+            release_url: None,
+            installer_url: None,
+            available: false,
+        });
+    }
+
+    let current = parse_release_version(&current_version)
+        .ok_or_else(|| format!("current app version is not valid semver: {current_version}"))?;
+
+    let client = reqwest::Client::builder()
+        .user_agent(format!("Gloss/{current_version}"))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let release = client
+        .get(GITHUB_LATEST_RELEASE_API_URL)
+        .send()
+        .await
+        .map_err(|e| format!("failed to check GitHub releases: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("failed to check GitHub releases: {e}"))?
+        .json::<GithubRelease>()
+        .await
+        .map_err(|e| format!("failed to read GitHub release response: {e}"))?;
+
+    let latest_version = parse_release_version(&release.tag_name).ok_or_else(|| {
+        format!(
+            "latest release tag is not valid semver: {}",
+            release.tag_name
+        )
+    })?;
+    let available = latest_version > current;
+
+    Ok(UpdateCheckResult {
+        current_version,
+        latest_version: Some(latest_version.to_string()),
+        release_name: release.name,
+        release_url: Some(release.html_url),
+        installer_url: preferred_installer_url(&release.assets),
+        available,
+    })
 }
 
 #[derive(serde::Serialize)]
@@ -2396,7 +2502,11 @@ async fn run_page_ai_stream(
         };
         let prompt = ChunkChatPrompt {
             book_title: &context.book_title,
-            chunk_type: if is_notebook { "notebook_canvas" } else { "page" },
+            chunk_type: if is_notebook {
+                "notebook_canvas"
+            } else {
+                "page"
+            },
             title: Some(page_title.as_str()),
             subject: None,
             body_markdown: &prompt_body,
@@ -4350,12 +4460,13 @@ async fn get_or_create_notebook_canvas(
         .await
         .map_err(|e| e.to_string())?;
 
-    let page_row = sqlx::query("SELECT id FROM pages WHERE source_document_id = ? AND page_number = ?")
-        .bind(source_document_id)
-        .bind(canvas_number)
-        .fetch_one(pool.inner())
-        .await
-        .map_err(|e| e.to_string())?;
+    let page_row =
+        sqlx::query("SELECT id FROM pages WHERE source_document_id = ? AND page_number = ?")
+            .bind(source_document_id)
+            .bind(canvas_number)
+            .fetch_one(pool.inner())
+            .await
+            .map_err(|e| e.to_string())?;
     let page_id: i64 = page_row.get("id");
 
     let updates_page_count = creates_new_canvas || stored_count < canvas_count;
@@ -4747,12 +4858,13 @@ async fn delete_source_document(
         }
     }
 
-    let row = sqlx::query("SELECT title, file_path, document_mode FROM source_documents WHERE id = ?")
-        .bind(source_document_id)
-        .fetch_optional(pool.inner())
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("source document {} not found", source_document_id))?;
+    let row =
+        sqlx::query("SELECT title, file_path, document_mode FROM source_documents WHERE id = ?")
+            .bind(source_document_id)
+            .fetch_optional(pool.inner())
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("source document {} not found", source_document_id))?;
 
     let title: String = row.get("title");
     let relative_path: String = row.get("file_path");
@@ -5684,7 +5796,11 @@ fn show_startup_error_dialog(app: &tauri::AppHandle, message: String) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+
+    builder
         .plugin(
             tauri_plugin_log::Builder::new()
                 .clear_targets()
@@ -5767,6 +5883,7 @@ pub fn run() {
             resolve_sync_conflict,
             take_sync_editing_lease,
             auto_sync_once,
+            check_for_update,
             list_textbooks,
             rename_source_document,
             delete_source_document,

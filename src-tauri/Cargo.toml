@@ -27,6 +27,7 @@ percent-encoding = "2"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 bincode = "2"
@@ -38,3 +39,6 @@ futures = "0.3"
 typst = "0.14.2"
 typst-kit = { version = "0.14.2", default-features = false, features = ["fonts", "embed-fonts"] }
 typst-svg = "0.14.2"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"

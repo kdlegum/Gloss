@@ -1,5 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { openUrl } from "@tauri-apps/plugin-opener";
+  import { check as checkSignedUpdate } from "@tauri-apps/plugin-updater";
   import { onMount } from "svelte";
   import LibraryScreen from "$lib/screens/LibraryScreen.svelte";
   import ReaderWorkspace from "$lib/screens/ReaderWorkspace.svelte";
@@ -27,6 +29,7 @@
     ChunkingProvider,
     SourceDocument,
     SyncState,
+    UpdateCheckResult,
     ViewerBatchSettingsState,
     VisionProvider,
   } from "$lib/app/types";
@@ -47,6 +50,12 @@
   let deletingSourceDocumentId = $state<number | null>(null);
   let renamingSourceDocumentId = $state<number | null>(null);
   let error = $state<string | null>(null);
+  let updateCheck = $state<UpdateCheckResult | null>(null);
+  let updateChecking = $state(false);
+  let updateInstalling = $state(false);
+  let updateInstallProgress = $state<string | null>(null);
+  let updateError = $state<string | null>(null);
+  let updateFeedback = $state<string | null>(null);
   let selectedBook = $state<SourceDocument | null>(null);
 
   let aiTaskSettings = $state<AiTaskSettings>(defaultAiTaskSettings());
@@ -430,6 +439,87 @@
     }
   }
 
+  async function checkForUpdates(manual = false) {
+    if (updateChecking) return;
+    updateChecking = true;
+    updateError = null;
+    if (manual) updateFeedback = null;
+    try {
+      const result = await invoke<UpdateCheckResult>("check_for_update");
+      updateCheck = result;
+      if (manual && !result.available) {
+        updateFeedback = result.latest_version
+          ? `Gloss is up to date (${result.current_version}).`
+          : "Update checks are currently configured for Windows release builds.";
+      }
+      if (result.available) {
+        updateFeedback = null;
+        await appLogInfo(`[updates] update available ${result.current_version} -> ${result.latest_version ?? "unknown"}`);
+      }
+    } catch (err) {
+      if (manual) {
+        updateError = formatLogError(err);
+      }
+      await appLogWarn(`[updates] check failed: ${formatLogError(err)}`);
+    } finally {
+      updateChecking = false;
+    }
+  }
+
+  async function openUpdateRelease() {
+    const url = updateCheck?.installer_url ?? updateCheck?.release_url;
+    if (!url) {
+      updateError = "No release download link was found.";
+      return;
+    }
+    try {
+      await openUrl(url);
+    } catch (err) {
+      updateError = formatLogError(err);
+      await appLogWarn(`[updates] failed to open release: ${formatLogError(err)}`);
+    }
+  }
+
+  async function installUpdate() {
+    if (updateChecking || updateInstalling) return;
+    updateInstalling = true;
+    updateInstallProgress = null;
+    updateError = null;
+    updateFeedback = null;
+    try {
+      const update = await checkSignedUpdate();
+      if (!update) {
+        updateFeedback = "No signed updater package is available yet.";
+        return;
+      }
+
+      let totalBytes: number | null = null;
+      let downloadedBytes = 0;
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          totalBytes = event.data.contentLength ?? null;
+          downloadedBytes = 0;
+          updateInstallProgress = totalBytes ? "Downloading update 0%" : "Downloading update...";
+        } else if (event.event === "Progress") {
+          downloadedBytes += event.data.chunkLength;
+          updateInstallProgress = totalBytes
+            ? `Downloading update ${Math.min(99, Math.round((downloadedBytes / totalBytes) * 100))}%`
+            : "Downloading update...";
+        } else {
+          updateInstallProgress = "Installing update...";
+        }
+      });
+      updateFeedback = "Update installed. Restart Gloss to finish.";
+      updateInstallProgress = null;
+      await appLogInfo(`[updates] installed signed update ${update.currentVersion} -> ${update.version}`);
+    } catch (err) {
+      updateError = formatLogError(err);
+      await appLogWarn(`[updates] signed install failed: ${formatLogError(err)}`);
+    } finally {
+      updateInstalling = false;
+    }
+  }
+
   function openLocalSyncSheet() {
     syncError = null;
     syncFeedback = null;
@@ -803,6 +893,7 @@
     void loadAiSettings();
     void loadSourceDocuments();
     void loadSyncState();
+    void checkForUpdates(false);
     const autoSyncTimer = window.setInterval(() => {
       void runAutoSyncOnce();
     }, 15_000);
@@ -854,7 +945,16 @@
         {deletingSourceDocumentId}
         {renamingSourceDocumentId}
         {error}
+        {updateCheck}
+        {updateChecking}
+        {updateInstalling}
+        {updateInstallProgress}
+        {updateError}
+        {updateFeedback}
         openAiSettings={() => openAiKeySettings(false)}
+        checkForUpdates={() => void checkForUpdates(true)}
+        installUpdate={() => void installUpdate()}
+        openUpdateRelease={() => void openUpdateRelease()}
         {importPdf}
         {createBlankNotebook}
         {openLocalSyncSheet}

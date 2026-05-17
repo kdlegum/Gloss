@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import type { DocumentMode, SourceDocument, SyncState } from "$lib/app/types";
+  import type { DocumentMode, SourceDocument, SyncState, UpdateCheckResult } from "$lib/app/types";
 
   type PdfDocumentMode = Exclude<DocumentMode, "notebook">;
 
@@ -19,7 +19,16 @@
     deletingSourceDocumentId,
     renamingSourceDocumentId,
     error,
+    updateCheck,
+    updateChecking,
+    updateInstalling,
+    updateInstallProgress,
+    updateError,
+    updateFeedback,
     openAiSettings,
+    checkForUpdates,
+    installUpdate,
+    openUpdateRelease,
     importPdf,
     createBlankNotebook,
     openLocalSyncSheet,
@@ -51,7 +60,16 @@
     deletingSourceDocumentId: number | null;
     renamingSourceDocumentId: number | null;
     error: string | null;
+    updateCheck: UpdateCheckResult | null;
+    updateChecking: boolean;
+    updateInstalling: boolean;
+    updateInstallProgress: string | null;
+    updateError: string | null;
+    updateFeedback: string | null;
     openAiSettings: () => void;
+    checkForUpdates: () => void;
+    installUpdate: () => void;
+    openUpdateRelease: () => void;
     importPdf: (documentMode: PdfDocumentMode) => Promise<void>;
     createBlankNotebook: () => Promise<void>;
     openLocalSyncSheet: () => void;
@@ -73,6 +91,8 @@
   let editingSourceDocumentId = $state<number | null>(null);
   let renameDraft = $state("");
   let renameInput = $state<HTMLInputElement | null>(null);
+  let settingsMenuOpen = $state(false);
+  let settingsMenuElement = $state<HTMLDivElement | null>(null);
 
   const remoteRevision = $derived(syncState?.remote_snapshot?.revision ?? null);
   const localRevision = $derived(Math.max(
@@ -100,6 +120,18 @@
     : "Not set up");
   const libraryMutating = $derived(
     importing || creatingNotebook || syncBusy || deletingSourceDocumentId !== null || renamingSourceDocumentId !== null,
+  );
+  const updateStatusLabel = $derived(updateInstalling
+    ? updateInstallProgress ?? "Installing..."
+    : updateChecking
+      ? "Checking..."
+      : updateCheck?.available
+        ? "Update available"
+        : updateError
+          ? "Check failed"
+          : updateFeedback || "Ready");
+  const settingsNeedsAttention = $derived(
+    !!updateCheck?.available || hasSyncConflicts || hasMissingPdfs || !!syncState?.dirty,
   );
 
   function documentMeta(book: SourceDocument): string {
@@ -143,19 +175,56 @@
     event.preventDefault();
     cancelSourceDocumentRename();
   }
+
+  function toggleSettingsMenu() {
+    settingsMenuOpen = !settingsMenuOpen;
+  }
+
+  function closeSettingsMenu() {
+    settingsMenuOpen = false;
+  }
+
+  function handleSettingsWindowClick(event: MouseEvent) {
+    if (!settingsMenuOpen || !settingsMenuElement) return;
+
+    const target = event.target;
+    if (target instanceof Node && settingsMenuElement.contains(target)) return;
+    closeSettingsMenu();
+  }
+
+  function handleSettingsWindowKeydown(event: KeyboardEvent) {
+    if (event.key !== "Escape") return;
+    closeSettingsMenu();
+  }
+
+  function openAiSettingsFromMenu() {
+    closeSettingsMenu();
+    openAiSettings();
+  }
+
+  function runUpdateActionFromMenu() {
+    if (updateChecking || updateInstalling) return;
+    closeSettingsMenu();
+    if (updateCheck?.available) {
+      installUpdate();
+      return;
+    }
+    checkForUpdates();
+  }
+
+  function openLocalSyncFromMenu() {
+    if (libraryMutating || editingSourceDocumentId !== null) return;
+    closeSettingsMenu();
+    openLocalSyncSheet();
+  }
 </script>
+
+<svelte:window onclick={handleSettingsWindowClick} onkeydown={handleSettingsWindowKeydown} />
 
 <div class="library">
   <div class="library-header">
     <h1>Gloss</h1>
     <div class="library-actions">
-      <button
-        class="ai-settings-btn"
-        onclick={openAiSettings}
-        type="button"
-      >
-        AI settings
-      </button>
       <div class="import-mode-group">
         <button
           onclick={() => void createBlankNotebook()}
@@ -179,20 +248,104 @@
           {importing ? "Importing..." : "Import Past Paper"}
         </button>
       </div>
-      <button
-        class="sync-open-btn"
-        type="button"
-        onclick={openLocalSyncSheet}
-        disabled={libraryMutating || editingSourceDocumentId !== null}
-      >
-        Local sync
-        <span>{syncStatusLabel}</span>
-      </button>
+      <div class="settings-menu" bind:this={settingsMenuElement}>
+        <button
+          class="settings-menu-btn"
+          class:needs-attention={settingsNeedsAttention}
+          type="button"
+          onclick={toggleSettingsMenu}
+          aria-haspopup="menu"
+          aria-expanded={settingsMenuOpen}
+        >
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
+            <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.05.05a2 2 0 0 1-2.83 2.83l-.05-.05a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.04 1.56V21a2 2 0 0 1-4 0v-.08a1.7 1.7 0 0 0-1.04-1.56 1.7 1.7 0 0 0-1.87.34l-.05.05a2 2 0 1 1-2.83-2.83l.05-.05A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1.04H3a2 2 0 0 1 0-4h.04A1.7 1.7 0 0 0 4.6 8.92a1.7 1.7 0 0 0-.34-1.87l-.05-.05a2 2 0 1 1 2.83-2.83l.05.05a1.7 1.7 0 0 0 1.87.34A1.7 1.7 0 0 0 10 3V3a2 2 0 0 1 4 0v.08a1.7 1.7 0 0 0 1.04 1.56 1.7 1.7 0 0 0 1.87-.34l.05-.05a2 2 0 0 1 2.83 2.83l-.05.05a1.7 1.7 0 0 0-.34 1.87 1.7 1.7 0 0 0 1.56 1.04H21a2 2 0 0 1 0 4h-.08A1.7 1.7 0 0 0 19.4 15Z" />
+          </svg>
+          Settings
+          {#if settingsNeedsAttention}
+            <span class="settings-attention-dot" aria-hidden="true"></span>
+          {/if}
+        </button>
+
+        {#if settingsMenuOpen}
+          <div class="settings-popover" role="menu" aria-label="Settings">
+            <button class="settings-menu-item" type="button" role="menuitem" onclick={openAiSettingsFromMenu}>
+              <span class="settings-item-icon settings-item-icon-text">AI</span>
+              <span class="settings-item-copy">
+                <strong>AI settings</strong>
+                <span>Providers and API keys</span>
+              </span>
+            </button>
+
+            <button
+              class="settings-menu-item"
+              type="button"
+              role="menuitem"
+              onclick={runUpdateActionFromMenu}
+              disabled={updateChecking || updateInstalling}
+            >
+              <span class="settings-item-icon">
+                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M20 12a8 8 0 1 1-2.34-5.66" />
+                  <path d="M20 4v5h-5" />
+                </svg>
+              </span>
+              <span class="settings-item-copy">
+                <strong>Updates</strong>
+                <span>{updateCheck?.available ? `Gloss ${updateCheck.latest_version}` : updateStatusLabel}</span>
+              </span>
+              <span class:settings-badge-alert={updateCheck?.available} class="settings-badge">
+                {updateInstalling ? "Install" : updateCheck?.available ? "Install" : "Check"}
+              </span>
+            </button>
+
+            <button
+              class="settings-menu-item"
+              type="button"
+              role="menuitem"
+              onclick={openLocalSyncFromMenu}
+              disabled={libraryMutating || editingSourceDocumentId !== null}
+            >
+              <span class="settings-item-icon">
+                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M17 2l4 4-4 4" />
+                  <path d="M3 11V9a3 3 0 0 1 3-3h15" />
+                  <path d="M7 22l-4-4 4-4" />
+                  <path d="M21 13v2a3 3 0 0 1-3 3H3" />
+                </svg>
+              </span>
+              <span class="settings-item-copy">
+                <strong>Local sync</strong>
+                <span>{syncFolderDisplay}</span>
+              </span>
+              <span class:settings-badge-alert={hasSyncConflicts || hasMissingPdfs || !!syncState?.dirty} class="settings-badge">{syncStatusLabel}</span>
+            </button>
+          </div>
+        {/if}
+      </div>
     </div>
   </div>
 
   {#if error}
     <p class="error">{error}</p>
+  {/if}
+  {#if updateCheck?.available}
+    <div class="update-banner">
+      <div>
+        <strong>Gloss {updateCheck.latest_version} is available.</strong>
+        <span>{updateInstallProgress ?? updateCheck.release_name ?? "Download the latest release to update."}</span>
+      </div>
+      <div class="update-banner-actions">
+        <button type="button" onclick={installUpdate} disabled={updateInstalling}>
+          {updateInstalling ? "Installing..." : "Install"}
+        </button>
+        <button type="button" onclick={openUpdateRelease} disabled={updateInstalling}>Open release</button>
+      </div>
+    </div>
+  {:else if updateError}
+    <p class="db-transfer-hint">Update check failed: {updateError}</p>
+  {:else if updateFeedback}
+    <p class="db-transfer-feedback">{updateFeedback}</p>
   {/if}
   {#if syncError}
     <p class="error">{syncError}</p>
@@ -508,47 +661,204 @@
     font-size: 0.8rem;
   }
 
-  .ai-settings-btn {
-    padding: 0.52rem 0.85rem;
-    background: #f6f7fa;
-    color: #243149;
-    border: 1px solid #d8dee9;
+  .update-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin: 0.8rem 0 0;
+    padding: 0.85rem 1rem;
+    border: 1px solid #f2c46d;
     border-radius: 8px;
-    font-size: 0.88rem;
+    background: #fff8e6;
+    color: #4f3422;
+  }
+
+  .update-banner div {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-width: 0;
+  }
+
+  .update-banner strong {
+    font-size: 0.92rem;
+  }
+
+  .update-banner span {
+    color: #70513a;
+    font-size: 0.82rem;
+    overflow-wrap: anywhere;
+  }
+
+  .update-banner-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    flex: 0 0 auto;
+  }
+
+  .update-banner-actions button {
+    flex: 0 0 auto;
+    padding: 0.45rem 0.8rem;
+    border-radius: 6px;
+    background: #1f2937;
+    color: #fff;
     font-weight: 650;
-    transition: background 0.15s, border-color 0.15s;
   }
 
-  .ai-settings-btn:hover:not(:disabled) {
-    background: #eceff5 !important;
-    border-color: #c9d2df;
+  .update-banner-actions button:last-child {
+    background: #fff;
+    color: #4f3422;
+    border: 1px solid #e5ba66;
   }
 
-  .sync-open-btn {
+  .settings-menu {
+    position: relative;
+  }
+
+  .settings-menu-btn {
     display: inline-flex;
     align-items: center;
     gap: 0.45rem;
     padding: 0.52rem 0.85rem;
     background: #f7f9f8;
     color: #243149;
-    border: 1px solid #d4ded9;
+    border: 1px solid #d8dee9;
     border-radius: 8px;
     font-size: 0.88rem;
     font-weight: 650;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
   }
 
-  .sync-open-btn span {
-    padding: 0.12rem 0.38rem;
+  .settings-menu-btn:hover:not(:disabled) {
+    background: #edf2f6 !important;
+    border-color: #cbd5e1;
+  }
+
+  .settings-menu-btn.needs-attention {
+    background: #fff8e6;
+    border-color: #f2c46d;
+    color: #5f3e12;
+  }
+
+  .settings-menu-btn svg {
+    width: 17px;
+    height: 17px;
+    flex: 0 0 auto;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .settings-attention-dot {
+    width: 0.42rem;
+    height: 0.42rem;
     border-radius: 999px;
-    background: #e8f3ee;
-    color: #256247;
+    background: #d97706;
+  }
+
+  .settings-popover {
+    position: absolute;
+    top: calc(100% + 0.45rem);
+    right: 0;
+    z-index: 70;
+    width: min(340px, calc(100vw - 2rem));
+    padding: 0.45rem;
+    border: 1px solid #d7dde7;
+    border-radius: 10px;
+    background: #fff;
+    box-shadow: 0 18px 44px rgba(15, 23, 42, 0.16);
+  }
+
+  .settings-menu-item {
+    width: 100%;
+    min-height: 58px;
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) auto;
+    gap: 0.65rem;
+    align-items: center;
+    padding: 0.65rem 0.7rem;
+    border-radius: 8px;
+    background: transparent;
+    color: #243149;
+    text-align: left;
+    font: inherit;
+    transition: background 0.15s, opacity 0.15s;
+  }
+
+  .settings-menu-item:hover:not(:disabled) {
+    background: #f3f6fa !important;
+  }
+
+  .settings-menu-item:disabled {
+    opacity: 0.55;
+  }
+
+  .settings-item-icon {
+    width: 34px;
+    height: 34px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 8px;
+    background: #edf2f7;
+    color: #34445c;
+  }
+
+  .settings-item-icon svg {
+    width: 18px;
+    height: 18px;
+    stroke: currentColor;
+    stroke-width: 1.9;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .settings-item-icon-text {
     font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0;
+  }
+
+  .settings-item-copy {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.12rem;
+  }
+
+  .settings-item-copy strong {
+    color: #1f2937;
+    font-size: 0.9rem;
+    font-weight: 750;
+  }
+
+  .settings-item-copy span {
+    color: #667085;
+    font-size: 0.78rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .sync-open-btn:hover:not(:disabled) {
-    background: #edf4f1 !important;
-    border-color: #c5d4cc;
+  .settings-badge {
+    max-width: 108px;
+    padding: 0.16rem 0.42rem;
+    border-radius: 999px;
+    background: #eef2f6;
+    color: #475569;
+    font-size: 0.72rem;
+    font-weight: 800;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .settings-badge-alert {
+    background: #fff1d6;
+    color: #9a3412;
   }
 
   .error {
@@ -964,9 +1274,19 @@
       text-align: center;
     }
 
-    .sync-open-btn {
+    .settings-menu,
+    .settings-menu-btn {
       width: 100%;
+    }
+
+    .settings-menu-btn {
       justify-content: center;
+    }
+
+    .settings-popover {
+      left: 0;
+      right: 0;
+      width: 100%;
     }
 
     .sync-folder-row,
