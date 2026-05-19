@@ -555,6 +555,7 @@
     if (!cached) cachePut(pageId, loaded);
     strokes = loaded.map(s => ({
       id: s.id,
+      clientId: makeStrokeClientId(),
       colour: s.colour,
       thickness: s.thickness ?? 1,
       points: s.points.map(p => ({ x: p.x, y: p.y, pressure: 0.5 })),
@@ -570,6 +571,7 @@
     const loaded = await invoke<SurfaceStrokeOutput[]>("load_surface_strokes", { surfaceId });
     strokes = loaded.map(s => ({
       id: s.id,
+      clientId: makeStrokeClientId(),
       colour: s.colour,
       thickness: s.thickness ?? 1,
       points: s.points.map(p => ({ x: p.x, y: p.y, pressure: 0.5 })),
@@ -1292,6 +1294,7 @@
   function cloneStroke(stroke: Stroke): Stroke {
     return {
       id: stroke.id,
+      clientId: stroke.clientId ?? makeStrokeClientId(),
       colour: stroke.colour,
       thickness: stroke.thickness,
       points: cloneInkPoints(stroke.points),
@@ -1356,12 +1359,74 @@
     );
   }
 
+  const pendingInkWrites = new Set<Promise<void>>();
+  const cancelledPendingStrokeClientIds = new Set<string>();
+
+  function trackInkWrite(promise: Promise<void>): Promise<void> {
+    let tracked: Promise<void>;
+    tracked = promise.finally(() => {
+      pendingInkWrites.delete(tracked);
+    });
+    pendingInkWrites.add(tracked);
+    return tracked;
+  }
+
+  async function flushPendingInkWrites(): Promise<void> {
+    while (pendingInkWrites.size > 0) {
+      await Promise.allSettled([...pendingInkWrites]);
+    }
+  }
+
+  function cancelPendingStrokeCreate(stroke: Stroke): void {
+    if (stroke.id !== null) return;
+    cancelledPendingStrokeClientIds.add(ensureStrokeClientId(stroke));
+  }
+
+  function prepareStrokeForCreate(stroke: Stroke): string {
+    const clientId = ensureStrokeClientId(stroke);
+    if (stroke.id === null && cancelledPendingStrokeClientIds.has(clientId)) {
+      stroke.clientId = makeStrokeClientId();
+      return stroke.clientId;
+    }
+    return clientId;
+  }
+
+  function consumePendingStrokeCancellation(clientId: string): boolean {
+    const cancelled = cancelledPendingStrokeClientIds.delete(clientId);
+    return cancelled;
+  }
+
+  function assignPersistedStrokeId(stroke: Stroke, id: number, clientId: string): Stroke {
+    if (stroke.clientId === clientId) stroke.id = id;
+
+    const pageStroke = findStrokeByClientId(strokes, clientId);
+    if (pageStroke) pageStroke.id = id;
+
+    const chunkId = stroke.chunkId;
+    if (chunkId != null) {
+      const viewStroke = chunkView?.chunk.id === chunkId
+        ? findStrokeByClientId(chunkView.strokes, clientId)
+        : null;
+      if (viewStroke) viewStroke.id = id;
+
+      const cachedStroke = chunkSurfaceCache.get(chunkId)?.strokes
+        ? findStrokeByClientId(chunkSurfaceCache.get(chunkId)!.strokes, clientId)
+        : null;
+      if (cachedStroke) cachedStroke.id = id;
+
+      return viewStroke ?? cachedStroke ?? stroke;
+    }
+
+    return pageStroke ?? stroke;
+  }
+
   async function persistPageStrokeCreate(
     pageId: number,
     stroke: Stroke,
-    stillPresent: () => boolean = () => true,
   ): Promise<void> {
-    if (isNotebookDocument()) {
+    const clientId = prepareStrokeForCreate(stroke);
+    const useSurfaceStroke = isNotebookDocument();
+    if (useSurfaceStroke) {
       let surfaceId = currentPageSurfaceId;
       if (surfaceId == null) {
         try {
@@ -1377,12 +1442,12 @@
       const initial = serialiseSurfaceStrokeInput(stroke);
       try {
         const id = await invoke<number>("save_surface_stroke", { surfaceId, stroke: initial });
-        stroke.id = id;
-        if (currentPageId === pageId && !stillPresent()) {
+        if (consumePendingStrokeCancellation(clientId)) {
           await invoke("delete_surface_stroke", { strokeId: id });
           return;
         }
-        const latest = serialiseSurfaceStrokeInput(stroke);
+        const liveStroke = assignPersistedStrokeId(stroke, id, clientId);
+        const latest = serialiseSurfaceStrokeInput(liveStroke);
         if (!surfaceStrokeInputsMatch(initial, latest)) {
           await invoke("update_surface_stroke", { strokeId: id, stroke: latest });
         }
@@ -1395,12 +1460,12 @@
     const initial = serialisePageStrokeInput(stroke);
     try {
       const id = await invoke<number>("save_stroke", { pageId, stroke: initial });
-      stroke.id = id;
-      if (!stillPresent()) {
+      if (consumePendingStrokeCancellation(clientId)) {
         await invoke("delete_stroke", { strokeId: id });
         return;
       }
-      const latest = serialisePageStrokeInput(stroke);
+      const liveStroke = assignPersistedStrokeId(stroke, id, clientId);
+      const latest = serialisePageStrokeInput(liveStroke);
       if (!pageStrokeInputsMatch(initial, latest)) {
         await invoke("update_stroke", { strokeId: id, stroke: latest });
       }
@@ -1412,22 +1477,22 @@
   async function persistChunkStrokeCreate(
     surfaceId: number,
     stroke: Stroke,
-    stillPresent: () => boolean = () => true,
   ): Promise<void> {
+    const clientId = prepareStrokeForCreate(stroke);
     const initial = serialiseSurfaceStrokeInput(stroke);
     try {
       const id = await invoke<number>("save_surface_stroke", { surfaceId, stroke: initial });
-      stroke.id = id;
-      if (!stillPresent()) {
+      if (consumePendingStrokeCancellation(clientId)) {
         await invoke("delete_surface_stroke", { strokeId: id });
         return;
       }
-      const latest = serialiseSurfaceStrokeInput(stroke);
+      const liveStroke = assignPersistedStrokeId(stroke, id, clientId);
+      const latest = serialiseSurfaceStrokeInput(liveStroke);
       if (!surfaceStrokeInputsMatch(initial, latest)) {
         await invoke("update_surface_stroke", { strokeId: id, stroke: latest });
       }
     } catch (err) {
-      console.error("save_surface_stroke failed", err);
+      void appLogWarn(`[ink] save_surface_stroke failed: ${formatLogError(err)}`);
     }
   }
 
@@ -1656,6 +1721,7 @@
       }));
       return {
         id: null,
+        clientId: makeStrokeClientId(),
         colour: stroke.colour,
         thickness: stroke.thickness,
         points,
@@ -1800,6 +1866,7 @@
       .filter((pts) => pts.length >= 2)
       .map((pts) => ({
         id: null,
+        clientId: makeStrokeClientId(),
         colour: penColour,
         thickness: penThickness,
         points: pts,
@@ -1815,7 +1882,7 @@
     if (currentPageId !== null) {
       cacheEvict(currentPageId);
       for (const stroke of newStrokes) {
-        void persistPageStrokeCreate(currentPageId, stroke, () => strokes.includes(stroke));
+        void trackInkWrite(persistPageStrokeCreate(currentPageId, stroke));
       }
     }
   }
@@ -2137,7 +2204,8 @@
     }
     if (currentPageId !== null) cacheEvict(currentPageId);
     for (const s of toDelete) {
-      if (s.id !== null) deletePageStroke(s.id).catch(() => {});
+      if (s.id !== null) void trackInkWrite(deletePageStroke(s.id).catch(() => {}));
+      else cancelPendingStrokeCreate(s);
     }
     markDirty();
   }
@@ -2669,6 +2737,7 @@
       const completed = currentStroke;
       const stroke: Stroke = {
         id: null,
+        clientId: makeStrokeClientId(),
         colour: penColour,
         thickness: penThickness,
         points: completed,
@@ -2680,7 +2749,7 @@
       clearPageStrokeTransformHistory();
       if (currentPageId !== null) {
         cacheEvict(currentPageId);
-        void persistPageStrokeCreate(currentPageId, stroke, () => strokes.includes(stroke));
+        void trackInkWrite(persistPageStrokeCreate(currentPageId, stroke));
       }
     }
     isDrawing = false;
@@ -3457,6 +3526,24 @@
     return loaded;
   }
 
+  let strokeClientIdSerial = 0;
+
+  function makeStrokeClientId(): string {
+    strokeClientIdSerial += 1;
+    return `stroke-${Date.now()}-${strokeClientIdSerial}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  function ensureStrokeClientId(stroke: Stroke): string {
+    if (!stroke.clientId) {
+      stroke.clientId = makeStrokeClientId();
+    }
+    return stroke.clientId;
+  }
+
+  function findStrokeByClientId(allStrokes: Stroke[], clientId: string): Stroke | null {
+    return allStrokes.find((stroke) => stroke.clientId === clientId) ?? null;
+  }
+
   function persistAiTaskSettings() {
     if (typeof localStorage === "undefined") return;
     localStorage.setItem(AI_TASK_SETTINGS_STORAGE_KEY, JSON.stringify(aiTaskSettings));
@@ -4091,9 +4178,12 @@
     }
   }
 
-  function closeViewer() {
-    void closeViewerAiPanel();
+  async function closeViewer() {
+    await closeViewerAiPanel();
     if (chunkView) closeChunkView();
+    await flushPendingInkWrites();
+    await flushChunkTextSaves();
+    await flushGlossarySave();
     pendingChunkTap = null;
     batchChunkProgress = null;
     selectedBook = null;
@@ -4173,7 +4263,8 @@
     }
     if (currentPageId !== null) cacheEvict(currentPageId);
     for (const stroke of removed) {
-      if (stroke.id !== null) deletePageStroke(stroke.id).catch(() => {});
+      if (stroke.id !== null) void trackInkWrite(deletePageStroke(stroke.id).catch(() => {}));
+      else cancelPendingStrokeCreate(stroke);
     }
     markDirty();
   }
@@ -4211,7 +4302,7 @@
     if (currentPageId !== null) cacheEvict(currentPageId);
     for (const restored of entry) {
       if (currentPageId !== null) {
-        void persistPageStrokeCreate(currentPageId, restored, () => strokes.includes(restored));
+        void trackInkWrite(persistPageStrokeCreate(currentPageId, restored));
       }
     }
     markDirty();
@@ -4229,7 +4320,8 @@
     clearPageStrokeTransformHistory();
     if (currentPageId !== null) cacheEvict(currentPageId);
     for (const s of deleted) {
-      if (s.id !== null) deletePageStroke(s.id).catch(() => {});
+      if (s.id !== null) void trackInkWrite(deletePageStroke(s.id).catch(() => {}));
+      else cancelPendingStrokeCreate(s);
     }
     redoStack = [...redoStack, deleted];
     strokes = strokes.filter(s => !selectedStrokes.has(s));
@@ -4288,7 +4380,7 @@
     if (pageId !== null) {
       cacheEvict(pageId);
       for (const stroke of prepared.strokes) {
-        void persistPageStrokeCreate(pageId, stroke, () => strokes.includes(stroke));
+        void trackInkWrite(persistPageStrokeCreate(pageId, stroke));
       }
     }
 
@@ -5505,9 +5597,6 @@
     cached.graphs = cloneGraphObjects(view.graphs);
   }
 
-  function chunkViewContainsStroke(view: ChunkViewState, stroke: Stroke): boolean {
-    return view.strokes.includes(stroke);
-  }
   const chunkGlossaryTabLabel = $derived(
     chunkView?.chunk.chunk_type === "question" ? "Answer" : "Glossary",
   );
@@ -7864,6 +7953,7 @@
       const rawGraphs = await invoke<SurfaceGraphObjectOutput[]>("load_surface_graph_objects", { surfaceId });
       const strokes: Stroke[] = raw.map(s => ({
         id: s.id,
+        clientId: makeStrokeClientId(),
         colour: s.colour,
         thickness: s.thickness ?? 1,
         points: s.points.map(p => ({ x: p.x, y: p.y, pressure: 0.5 })),
@@ -8734,6 +8824,7 @@
       .filter((pts) => pts.length >= 2)
       .map((pts) => ({
         id: null,
+        clientId: makeStrokeClientId(),
         colour: penColour,
         thickness: penThickness,
         points: pts,
@@ -8749,11 +8840,7 @@
     redrawChunkDry();
 
     for (const stroke of newStrokes) {
-      await persistChunkStrokeCreate(
-        view.surfaceId,
-        stroke,
-        () => chunkViewContainsStroke(view, stroke),
-      );
+      await persistChunkStrokeCreate(view.surfaceId, stroke);
     }
   }
 
@@ -8763,6 +8850,7 @@
 
     const stroke: Stroke = {
       id: null,
+      clientId: makeStrokeClientId(),
       colour: penColour,
       thickness: penThickness,
       points: pts,
@@ -8775,11 +8863,7 @@
     clearChunkStrokeTransformHistory();
     redrawChunkDry();
 
-    void persistChunkStrokeCreate(
-      view.surfaceId,
-      stroke,
-      () => chunkViewContainsStroke(view, stroke),
-    );
+    void trackInkWrite(persistChunkStrokeCreate(view.surfaceId, stroke));
   }
 
   function updateChunkSurfaceCacheGraphs(next: SurfaceGraphObject[]) {
@@ -9585,7 +9669,10 @@
     }
     redrawChunkDry();
     for (const stroke of removed) {
-      if (stroke.id === null) continue;
+      if (stroke.id === null) {
+        cancelPendingStrokeCreate(stroke);
+        continue;
+      }
       try {
         await invoke("delete_surface_stroke", { strokeId: stroke.id });
       } catch (err) {
@@ -9664,7 +9751,8 @@
     }
     redrawChunkDry();
     for (const s of remove) {
-      if (s.id !== null) invoke("delete_surface_stroke", { strokeId: s.id }).catch(() => {});
+      if (s.id !== null) void trackInkWrite(invoke<void>("delete_surface_stroke", { strokeId: s.id }).catch(() => {}));
+      else cancelPendingStrokeCreate(s);
     }
   }
 
@@ -9681,7 +9769,8 @@
     clearChunkSelectionState();
     redrawChunkCanvases();
     for (const stroke of remove) {
-      if (stroke.id !== null) invoke("delete_surface_stroke", { strokeId: stroke.id }).catch(() => {});
+      if (stroke.id !== null) void trackInkWrite(invoke<void>("delete_surface_stroke", { strokeId: stroke.id }).catch(() => {}));
+      else cancelPendingStrokeCreate(stroke);
     }
   }
 
@@ -9735,11 +9824,7 @@
     redrawChunkCanvases();
 
     for (const stroke of prepared.strokes) {
-      void persistChunkStrokeCreate(
-        view.surfaceId,
-        stroke,
-        () => chunkViewContainsStroke(view, stroke),
-      );
+      void trackInkWrite(persistChunkStrokeCreate(view.surfaceId, stroke));
     }
 
     inkClipboard = { ...clipboard, pasteCount: prepared.nextPasteCount };
@@ -10037,6 +10122,7 @@
 
   onDestroy(() => {
     void cancelChunkChatForReset();
+    void flushPendingInkWrites();
     void flushChunkTextSaves();
     void flushGlossarySave();
     stopChunkPanelResize();

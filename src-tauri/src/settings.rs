@@ -3,7 +3,7 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 const OPENAI_API_KEY: &str = "openai_api_key";
 const GEMINI_API_KEY: &str = "gemini_api_key";
@@ -30,6 +30,7 @@ pub const LOCAL_ONLY_DB_KEYS: [&str; 7] = [
 ];
 
 static LOCAL_SETTINGS_PATH: OnceLock<PathBuf> = OnceLock::new();
+static LOCAL_SETTINGS_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 #[serde(default)]
@@ -132,6 +133,13 @@ pub fn read_local_settings() -> Result<LocalSettings, String> {
 }
 
 pub fn write_local_settings(settings: &LocalSettings) -> Result<(), String> {
+    let _guard = LOCAL_SETTINGS_WRITE_LOCK
+        .lock()
+        .map_err(|_| "local settings lock was poisoned".to_string())?;
+    write_local_settings_unlocked(settings)
+}
+
+fn write_local_settings_unlocked(settings: &LocalSettings) -> Result<(), String> {
     let path = local_settings_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -152,10 +160,13 @@ pub fn update_local_settings<F>(update: F) -> Result<LocalSettings, String>
 where
     F: FnOnce(&mut LocalSettings),
 {
+    let _guard = LOCAL_SETTINGS_WRITE_LOCK
+        .lock()
+        .map_err(|_| "local settings lock was poisoned".to_string())?;
     let mut settings = read_local_settings()?;
     ensure_device_id(&mut settings);
     update(&mut settings);
-    write_local_settings(&settings)?;
+    write_local_settings_unlocked(&settings)?;
     Ok(settings)
 }
 

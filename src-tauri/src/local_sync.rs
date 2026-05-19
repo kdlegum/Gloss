@@ -4,6 +4,7 @@ use crate::settings;
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::Manager;
 #[cfg(desktop)]
 use tauri_plugin_dialog::DialogExt;
@@ -16,6 +17,7 @@ const SNAPSHOT_RELATIVE_PATH: &str = "library/gloss.snapshot.db";
 const LEASE_SECONDS: i64 = 10 * 60;
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
+static LOCAL_DIRTY_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Serialize)]
 pub struct SyncState {
@@ -271,6 +273,27 @@ impl SyncFolder {
         }
     }
 
+    fn delete_file(&self, relative: &str) -> Result<(), String> {
+        let Some(entry) = self.file_entry(relative)? else {
+            return Ok(());
+        };
+        if entry.is_dir {
+            return Err(format!("refusing to delete sync directory {relative}"));
+        }
+        match self {
+            Self::Path(root) => {
+                let path = root.join(relative);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(err) => Err(err.to_string()),
+                }
+            }
+            #[cfg(target_os = "android")]
+            Self::AndroidTree { tree_uri, .. } => android_sync::delete_file(tree_uri, relative),
+        }
+    }
+
     fn list_recursive(&self, relative: &str) -> Result<Vec<SyncFileEntry>, String> {
         match self {
             Self::Path(root) => {
@@ -382,6 +405,7 @@ impl SyncFolder {
 }
 
 pub fn mark_dirty() {
+    LOCAL_DIRTY_EPOCH.fetch_add(1, Ordering::SeqCst);
     if let Err(err) = settings::update_local_settings(|local| {
         if SyncFolder::from_local(local).is_some() {
             local.sync_dirty = true;
@@ -763,6 +787,7 @@ pub async fn sync_now(
         return Err("The sync folder has a newer snapshot and this device has local edits. A recovery DB was saved under conflicts/; import or resolve before syncing.".to_string());
     }
 
+    let dirty_epoch_before_export = LOCAL_DIRTY_EPOCH.load(Ordering::SeqCst);
     normalize_document_pdfs(&app, pool).await?;
     copy_local_pdfs_to_sync(&app, &folder, pool).await?;
     let revision = std::cmp::max(manifest.current_revision, local_tip) + 1;
@@ -773,8 +798,9 @@ pub async fn sync_now(
         write_device_presence(&folder, true)?;
     }
 
+    let dirty_epoch_after_export = LOCAL_DIRTY_EPOCH.load(Ordering::SeqCst);
     settings::update_local_settings(|local| {
-        local.sync_dirty = false;
+        local.sync_dirty = dirty_epoch_after_export != dirty_epoch_before_export;
         local.last_exported_revision = Some(revision);
     })?;
 
@@ -868,13 +894,33 @@ pub async fn resolve_sync_conflict(
     pool: &SqlitePool,
     resolution: String,
 ) -> Result<SyncState, String> {
+    let folder = configured_folder()?;
+    initialise_sync_folder(&folder)?;
     match resolution.trim() {
-        "keep_local" => sync_now(app, pool, true).await,
+        "keep_local" => {
+            sync_now(app.clone(), pool, true).await?;
+            clear_resolved_conflicts(&folder)?;
+            get_sync_state(app, pool).await
+        }
         "use_remote" => {
+            let was_dirty = settings::read_local_settings()?.sync_dirty;
             settings::update_local_settings(|local| {
                 local.sync_dirty = false;
             })?;
-            import_latest_sync_snapshot(app, pool, true).await
+            match import_latest_sync_snapshot(app.clone(), pool, true).await {
+                Ok(_) => {
+                    clear_resolved_conflicts(&folder)?;
+                    get_sync_state(app, pool).await
+                }
+                Err(err) => {
+                    if was_dirty {
+                        let _ = settings::update_local_settings(|local| {
+                            local.sync_dirty = true;
+                        });
+                    }
+                    Err(err)
+                }
+            }
         }
         other => Err(format!("unknown sync conflict resolution {other:?}")),
     }
@@ -1339,10 +1385,11 @@ async fn copy_local_pdfs_to_sync(
     pool: &SqlitePool,
 ) -> Result<(), String> {
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let rows = sqlx::query("SELECT title, file_path, document_mode FROM source_documents ORDER BY id")
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let rows =
+        sqlx::query("SELECT title, file_path, document_mode FROM source_documents ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
     for row in rows {
         let title: String = row.get("title");
         let file_path: String = row.get("file_path");
@@ -1378,10 +1425,11 @@ fn copy_sync_pdfs_to_local(
 async fn load_snapshot_document_rows(
     pool: &SqlitePool,
 ) -> Result<Vec<SnapshotDocumentRow>, String> {
-    let rows = sqlx::query("SELECT title, file_path, document_mode FROM source_documents ORDER BY id")
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let rows =
+        sqlx::query("SELECT title, file_path, document_mode FROM source_documents ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
     Ok(rows
         .into_iter()
         .map(|row| SnapshotDocumentRow {
@@ -1660,6 +1708,18 @@ fn detect_conflicts(folder: &SyncFolder) -> Result<Vec<SyncConflict>, String> {
     }
     conflicts.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(conflicts)
+}
+
+fn clear_resolved_conflicts(folder: &SyncFolder) -> Result<(), String> {
+    for conflict in detect_conflicts(folder)? {
+        folder.delete_file(&conflict.path).map_err(|err| {
+            format!(
+                "failed to remove resolved sync conflict file {}: {err}",
+                conflict.path
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn collect_file_entries(

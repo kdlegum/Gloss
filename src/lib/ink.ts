@@ -5,6 +5,7 @@ export type Point = { x: number; y: number; pressure: number };
 export type BBox   = { minX: number; minY: number; maxX: number; maxY: number };
 export type Stroke = {
   id: number | null;
+  clientId?: string;
   colour: string;
   thickness: number;
   points: Point[];

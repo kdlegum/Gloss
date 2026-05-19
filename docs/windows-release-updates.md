@@ -49,6 +49,16 @@ The tag release job expects these repository secrets:
 - `TAURI_SIGNING_PRIVATE_KEY`
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
 
+The workflow creates the draft GitHub Release with a token that has `contents: write`.
+By default it uses GitHub's built-in `GITHUB_TOKEN`, and the Windows release job
+already requests that permission. If GitHub still reports `Resource not accessible
+by integration` while creating the release, check **Settings > Actions > General >
+Workflow permissions** and any organization policy that may restrict write tokens.
+As a fallback, create a fine-grained personal access token scoped to this repository
+with **Contents: Read and write**, then store it as a repository secret named
+`GH_RELEASE_TOKEN`. The Windows and Android release upload steps will prefer that
+secret when it exists and otherwise fall back to `GITHUB_TOKEN`.
+
 Generate them with the Tauri signer command, then keep the private key only in GitHub Secrets or another secret manager:
 
 ```powershell

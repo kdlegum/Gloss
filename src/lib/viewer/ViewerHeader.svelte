@@ -30,7 +30,7 @@
     reChunkCurrentPage: () => Promise<void>;
     canRechunkPage: boolean;
     reChunkingPage: boolean;
-    closeViewer: () => void;
+    closeViewer: () => void | Promise<void>;
   } = $props();
 
   const isNotebook = $derived(selectedBook.document_mode === "notebook");
