@@ -12,33 +12,28 @@ Gloss now has two Windows update layers:
 
    Never ship a build from a commit that is missing a migration already applied by local/dev builds. That is what causes SQLx `VersionMissing` startup failures on existing data.
 
-2. Bump the version in all three places:
-
-   - `package.json`
-   - `src-tauri/Cargo.toml`
-   - `src-tauri/tauri.conf.json`
-
-3. Run the validation commands locally:
+2. Run the validation commands locally:
 
    ```powershell
    npm run check
    cargo check --manifest-path src-tauri\Cargo.toml
    ```
 
-4. Create and push a semver tag that matches the app version:
+3. Bump, commit, tag, and push a semver tag that matches the app version:
 
    ```powershell
-   git tag v0.1.1
-   git push origin v0.1.1
+   npm run release:tag -- v0.1.1
    ```
 
-5. GitHub Actions verifies that `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` all match the tag version.
+   The helper updates `package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`, then creates a version-bump commit before running `git tag <tag>` and `git push origin <tag>`. It refuses to run if those version files already have local changes.
 
-6. GitHub Actions creates a draft GitHub Release with the Windows `.msi`, NSIS `.exe`, updater bundles, signatures, and `latest.json`.
+4. GitHub Actions verifies that `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` all match the tag version.
 
-7. Install the draft artifact on a test Windows machine, open an existing Gloss library, and confirm the database migrates cleanly.
+5. GitHub Actions creates a draft GitHub Release with the Windows `.msi`, NSIS `.exe`, updater bundles, signatures, and `latest.json`.
 
-8. Publish the draft release.
+6. Install the draft artifact on a test Windows machine, open an existing Gloss library, and confirm the database migrates cleanly.
+
+7. Publish the draft release.
 
 The app checks releases without GitHub authentication. If the repository remains private, the GitHub Releases API and `latest.json` download URL will still return 404 from installed apps. In that case, either make the release assets public or host `latest.json` and the updater assets at a public URL and update the endpoint in `src-tauri/tauri.conf.json`.
 

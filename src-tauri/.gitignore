@@ -13,3 +13,5 @@
 /pdfium.dll
 /libpdfium.dylib
 /libpdfium.so
+
+/scripts

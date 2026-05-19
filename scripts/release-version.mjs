@@ -116,28 +116,53 @@ function readProjectJson(path) {
   return JSON.parse(text);
 }
 
-function formatJson(value) {
-  return `${JSON.stringify(value, null, 2)}\n`;
-}
-
 function setJsonVersion(path, version) {
   const absolutePath = resolve(rootDir, path);
-  const data = JSON.parse(readFileSync(absolutePath, 'utf8'));
-  data.version = version;
-  return formatJson(data);
+  const originalText = readFileSync(absolutePath, 'utf8');
+  const next = originalText.replace(
+    /^(\s*"version"\s*:\s*")[^"]+(".*)$/m,
+    (_match, before, after) => `${before}${version}${after}`
+  );
+
+  if (next === originalText && JSON.parse(originalText).version !== version) {
+    throw new Error(`could not update version in ${path}`);
+  }
+
+  if (JSON.parse(next).version !== version) {
+    throw new Error(`could not verify updated version in ${path}`);
+  }
+
+  return next;
 }
 
 function setPackageLockVersion(version) {
   const absolutePath = resolve(rootDir, 'package-lock.json');
-  const data = JSON.parse(readFileSync(absolutePath, 'utf8'));
+  const originalText = readFileSync(absolutePath, 'utf8');
+  const data = JSON.parse(originalText);
 
   if (!data.packages?.['']) {
     throw new Error('package-lock.json does not contain packages[""]');
   }
 
-  data.version = version;
-  data.packages[''].version = version;
-  return formatJson(data);
+  let seen = 0;
+  const next = originalText.replace(
+    /^(\s*"version"\s*:\s*")[^"]+(".*)$/gm,
+    (match, before, after) => {
+      seen += 1;
+      return seen <= 2 ? `${before}${version}${after}` : match;
+    }
+  );
+
+  if (seen < 2) {
+    throw new Error('could not update both package-lock.json version fields');
+  }
+
+  const nextData = JSON.parse(next);
+  if (nextData.version !== version || nextData.packages?.['']?.version !== version) {
+    throw new Error('could not verify updated package-lock.json versions');
+  }
+
+  return next;
 }
 
 function setCargoPackageVersion(version) {
