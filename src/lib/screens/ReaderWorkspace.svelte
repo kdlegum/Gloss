@@ -153,6 +153,7 @@
 
   const LEGACY_CHUNKING_PROVIDER_STORAGE_KEY = "gloss_chunking_provider";
   const AI_TASK_SETTINGS_STORAGE_KEY = "gloss_ai_task_settings_v1";
+  const PAPER_SETTINGS_STORAGE_KEY = "gloss_paper_settings_v1";
   const CUSTOM_MODEL_VALUE = "__custom__";
 
   const CHUNKING_PROVIDER_OPTIONS: Array<{ value: ChunkingProvider; label: string; short: string }> = [
@@ -863,6 +864,27 @@
     "#118ab2",
     "#2351d1",
   ];
+  type PaperPattern = "dotted" | "grid" | "line";
+  interface PaperSettings {
+    backgroundColour: string;
+    pattern: PaperPattern;
+    spacing: number;
+  }
+  const PAPER_SPACING_MIN = 20;
+  const PAPER_SPACING_MAX = 80;
+  const PAPER_BACKGROUND_SWATCHES = [
+    "#f4f7fb",
+    "#ffffff",
+    "#fff9e8",
+    "#eef8f1",
+    "#f3eefc",
+    "#111827",
+  ];
+  const PAPER_PATTERN_OPTIONS: Array<{ value: PaperPattern; label: string }> = [
+    { value: "dotted", label: "Dots" },
+    { value: "grid", label: "Grid" },
+    { value: "line", label: "Lines" },
+  ];
   const SHAPE_OPTIONS: Array<{ value: ShapeKind; label: string; hint: string }> = [
     { value: "circle", label: "Circle", hint: "Center at press point." },
     { value: "graph_full", label: "Graph ±", hint: "Axes in positive and negative directions." },
@@ -871,9 +893,93 @@
   let penColour = $state(DEFAULT_PEN_COLOUR);
   let penThickness = $state(DEFAULT_PEN_THICKNESS);
   let showPenOptions = $state(false);
+  let showPaperOptions = $state(false);
   let shapeKind = $state<ShapeKind>("circle");
   let showShapeOptions = $state(false);
   let shapeDraft = $state<ShapeDraft | null>(null);
+  let paperSettings = $state<PaperSettings>(defaultPaperSettings());
+
+  function defaultPaperSettings(): PaperSettings {
+    return {
+      backgroundColour: "#f4f7fb",
+      pattern: "dotted",
+      spacing: 40,
+    };
+  }
+
+  function isHexColour(value: string): boolean {
+    return /^#[0-9a-fA-F]{6}$/.test(value);
+  }
+
+  function clampPaperSpacing(value: number): number {
+    if (!Number.isFinite(value)) return defaultPaperSettings().spacing;
+    return Math.round(Math.max(PAPER_SPACING_MIN, Math.min(PAPER_SPACING_MAX, value)));
+  }
+
+  function normalisePaperPattern(value: unknown): PaperPattern {
+    return value === "grid" || value === "line" || value === "dotted" ? value : "dotted";
+  }
+
+  function normalisePaperSettings(value: Partial<PaperSettings> | null | undefined): PaperSettings {
+    const defaults = defaultPaperSettings();
+    return {
+      backgroundColour: typeof value?.backgroundColour === "string" && isHexColour(value.backgroundColour)
+        ? value.backgroundColour
+        : defaults.backgroundColour,
+      pattern: normalisePaperPattern(value?.pattern),
+      spacing: clampPaperSpacing(typeof value?.spacing === "number" ? value.spacing : defaults.spacing),
+    };
+  }
+
+  function loadPaperSettings(): PaperSettings {
+    if (typeof localStorage === "undefined") return defaultPaperSettings();
+    const stored = localStorage.getItem(PAPER_SETTINGS_STORAGE_KEY);
+    if (!stored) return defaultPaperSettings();
+    try {
+      return normalisePaperSettings(JSON.parse(stored) as Partial<PaperSettings>);
+    } catch {
+      return defaultPaperSettings();
+    }
+  }
+
+  function persistPaperSettings() {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(PAPER_SETTINGS_STORAGE_KEY, JSON.stringify(paperSettings));
+  }
+
+  function isPaperBackgroundDark(): boolean {
+    const colour = paperSettings.backgroundColour;
+    if (!isHexColour(colour)) return false;
+    const r = Number.parseInt(colour.slice(1, 3), 16);
+    const g = Number.parseInt(colour.slice(3, 5), 16);
+    const b = Number.parseInt(colour.slice(5, 7), 16);
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) < 120;
+  }
+
+  function paperPatternColour(alpha: number): string {
+    return isPaperBackgroundDark()
+      ? `rgba(255, 255, 255, ${alpha})`
+      : `rgba(15, 23, 42, ${alpha})`;
+  }
+
+  function paperPatternAlpha(pattern: PaperPattern = paperSettings.pattern): number {
+    return pattern === "dotted" ? 0.2 : 0.15;
+  }
+
+  function updatePaperSettings(next: Partial<PaperSettings>) {
+    paperSettings = normalisePaperSettings({ ...paperSettings, ...next });
+    persistPaperSettings();
+    markDirty();
+    redrawChunkCanvases();
+  }
+
+  function togglePaperOptions() {
+    showPaperOptions = !showPaperOptions;
+    showPenOptions = false;
+    showShapeOptions = false;
+    showChunkPenOptions = false;
+    showChunkShapeOptions = false;
+  }
 
   // â”€â”€ Select state â”€â”€
   let selectOrigin = $state<{ x: number; y: number } | null>(null);
@@ -2036,6 +2142,7 @@
     showShapeOptions = false;
     showChunkPenOptions = false;
     showChunkShapeOptions = false;
+    showPaperOptions = false;
   }
 
   function closeGraphComposer() {
@@ -2112,6 +2219,7 @@
     if (pendingGraphPlacement?.scope === "page") pendingGraphPlacement = null;
     showPenOptions = wasDrawMode ? !showPenOptions : true;
     showShapeOptions = false;
+    showPaperOptions = false;
     markDirty();
   }
 
@@ -2128,6 +2236,7 @@
     if (pendingGraphPlacement?.scope === "page") pendingGraphPlacement = null;
     showPenOptions = false;
     showShapeOptions = wasShapeMode ? !showShapeOptions : true;
+    showPaperOptions = false;
     markDirty();
   }
 
@@ -2136,6 +2245,7 @@
     selectOrigin = null;
     selectRect = null;
     shapeDraft = null;
+    showPaperOptions = false;
     openGraphComposer("page");
     markDirty();
   }
@@ -2144,6 +2254,7 @@
     mode = 'erase';
     showPenOptions = false;
     showShapeOptions = false;
+    showPaperOptions = false;
     clearSelectionState();
     selectOrigin = null;
     selectRect = null;
@@ -2156,6 +2267,7 @@
     mode = 'select';
     showPenOptions = false;
     showShapeOptions = false;
+    showPaperOptions = false;
     clearSelectionState();
     selectOrigin = null;
     selectRect = null;
@@ -2852,29 +2964,55 @@
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, w, h);
 
-    const GRID_WORLD = 40;
-    const DOT_R = isNotebookDocument() ? 1.3 : 1.5;
-    const spacing = GRID_WORLD * camera.scale;
+    const gridWorld = paperSettings.spacing;
+    const pattern = paperSettings.pattern;
+    const DOT_R = 1.3;
+    const spacing = gridWorld * camera.scale;
     if (spacing < 8 || spacing > 300) return;
 
     const startW = screenToWorld(0, 0);
-    const startX = Math.floor(startW.x / GRID_WORLD) * GRID_WORLD;
-    const startY = Math.floor(startW.y / GRID_WORLD) * GRID_WORLD;
+    const startX = Math.floor(startW.x / gridWorld) * gridWorld;
+    const startY = Math.floor(startW.y / gridWorld) * gridWorld;
 
-    ctx.fillStyle = isNotebookDocument() ? "rgba(15, 23, 42, 0.18)" : "rgba(0,0,0,0.18)";
-    for (let wx = startX; ; wx += GRID_WORLD) {
-      const sx = (wx * camera.scale + camera.x) * dpr;
-      if (sx > w + DOT_R * dpr) break;
-      if (sx < -DOT_R * dpr) continue;
-      for (let wy = startY; ; wy += GRID_WORLD) {
-        const sy = (wy * camera.scale + camera.y) * dpr;
-        if (sy > h + DOT_R * dpr) break;
-        if (sy < -DOT_R * dpr) continue;
-        ctx.beginPath();
-        ctx.arc(sx, sy, DOT_R, 0, Math.PI * 2);
-        ctx.fill();
+    if (pattern === "dotted") {
+      ctx.fillStyle = paperPatternColour(paperPatternAlpha(pattern));
+      for (let wx = startX; ; wx += gridWorld) {
+        const sx = (wx * camera.scale + camera.x) * dpr;
+        if (sx > w + DOT_R * dpr) break;
+        if (sx < -DOT_R * dpr) continue;
+        for (let wy = startY; ; wy += gridWorld) {
+          const sy = (wy * camera.scale + camera.y) * dpr;
+          if (sy > h + DOT_R * dpr) break;
+          if (sy < -DOT_R * dpr) continue;
+          ctx.beginPath();
+          ctx.arc(sx, sy, DOT_R, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+      return;
+    }
+
+    ctx.strokeStyle = paperPatternColour(paperPatternAlpha(pattern));
+    ctx.lineWidth = Math.max(1, dpr);
+    ctx.beginPath();
+    if (pattern === "grid") {
+      for (let wx = startX; ; wx += gridWorld) {
+        const sx = Math.round((wx * camera.scale + camera.x) * dpr) + 0.5;
+        if (sx > w + dpr) break;
+        if (sx < -dpr) continue;
+        ctx.moveTo(sx, 0);
+        ctx.lineTo(sx, h);
       }
     }
+    for (let wy = startY; ; wy += gridWorld) {
+      const sy = (wy * camera.scale + camera.y) * dpr;
+      if (sy > h + dpr) break;
+      if (sy < -dpr) continue;
+      const crispY = Math.round(sy) + 0.5;
+      ctx.moveTo(0, crispY);
+      ctx.lineTo(w, crispY);
+    }
+    ctx.stroke();
   }
 
   function getNotebookDocumentPageCount(): number {
@@ -2929,9 +3067,10 @@
       const padY = 4 * px;
       const labelX = originX + 14 * px;
       const labelY = pageTop + 14 * px;
+      const darkPaper = isPaperBackgroundDark();
 
       ctx.save();
-      ctx.strokeStyle = "rgba(100, 116, 139, 0.32)";
+      ctx.strokeStyle = darkPaper ? "rgba(255, 255, 255, 0.22)" : "rgba(100, 116, 139, 0.32)";
       ctx.lineWidth = 1.2 * px;
       ctx.strokeRect(
         originX + inset,
@@ -2944,12 +3083,12 @@
       ctx.textBaseline = "top";
       const labelW = ctx.measureText(label).width + padX * 2;
       const labelH = fontSize + padY * 2;
-      ctx.fillStyle = "rgba(248, 250, 252, 0.94)";
+      ctx.fillStyle = darkPaper ? "rgba(15, 23, 42, 0.88)" : "rgba(248, 250, 252, 0.94)";
       ctx.fillRect(labelX, labelY, labelW, labelH);
-      ctx.strokeStyle = "rgba(148, 163, 184, 0.45)";
+      ctx.strokeStyle = darkPaper ? "rgba(255, 255, 255, 0.28)" : "rgba(148, 163, 184, 0.45)";
       ctx.lineWidth = px;
       ctx.strokeRect(labelX, labelY, labelW, labelH);
-      ctx.fillStyle = "rgba(51, 65, 85, 0.82)";
+      ctx.fillStyle = darkPaper ? "rgba(248, 250, 252, 0.88)" : "rgba(51, 65, 85, 0.82)";
       ctx.fillText(label, labelX + padX, labelY + padY);
       ctx.restore();
     }
@@ -4036,6 +4175,7 @@
     }
     if (chunkView) closeChunkView();
     pendingChunkTap = null;
+    showPaperOptions = false;
     void appLogInfo(`[viewer] opening doc=${book.id} title="${book.title}"`);
     selectedBook = book;
     syncPastPaperInstructionInputs(book);
@@ -4193,6 +4333,7 @@
     await flushChunkTextSaves();
     await flushGlossarySave();
     pendingChunkTap = null;
+    showPaperOptions = false;
     batchChunkProgress = null;
     selectedBook = null;
     syncPastPaperInstructionInputs(null);
@@ -4861,6 +5002,7 @@
     if (pendingGraphPlacement?.scope === "chunk") pendingGraphPlacement = null;
     showChunkPenOptions = wasDrawMode ? !showChunkPenOptions : true;
     showChunkShapeOptions = false;
+    showPaperOptions = false;
     redrawChunkCanvases();
   }
 
@@ -4874,6 +5016,7 @@
     if (pendingGraphPlacement?.scope === "chunk") pendingGraphPlacement = null;
     showChunkPenOptions = false;
     showChunkShapeOptions = wasShapeMode ? !showChunkShapeOptions : true;
+    showPaperOptions = false;
     redrawChunkCanvases();
   }
 
@@ -4882,6 +5025,7 @@
     chunkIsDrawing = false;
     chunkCurrentStroke = [];
     chunkShapeDraft = null;
+    showPaperOptions = false;
     openGraphComposer("chunk");
     redrawChunkCanvases();
   }
@@ -4891,6 +5035,7 @@
     clearChunkSelectionState();
     showChunkPenOptions = false;
     showChunkShapeOptions = false;
+    showPaperOptions = false;
     chunkShapeDraft = null;
     if (pendingGraphPlacement?.scope === "chunk") pendingGraphPlacement = null;
     redrawChunkCanvases();
@@ -4901,6 +5046,7 @@
     clearChunkSelectionState();
     showChunkPenOptions = false;
     showChunkShapeOptions = false;
+    showPaperOptions = false;
     chunkShapeDraft = null;
     if (pendingGraphPlacement?.scope === "chunk") pendingGraphPlacement = null;
     redrawChunkCanvases();
@@ -8487,6 +8633,7 @@
     chunkTab = 'ink';
     showChunkPenOptions = false;
     showChunkShapeOptions = false;
+    showPaperOptions = false;
     chunkCamera = { x: 0, y: 0, scale: 1 };
     cachedChunkRect = null;
     if (chunkWetCanvas) {
@@ -8613,6 +8760,7 @@
     chunkMode = 'draw';
     showChunkPenOptions = false;
     showChunkShapeOptions = false;
+    showPaperOptions = false;
     chunkWetCtx = null;
     chunkDryCtx = null;
     chunkWetCanvas = null!;
@@ -8683,18 +8831,22 @@
   interface ChunkCamera { x: number; y: number; scale: number }
   const CHUNK_ZOOM_MIN = 0.35;
   const CHUNK_ZOOM_MAX = 8.0;
-  const CHUNK_GRID_WORLD = 40;
   const CHUNK_ERASE_RADIUS_WORLD = 8;
   let chunkCamera = $state<ChunkCamera>({ x: 0, y: 0, scale: 1 });
   let chunkSurfaceSize = { w: 1, h: 1 };
   let chunkHomeViewSize = { w: 0, h: 0 };
   let chunkZoomPercent = $derived(Math.round(chunkCamera.scale * 100));
   let chunkGridStyle = $derived.by(() => {
-    const step = CHUNK_GRID_WORLD * chunkCamera.scale;
+    const step = paperSettings.spacing * chunkCamera.scale;
+    const dotOffset = step * 0.5;
     return [
-      `--chunk-grid-size: ${step}px`,
-      `--chunk-grid-offset-x: ${chunkCamera.x + step / 2}px`,
-      `--chunk-grid-offset-y: ${chunkCamera.y + step / 2}px`,
+      `--paper-background-colour: ${paperSettings.backgroundColour}`,
+      `--paper-pattern-colour: ${paperPatternColour(paperPatternAlpha())}`,
+      `--paper-grid-size: ${step}px`,
+      `--paper-grid-offset-x: ${chunkCamera.x}px`,
+      `--paper-grid-offset-y: ${chunkCamera.y}px`,
+      `--paper-dot-offset-x: ${chunkCamera.x - dotOffset}px`,
+      `--paper-dot-offset-y: ${chunkCamera.y - dotOffset}px`,
     ].join("; ");
   });
 
@@ -10002,6 +10154,11 @@
     }
     if (!selectedBook) return;
     if (e.defaultPrevented) return;
+    if (showPaperOptions && e.key === "Escape") {
+      e.preventDefault();
+      showPaperOptions = false;
+      return;
+    }
     const eventTarget = e.target;
     if (
       eventTarget instanceof HTMLInputElement
@@ -10119,6 +10276,7 @@
 
   onMount(() => {
     refreshCustomModelMode(aiTaskSettings);
+    paperSettings = loadPaperSettings();
     // Dev-only: expose invoke on window for ad-hoc debugging from devtools.
     (window as unknown as { glossInvoke?: typeof invoke }).glossInvoke = invoke;
     void (async () => {
@@ -10155,6 +10313,9 @@
   });
 
   let zoomPercent = $derived(Math.round(camera.scale * 100));
+  let mainPaperSurfaceStyle = $derived.by(() => (
+    `--paper-background-colour: ${paperSettings.backgroundColour};`
+  ));
 
   $effect(() => {
     currentPage;
@@ -10273,6 +10434,7 @@
         class:mode-shape={mode === 'shape'}
         class:mode-select={mode === 'select'}
         class:notebook-surface={isNotebookDocument()}
+        style={mainPaperSurfaceStyle}
         use:observeContainerResize
       >
         <canvas bind:this={gridCanvas} class="layer layer-grid"></canvas>
@@ -10591,6 +10753,7 @@
                     chunkTab = 'ink';
                     showChunkPenOptions = false;
                     showChunkShapeOptions = false;
+                    showPaperOptions = false;
                   }}
                 >
                   <svg viewBox="0 0 16 16" fill="none" width="13" height="13">
@@ -10606,6 +10769,7 @@
                     chunkTab = 'glossary';
                     showChunkPenOptions = false;
                     showChunkShapeOptions = false;
+                    showPaperOptions = false;
                     if (glossaryFormat === "typst") {
                       scheduleGlossaryTypstPreview(0);
                     }
@@ -10624,6 +10788,7 @@
                     chunkTab = 'ai';
                     showChunkPenOptions = false;
                     showChunkShapeOptions = false;
+                    showPaperOptions = false;
                   }}
                 >
                   AI
@@ -10643,6 +10808,9 @@
                   class:mode-erase={chunkMode === 'erase'}
                   class:mode-shape={chunkMode === 'shape'}
                   class:mode-select={chunkMode === 'select'}
+                  class:paper-dotted={paperSettings.pattern === 'dotted'}
+                  class:paper-grid={paperSettings.pattern === 'grid'}
+                  class:paper-line={paperSettings.pattern === 'line'}
                   style={chunkGridStyle}
                   use:setupChunkCanvases
                   onwheel={onChunkWheel}
@@ -10694,6 +10862,91 @@
                         <line x1="8" y1="12" x2="16" y2="12"/>
                       </svg>
                     </button>
+                    <div class="paper-tool">
+                      <button
+                        class="tool-btn"
+                        class:active={showPaperOptions}
+                        type="button"
+                        onclick={togglePaperOptions}
+                        aria-label="Paper options"
+                        aria-pressed={showPaperOptions}
+                        title="Paper options"
+                      >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+                          <rect x="5" y="3.5" width="14" height="17" rx="2"/>
+                          <path d="M9 8h6"/>
+                          <path d="M9 12h6"/>
+                          <path d="M9 16h4"/>
+                        </svg>
+                      </button>
+                      {#if showPaperOptions}
+                        <div class="paper-popout chunk-paper-popout" transition:fade={{ duration: 140 }}>
+                          <div class="paper-popout-header">
+                            <span class="paper-popout-title">Paper</span>
+                            <span class="paper-sample" style={`--paper-background-colour: ${paperSettings.backgroundColour}; --paper-pattern-colour: ${paperPatternColour(paperPatternAlpha())};`}>
+                              <span
+                                class="paper-sample-pattern"
+                                class:paper-dotted={paperSettings.pattern === 'dotted'}
+                                class:paper-grid={paperSettings.pattern === 'grid'}
+                                class:paper-line={paperSettings.pattern === 'line'}
+                              ></span>
+                            </span>
+                          </div>
+                          <div class="paper-pattern-options" aria-label="Paper pattern">
+                            {#each PAPER_PATTERN_OPTIONS as option}
+                              <button
+                                class="paper-option"
+                                class:active={paperSettings.pattern === option.value}
+                                type="button"
+                                onclick={() => updatePaperSettings({ pattern: option.value })}
+                                aria-pressed={paperSettings.pattern === option.value}
+                              >
+                                {option.label}
+                              </button>
+                            {/each}
+                          </div>
+                          <label class="pen-slider-group" for="chunk-paper-spacing">
+                            <span>Spacing</span>
+                            <span>{paperSettings.spacing} px</span>
+                          </label>
+                          <input
+                            id="chunk-paper-spacing"
+                            class="pen-slider"
+                            type="range"
+                            min={PAPER_SPACING_MIN}
+                            max={PAPER_SPACING_MAX}
+                            step="1"
+                            value={paperSettings.spacing}
+                            oninput={(e) => updatePaperSettings({ spacing: Number((e.currentTarget as HTMLInputElement).value) })}
+                          />
+                          <div class="paper-colours" aria-label="Paper colours">
+                            {#each PAPER_BACKGROUND_SWATCHES as colour}
+                              <button
+                                class="paper-colour-swatch"
+                                class:selected={paperSettings.backgroundColour === colour}
+                                type="button"
+                                onclick={() => updatePaperSettings({ backgroundColour: colour })}
+                                aria-label={`Select ${colour} paper`}
+                                aria-pressed={paperSettings.backgroundColour === colour}
+                                style={`--paper-swatch-colour: ${colour};`}
+                              ></button>
+                            {/each}
+                            <label
+                              class="paper-colour-custom"
+                              class:selected={!PAPER_BACKGROUND_SWATCHES.includes(paperSettings.backgroundColour)}
+                              aria-label="Custom paper colour"
+                              style={`--paper-swatch-colour: ${paperSettings.backgroundColour};`}
+                            >
+                              <input
+                                type="color"
+                                value={paperSettings.backgroundColour}
+                                oninput={(e) => updatePaperSettings({ backgroundColour: (e.currentTarget as HTMLInputElement).value })}
+                              />
+                            </label>
+                          </div>
+                        </div>
+                      {/if}
+                    </div>
                     <div class="divider"></div>
                     <div class="pen-tool">
                       <button
@@ -11649,6 +11902,92 @@
           </svg>
         </button>
 
+        <div class="paper-tool">
+          <button
+            class="tool-btn"
+            class:active={showPaperOptions}
+            type="button"
+            onclick={togglePaperOptions}
+            aria-label="Paper options"
+            aria-pressed={showPaperOptions}
+            title="Paper options"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="5" y="3.5" width="14" height="17" rx="2"/>
+              <path d="M9 8h6"/>
+              <path d="M9 12h6"/>
+              <path d="M9 16h4"/>
+            </svg>
+          </button>
+          {#if showPaperOptions}
+            <div class="paper-popout" transition:fade={{ duration: 140 }}>
+              <div class="paper-popout-header">
+                <span class="paper-popout-title">Paper</span>
+                <span class="paper-sample" style={`--paper-background-colour: ${paperSettings.backgroundColour}; --paper-pattern-colour: ${paperPatternColour(paperPatternAlpha())};`}>
+                  <span
+                    class="paper-sample-pattern"
+                    class:paper-dotted={paperSettings.pattern === 'dotted'}
+                    class:paper-grid={paperSettings.pattern === 'grid'}
+                    class:paper-line={paperSettings.pattern === 'line'}
+                  ></span>
+                </span>
+              </div>
+              <div class="paper-pattern-options" aria-label="Paper pattern">
+                {#each PAPER_PATTERN_OPTIONS as option}
+                  <button
+                    class="paper-option"
+                    class:active={paperSettings.pattern === option.value}
+                    type="button"
+                    onclick={() => updatePaperSettings({ pattern: option.value })}
+                    aria-pressed={paperSettings.pattern === option.value}
+                  >
+                    {option.label}
+                  </button>
+                {/each}
+              </div>
+              <label class="pen-slider-group" for="paper-spacing">
+                <span>Spacing</span>
+                <span>{paperSettings.spacing} px</span>
+              </label>
+              <input
+                id="paper-spacing"
+                class="pen-slider"
+                type="range"
+                min={PAPER_SPACING_MIN}
+                max={PAPER_SPACING_MAX}
+                step="1"
+                value={paperSettings.spacing}
+                oninput={(e) => updatePaperSettings({ spacing: Number((e.currentTarget as HTMLInputElement).value) })}
+              />
+              <div class="paper-colours" aria-label="Paper colours">
+                {#each PAPER_BACKGROUND_SWATCHES as colour}
+                  <button
+                    class="paper-colour-swatch"
+                    class:selected={paperSettings.backgroundColour === colour}
+                    type="button"
+                    onclick={() => updatePaperSettings({ backgroundColour: colour })}
+                    aria-label={`Select ${colour} paper`}
+                    aria-pressed={paperSettings.backgroundColour === colour}
+                    style={`--paper-swatch-colour: ${colour};`}
+                  ></button>
+                {/each}
+                <label
+                  class="paper-colour-custom"
+                  class:selected={!PAPER_BACKGROUND_SWATCHES.includes(paperSettings.backgroundColour)}
+                  aria-label="Custom paper colour"
+                  style={`--paper-swatch-colour: ${paperSettings.backgroundColour};`}
+                >
+                  <input
+                    type="color"
+                    value={paperSettings.backgroundColour}
+                    oninput={(e) => updatePaperSettings({ backgroundColour: (e.currentTarget as HTMLInputElement).value })}
+                  />
+                </label>
+              </div>
+            </div>
+          {/if}
+        </div>
+
         <!-- Erase -->
         <button
           class="tool-btn"
@@ -11830,14 +12169,13 @@
     flex: 1;
     overflow: hidden;
     min-height: 0;
-    background: #e8e8e8;
+    background: var(--paper-background-colour, #e8e8e8);
     cursor: crosshair;
     touch-action: none;
   }
 
   .infinite-canvas.notebook-surface {
-    background-color: #f4f7fb;
-    background-image: linear-gradient(180deg, #fbfcfe 0%, #f2f5fa 100%);
+    background: var(--paper-background-colour, #f4f7fb);
   }
 
   .infinite-canvas.mode-erase { cursor: cell; }
@@ -12745,13 +13083,30 @@
     flex: 1;
     min-height: 0;
     overflow: hidden;
-    background-color: #f4f7fb;
-    background-image:
-      radial-gradient(circle at center, rgba(15, 23, 42, 0.18) 1.3px, transparent 1.4px),
-      linear-gradient(180deg, #fbfcfe 0%, #f2f5fa 100%);
-    background-size: var(--chunk-grid-size, 40px) var(--chunk-grid-size, 40px), 100% 100%;
-    background-position: var(--chunk-grid-offset-x, 20px) var(--chunk-grid-offset-y, 20px), 0 0;
+    background-color: var(--paper-background-colour, #f4f7fb);
     touch-action: none;
+  }
+
+  .chunk-sheet-surface.paper-dotted {
+    background-image:
+      radial-gradient(circle at center, var(--paper-pattern-colour, rgba(15, 23, 42, 0.2)) 1.3px, transparent 1.45px);
+    background-size: var(--paper-grid-size, 40px) var(--paper-grid-size, 40px);
+    background-position: var(--paper-dot-offset-x, 0) var(--paper-dot-offset-y, 0);
+  }
+
+  .chunk-sheet-surface.paper-grid {
+    background-image:
+      linear-gradient(var(--paper-pattern-colour, rgba(15, 23, 42, 0.15)) 1px, transparent 1px),
+      linear-gradient(90deg, var(--paper-pattern-colour, rgba(15, 23, 42, 0.15)) 1px, transparent 1px);
+    background-size: var(--paper-grid-size, 40px) var(--paper-grid-size, 40px);
+    background-position: var(--paper-grid-offset-x, 0) var(--paper-grid-offset-y, 0);
+  }
+
+  .chunk-sheet-surface.paper-line {
+    background-image:
+      linear-gradient(var(--paper-pattern-colour, rgba(15, 23, 42, 0.15)) 1px, transparent 1px);
+    background-size: var(--paper-grid-size, 40px) var(--paper-grid-size, 40px);
+    background-position: 0 var(--paper-grid-offset-y, 0);
   }
 
   .chunk-sheet-surface.mode-erase { cursor: cell; }
@@ -12835,6 +13190,12 @@
     z-index: 120;
   }
 
+  .chunk-ink-bar .chunk-paper-popout {
+    border: 1px solid color-mix(in oklch, var(--chunk-accent) 26%, transparent);
+    box-shadow: 0 14px 34px color-mix(in oklch, var(--chunk-accent) 14%, transparent);
+    z-index: 120;
+  }
+
   .chunk-ink-bar .pen-popout::after {
     border-right: 1px solid color-mix(in oklch, var(--chunk-accent) 26%, transparent);
     border-bottom: 1px solid color-mix(in oklch, var(--chunk-accent) 26%, transparent);
@@ -12845,11 +13206,26 @@
     border-bottom: 1px solid color-mix(in oklch, var(--chunk-accent) 26%, transparent);
   }
 
+  .chunk-ink-bar .chunk-paper-popout::after {
+    border-right: 1px solid color-mix(in oklch, var(--chunk-accent) 26%, transparent);
+    border-bottom: 1px solid color-mix(in oklch, var(--chunk-accent) 26%, transparent);
+  }
+
   .chunk-ink-bar .shape-option:hover {
     background: color-mix(in oklch, var(--chunk-accent) 10%, white);
   }
 
   .chunk-ink-bar .shape-option.active {
+    background: color-mix(in oklch, var(--chunk-accent) 14%, white);
+    border-color: color-mix(in oklch, var(--chunk-accent) 24%, transparent);
+    color: var(--chunk-accent);
+  }
+
+  .chunk-ink-bar .paper-option:hover {
+    background: color-mix(in oklch, var(--chunk-accent) 10%, white);
+  }
+
+  .chunk-ink-bar .paper-option.active {
     background: color-mix(in oklch, var(--chunk-accent) 14%, white);
     border-color: color-mix(in oklch, var(--chunk-accent) 24%, transparent);
     color: var(--chunk-accent);
@@ -14204,6 +14580,13 @@
     z-index: 40;
   }
 
+  .paper-tool {
+    position: relative;
+    display: flex;
+    align-items: center;
+    z-index: 40;
+  }
+
   .pen-popout {
     position: absolute;
     bottom: calc(100% + 10px);
@@ -14237,6 +14620,24 @@
     z-index: 120;
   }
 
+  .paper-popout {
+    position: absolute;
+    bottom: calc(100% + 10px);
+    left: 50%;
+    transform: translateX(-50%);
+    width: 250px;
+    padding: 0.7rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.65rem;
+    background: rgba(255, 255, 255, 0.96);
+    border: 1px solid rgba(32, 64, 160, 0.14);
+    border-radius: 14px;
+    box-shadow: 0 12px 32px rgba(25, 34, 68, 0.18);
+    backdrop-filter: blur(8px);
+    z-index: 120;
+  }
+
   .pen-popout::after {
     content: "";
     position: absolute;
@@ -14261,6 +14662,141 @@
     border-right: 1px solid rgba(32, 64, 160, 0.14);
     border-bottom: 1px solid rgba(32, 64, 160, 0.14);
     transform: translate(-50%, -50%) rotate(45deg);
+  }
+
+  .paper-popout::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    width: 14px;
+    height: 14px;
+    background: rgba(255, 255, 255, 0.96);
+    border-right: 1px solid rgba(32, 64, 160, 0.14);
+    border-bottom: 1px solid rgba(32, 64, 160, 0.14);
+    transform: translate(-50%, -50%) rotate(45deg);
+  }
+
+  .paper-popout-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.7rem;
+  }
+
+  .paper-popout-title {
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: #28405e;
+  }
+
+  .paper-sample {
+    width: 42px;
+    height: 30px;
+    border-radius: 7px;
+    border: 1px solid rgba(51, 65, 85, 0.18);
+    overflow: hidden;
+    background: var(--paper-background-colour, #f4f7fb);
+    flex-shrink: 0;
+  }
+
+  .paper-sample-pattern {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+
+  .paper-sample-pattern.paper-dotted {
+    background-image: radial-gradient(circle at center, var(--paper-pattern-colour) 1.2px, transparent 1.35px);
+    background-size: 10px 10px;
+  }
+
+  .paper-sample-pattern.paper-grid {
+    background-image:
+      linear-gradient(var(--paper-pattern-colour) 1px, transparent 1px),
+      linear-gradient(90deg, var(--paper-pattern-colour) 1px, transparent 1px);
+    background-size: 10px 10px;
+  }
+
+  .paper-sample-pattern.paper-line {
+    background-image: linear-gradient(var(--paper-pattern-colour) 1px, transparent 1px);
+    background-size: 10px 10px;
+  }
+
+  .paper-pattern-options {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.35rem;
+  }
+
+  .paper-option {
+    height: 30px;
+    padding: 0 0.45rem;
+    border-radius: 8px;
+    border: 1px solid rgba(148, 163, 184, 0.48);
+    background: #fff;
+    color: #475569;
+    font-size: 0.78rem;
+    font-weight: 600;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
+  }
+
+  .paper-option:hover {
+    background: #eef3ff;
+  }
+
+  .paper-option.active {
+    background: #e7efff;
+    border-color: rgba(32, 64, 160, 0.28);
+    color: #19397f;
+  }
+
+  .paper-colours {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    align-items: center;
+    gap: 0.45rem;
+  }
+
+  .paper-colour-swatch,
+  .paper-colour-custom {
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    justify-self: center;
+    border-radius: 7px;
+    background: var(--paper-swatch-colour);
+    border: 2px solid rgba(255, 255, 255, 0.96);
+    box-shadow: 0 0 0 1px rgba(50, 62, 88, 0.18);
+    transition: transform 0.12s, box-shadow 0.12s;
+  }
+
+  .paper-colour-swatch:hover,
+  .paper-colour-custom:hover {
+    transform: scale(1.06);
+  }
+
+  .paper-colour-swatch.selected,
+  .paper-colour-custom.selected {
+    box-shadow: 0 0 0 2px #1f3f93, 0 0 0 5px rgba(31, 63, 147, 0.16);
+  }
+
+  .paper-colour-custom {
+    position: relative;
+    display: block;
+    overflow: hidden;
+    background: var(--paper-swatch-colour, #fff);
+  }
+
+  .paper-colour-custom input {
+    position: absolute;
+    inset: -4px;
+    width: calc(100% + 8px);
+    height: calc(100% + 8px);
+    padding: 0;
+    border: 0;
+    opacity: 0;
+    cursor: pointer;
   }
 
   .shape-option {
