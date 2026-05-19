@@ -1193,7 +1193,9 @@
   // avoid calling getBoundingClientRect() on every pointer event.
   let cachedContainerRect: DOMRect | null = null;
 
-  /** Convert a screen pointer to normalised page space [0,1]. */
+  /** Convert a screen pointer to page-guide-relative space.
+   * Notebook coordinates can extend beyond the visible page guide.
+   */
   function pointerToNorm(clientX: number, clientY: number): { x: number; y: number } {
     const rect = cachedContainerRect ??= canvasContainer.getBoundingClientRect();
     const sx = clientX - rect.left;
@@ -1202,9 +1204,7 @@
     const wy = (sy - camera.y) / camera.scale;
     const x = (wx - pageOrigin.x) / pageSize.w;
     const y = (wy - pageOrigin.y) / pageSize.h;
-    return isNotebookDocument()
-      ? { x: clampNorm(x), y: Math.max(0, y) }
-      : { x, y };
+    return { x, y };
   }
 
   /** Normalised page space â†’ world space coordinates. */
@@ -1903,12 +1903,18 @@
   }
 
   function clampGraphRect(rect: { x: number; y: number; w: number; h: number }) {
+    if (isNotebookDocument()) {
+      return {
+        x: rect.x,
+        y: rect.y,
+        w: Math.max(MIN_GRAPH_BBOX_SIZE, rect.w),
+        h: Math.max(MIN_GRAPH_BBOX_SIZE, rect.h),
+      };
+    }
     const w = clampNorm(Math.max(MIN_GRAPH_BBOX_SIZE, rect.w));
     const h = clampNorm(Math.max(MIN_GRAPH_BBOX_SIZE, rect.h));
     const x = Math.max(0, Math.min(1 - w, rect.x));
-    const y = isNotebookDocument()
-      ? Math.max(0, rect.y)
-      : Math.max(0, Math.min(1 - h, rect.y));
+    const y = Math.max(0, Math.min(1 - h, rect.y));
     return { x, y, w, h };
   }
 
@@ -2574,9 +2580,7 @@
         const { x, y } = pointerToNorm(e.clientX, e.clientY);
         const rawDeltaX = x - strokeDrag.startPoint.x;
         const rawDeltaY = y - strokeDrag.startPoint.y;
-        const delta = isNotebookDocument()
-          ? clampChunkStrokeDragDelta(strokeDrag.startSelection, rawDeltaX, rawDeltaY)
-          : { deltaX: rawDeltaX, deltaY: rawDeltaY };
+        const delta = { deltaX: rawDeltaX, deltaY: rawDeltaY };
         translateDraggedStrokes(strokeDrag, delta.deltaX, delta.deltaY);
         selection = {
           x: strokeDrag.startSelection.x + delta.deltaX,
@@ -2955,12 +2959,16 @@
     if (!canvasContainer || !pageSize.w || !pageSize.h) return;
     const visMinY = -camera.y / camera.scale;
     const visMaxY = visMinY + canvasContainer.clientHeight / camera.scale;
+    const visiblePageCount = Math.max(
+      1,
+      Math.ceil(Math.max(0, visMaxY - pageOrigin.y) / pageSize.h) + 1,
+    );
     drawInkPageGuides(ctx, {
       originX: pageOrigin.x,
       originY: pageOrigin.y,
       pageWidth: pageSize.w,
       pageHeight: pageSize.h,
-      pageCount: getNotebookDocumentPageCount(),
+      pageCount: Math.max(getNotebookDocumentPageCount(), visiblePageCount),
       scale: camera.scale,
       visMinY,
       visMaxY,
@@ -4354,11 +4362,19 @@
     if (mode !== "select") return false;
     const clipboard = await getInkClipboardForScope("page");
     if (!clipboard) return false;
+    const pasteBounds = isNotebookDocument()
+      ? {
+        minX: Number.NEGATIVE_INFINITY,
+        maxX: Number.POSITIVE_INFINITY,
+        minY: Number.NEGATIVE_INFINITY,
+        maxY: Number.POSITIVE_INFINITY,
+      }
+      : { minX: 0, maxX: 1, minY: 0, maxY: 1 };
     const prepared = preparePastedStrokes(
       clipboard,
       { w: pageSize.w, h: pageSize.h },
       null,
-      { minX: 0, maxX: 1, minY: 0, maxY: isNotebookDocument() ? Number.POSITIVE_INFINITY : 1 },
+      pasteBounds,
       anchorPoint,
     );
     if (!prepared) return false;
