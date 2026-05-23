@@ -31,8 +31,13 @@ android {
         applicationId = "com.gloss.app"
         minSdk = 24
         targetSdk = 36
-        versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+        versionCode = versionName!!.split("-")[0].split(".").let { parts ->
+            val major = parts.getOrNull(0)?.toIntOrNull() ?: 0
+            val minor = parts.getOrNull(1)?.toIntOrNull() ?: 0
+            val patch = parts.getOrNull(2)?.toIntOrNull() ?: 0
+            major * 1_000_000 + minor * 1_000 + patch
+        }.coerceAtLeast(1)
     }
     signingConfigs {
         if (hasReleaseSigning) {
