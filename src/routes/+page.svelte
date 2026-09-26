@@ -57,6 +57,8 @@
   let updateError = $state<string | null>(null);
   let updateFeedback = $state<string | null>(null);
   let selectedBook = $state<SourceDocument | null>(null);
+  let pendingShare = $state<{ uri: string; fileName: string | null } | null>(null);
+  let importingShared = $state(false);
 
   let aiTaskSettings = $state<AiTaskSettings>(defaultAiTaskSettings());
   let aiSettings = $state<AiSettingsState | null>(null);
@@ -740,6 +742,42 @@
     );
   }
 
+  async function checkPendingShare() {
+    try {
+      const result = await invoke<{ uri: string | null; file_name: string | null }>(
+        "consume_pending_share",
+      );
+      if (result.uri) {
+        pendingShare = { uri: result.uri, fileName: result.file_name };
+      }
+    } catch {
+      // non-critical — silently ignore
+    }
+  }
+
+  async function importSharedPdf(mode: "textbook" | "past_paper") {
+    if (!pendingShare) return;
+    const { uri } = pendingShare;
+    importingShared = true;
+    try {
+      const doc = await invoke<SourceDocument>("import_pdf", {
+        documentMode: mode,
+        sourceUri: uri,
+      });
+      void appLogInfo(
+        `[import] shared pdf doc=${doc.id} mode=${doc.document_mode} title="${doc.title}"`,
+      );
+      pendingShare = null;
+      await loadSourceDocuments();
+      await loadSyncState();
+    } catch (e: unknown) {
+      error = String(e);
+      void appLogError(`[import] shared pdf failed: ${formatLogError(e)}`);
+    } finally {
+      importingShared = false;
+    }
+  }
+
   async function importPdf(documentMode: "textbook" | "past_paper" = "textbook") {
     if (syncBusy || autoSyncBusy || creatingNotebook || renamingSourceDocumentId !== null) return;
     error = null;
@@ -894,6 +932,11 @@
     void loadSourceDocuments();
     void loadSyncState();
     void checkForUpdates(false);
+    void checkPendingShare();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") void checkPendingShare();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     const autoSyncTimer = window.setInterval(() => {
       void runAutoSyncOnce();
     }, 15_000);
@@ -913,6 +956,7 @@
     return () => {
       window.clearInterval(autoSyncTimer);
       window.clearInterval(leaseTimer);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   });
 </script>
@@ -974,6 +1018,45 @@
     />
   {/if}
 
+  {#if pendingShare}
+    <div class="share-backdrop" role="presentation">
+      <div class="share-dialog" role="dialog" aria-modal="true" aria-labelledby="share-title">
+        <p class="share-kicker">Import PDF</p>
+        <h2 id="share-title" class="share-filename">{pendingShare.fileName ?? "PDF file"}</h2>
+        <p class="share-prompt">Import as:</p>
+        <div class="share-actions">
+          <button
+            class="share-btn share-btn-textbook"
+            type="button"
+            disabled={importingShared}
+            onclick={() => void importSharedPdf("textbook")}
+          >
+            Textbook
+          </button>
+          <button
+            class="share-btn share-btn-pastpaper"
+            type="button"
+            disabled={importingShared}
+            onclick={() => void importSharedPdf("past_paper")}
+          >
+            Past Paper
+          </button>
+        </div>
+        {#if importingShared}
+          <p class="share-loading">Importing…</p>
+        {:else}
+          <button
+            class="share-cancel"
+            type="button"
+            onclick={() => (pendingShare = null)}
+          >
+            Cancel
+          </button>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
   <AiSettingsSheet
     show={showAiKeySheet}
     {aiKeySheetFirstRun}
@@ -1016,5 +1099,105 @@
 
   main {
     min-height: 100vh;
+  }
+
+  .share-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    background: rgba(15, 23, 42, 0.32);
+  }
+
+  .share-dialog {
+    width: min(380px, 100%);
+    padding: 1.5rem;
+    border-radius: 10px;
+    background: #fff;
+    box-shadow: 0 24px 70px rgba(15, 23, 42, 0.2);
+  }
+
+  .share-kicker {
+    margin: 0 0 0.2rem;
+    color: #607083;
+    font-size: 0.72rem;
+    font-weight: 750;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .share-filename {
+    margin: 0 0 0.9rem;
+    font-size: 1.05rem;
+    font-weight: 600;
+    word-break: break-word;
+  }
+
+  .share-prompt {
+    margin: 0 0 0.6rem;
+    font-size: 0.85rem;
+    color: #475569;
+  }
+
+  .share-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .share-btn {
+    flex: 1;
+    padding: 0.65rem 0.5rem;
+    border: none;
+    border-radius: 7px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.12s;
+  }
+
+  .share-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .share-btn-textbook {
+    background: oklch(0.25 0.04 233);
+    color: #fff;
+  }
+
+  .share-btn-pastpaper {
+    background: oklch(0.25 0.04 50);
+    color: #fff;
+  }
+
+  .share-btn:hover:not(:disabled) {
+    opacity: 0.85;
+  }
+
+  .share-cancel {
+    display: block;
+    width: 100%;
+    padding: 0.5rem;
+    border: none;
+    border-radius: 6px;
+    background: #f1f5f9;
+    color: #475569;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+
+  .share-cancel:hover {
+    background: #e2e8f0;
+  }
+
+  .share-loading {
+    margin: 0;
+    text-align: center;
+    font-size: 0.85rem;
+    color: #607083;
   }
 </style>

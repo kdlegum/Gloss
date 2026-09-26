@@ -1,3 +1,4 @@
+mod android_share;
 mod android_sync;
 mod chunking;
 mod deepseek;
@@ -4218,20 +4219,26 @@ async fn rechunk_page(
 #[tauri::command]
 async fn import_pdf(
     document_mode: Option<String>,
+    source_uri: Option<String>,
     app: tauri::AppHandle,
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<SourceDocument, String> {
     local_sync::guard_write()?;
-    // Open file picker — returns FilePath::Path on desktop, FilePath::Url on Android
-    let picked = app
-        .dialog()
-        .file()
-        .add_filter("PDF", &["pdf"])
-        .blocking_pick_file();
 
-    let file_path = match picked {
-        Some(p) => p,
-        None => return Err("cancelled".into()),
+    let file_path = if let Some(uri) = source_uri {
+        let url = url::Url::parse(&uri).map_err(|e| format!("invalid share URI: {e}"))?;
+        FilePath::Url(url)
+    } else {
+        // Open file picker — returns FilePath::Path on desktop, FilePath::Url on Android
+        match app
+            .dialog()
+            .file()
+            .add_filter("PDF", &["pdf"])
+            .blocking_pick_file()
+        {
+            Some(p) => p,
+            None => return Err("cancelled".into()),
+        }
     };
 
     // Extract filename. On Android the content URI's last path segment is percent-encoded
@@ -4335,6 +4342,26 @@ async fn import_pdf(
         instruction_page_start,
         instruction_page_end,
     })
+}
+
+#[derive(serde::Serialize)]
+struct PendingShareResult {
+    uri: Option<String>,
+    file_name: Option<String>,
+}
+
+#[tauri::command]
+fn consume_pending_share() -> PendingShareResult {
+    match android_share::consume_pending_share() {
+        Ok(p) => PendingShareResult {
+            uri: p.uri,
+            file_name: p.file_name,
+        },
+        Err(_) => PendingShareResult {
+            uri: None,
+            file_name: None,
+        },
+    }
 }
 
 #[tauri::command]
@@ -5824,6 +5851,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(android_sync::init())
+        .plugin(android_share::init())
         .setup(|app| {
             let pool = match tauri::async_runtime::block_on(init_db(app)) {
                 Ok(pool) => pool,
@@ -5872,6 +5900,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             import_pdf,
+            consume_pending_share,
             create_blank_notebook,
             get_or_create_notebook_canvas,
             get_sync_state,
