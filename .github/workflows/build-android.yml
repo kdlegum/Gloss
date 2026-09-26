@@ -56,8 +56,15 @@ jobs:
           tauri_version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
           cargo_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' src-tauri/Cargo.toml | head -1)"
 
+          cargo_lock_version="$(grep -A1 'name = "gloss"' src-tauri/Cargo.lock | grep 'version' | sed 's/.*"\(.*\)"/\1/')"
+
           if [ "$package_version" != "$tauri_version" ] || [ "$cargo_version" != "$tauri_version" ]; then
             echo "Version mismatch: package.json=$package_version tauri.conf.json=$tauri_version Cargo.toml=$cargo_version" >&2
+            exit 1
+          fi
+
+          if [ "$cargo_lock_version" != "$tauri_version" ]; then
+            echo "Cargo.lock version ($cargo_lock_version) does not match app version ($tauri_version). Run 'cargo build' in src-tauri to update Cargo.lock before tagging." >&2
             exit 1
           fi
 
@@ -157,6 +164,16 @@ jobs:
           "$build_tools_dir/apksigner" verify --print-certs "$apk_path"
           "$build_tools_dir/aapt" dump badging "$apk_path" | tee apk-badging.txt
           grep -F "native-code: 'arm64-v8a'" apk-badging.txt
+
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            expected_version="$(node -p "require('./package.json').version")"
+            apk_version="$(grep "^package:" apk-badging.txt | sed "s/.*versionName='\\([^']*\\)'.*/\\1/")"
+            if [ "$apk_version" != "$expected_version" ]; then
+              echo "APK versionName ('$apk_version') does not match expected version ('$expected_version'). Tauri likely regenerated tauri.properties from a stale Cargo.lock." >&2
+              exit 1
+            fi
+            echo "APK version verified: $apk_version"
+          fi
 
       - name: Prepare APK artifact
         shell: bash

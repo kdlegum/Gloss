@@ -97,9 +97,15 @@ jobs:
           $packageVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
           $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           $cargoVersion = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $cargoLockVersion = (Select-String -Path src-tauri/Cargo.lock -Pattern 'name = "gloss"' -Context 0,1).Context.PostContext | Select-String -Pattern 'version = "([^"]+)"' | Select-Object -First 1
+          $cargoLockVersion = $cargoLockVersion.Matches.Groups[1].Value
 
           if ($packageVersion -ne $tauriVersion -or $cargoVersion -ne $tauriVersion) {
             throw "Version mismatch: package.json=$packageVersion tauri.conf.json=$tauriVersion Cargo.toml=$cargoVersion"
+          }
+
+          if ($cargoLockVersion -ne $tauriVersion) {
+            throw "Cargo.lock version ($cargoLockVersion) does not match app version ($tauriVersion). Run 'cargo build' in src-tauri to update Cargo.lock before tagging."
           }
 
           $expectedTag = "v$tauriVersion"
