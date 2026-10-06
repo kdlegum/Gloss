@@ -28,11 +28,14 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Accept Android SDK licenses
-        run: yes | sdkmanager --licenses || true
-
-      - name: Install NDK
-        run: sdkmanager "ndk;27.0.12077973"
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses > /dev/null || true
+          "$sdkmanager" --install "ndk;27.0.12077973"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -76,8 +79,6 @@ jobs:
 
       - name: Initialize Android project
         run: npm run tauri -- android init
-        env:
-          NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
 
       - name: Sync Android version
         if: github.ref_type == 'tag'
@@ -105,8 +106,6 @@ jobs:
       - name: Build installable arm64 APK
         if: github.ref_type != 'tag'
         run: npm run tauri -- android build --debug --apk --target aarch64
-        env:
-          NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
 
       - name: Configure Android release signing
         if: github.ref_type == 'tag'
@@ -136,8 +135,6 @@ jobs:
       - name: Build signed release arm64 APK
         if: github.ref_type == 'tag'
         run: npm run tauri -- android build --apk --target aarch64
-        env:
-          NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
 
       - name: Verify APK
         shell: bash
