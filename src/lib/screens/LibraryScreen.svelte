@@ -221,6 +221,7 @@
 
 <svelte:window onclick={handleSettingsWindowClick} onkeydown={handleSettingsWindowKeydown} />
 
+<div class="library-scroll">
 <div class="library">
   <div class="library-header">
     <h1>Gloss</h1>
@@ -470,6 +471,7 @@
     </ul>
   {/if}
 </div>
+</div>
 
 {#if showSyncSheet}
   <div class="sync-backdrop" role="presentation">
@@ -574,6 +576,14 @@
 {/if}
 
 <style>
+  .library-scroll {
+    height: 100vh;
+    height: 100dvh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
   .library {
     max-width: 640px;
     margin: 0 auto;
